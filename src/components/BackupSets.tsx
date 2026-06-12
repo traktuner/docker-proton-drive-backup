@@ -121,6 +121,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   // Ids the user just hit Cancel on — show immediate feedback until the run
   // actually stops (the backend may take a moment to kill the transfer).
   const [cancelling, setCancelling] = useState<Set<string>>(new Set());
+  const [verifying, setVerifying] = useState<Set<string>>(new Set());
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
   const load = () =>
@@ -170,6 +171,31 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
     setCancelling((prev) => new Set(prev).add(id)); // immediate feedback
     await fetch(`/api/backup-sets/${id}/cancel`, { method: 'POST' });
     load();
+  };
+  const verify = async (id: string) => {
+    const name = sets.find((s) => s.id === id)?.name;
+    setVerifying((prev) => new Set(prev).add(id));
+    toast(`Verifying${name ? ` “${name}”` : ''} against Drive…`, 'info');
+    try {
+      const res = await fetch(`/api/backup-sets/${id}/verify`, { method: 'POST' });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || 'Verify failed');
+      toast(
+        d.repaired > 0
+          ? `Verify: ${d.repaired} item(s) will re-upload next run (${d.checked} checked)`
+          : `Verify: all ${d.checked} item(s) match Drive`,
+        d.repaired > 0 ? 'info' : 'success',
+      );
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), 'error');
+    } finally {
+      setVerifying((prev) => {
+        const n = new Set(prev);
+        n.delete(id);
+        return n;
+      });
+      load();
+    }
   };
   const remove = async (id: string) => {
     const name = sets.find((s) => s.id === id)?.name;
@@ -443,6 +469,16 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                       >
                         Edit
                       </button>
+                      {s.mode !== 'add' && (
+                        <button
+                          onClick={() => verify(s.id)}
+                          disabled={s.lastStatus === 'running' || verifying.has(s.id)}
+                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                          title="Reconcile the catalog against Drive — re-upload anything deleted or changed there"
+                        >
+                          {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
+                        </button>
+                      )}
                       <button
                         onClick={() => setConfirmDel(s.id)}
                         disabled={s.lastStatus === 'running'}

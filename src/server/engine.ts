@@ -8,6 +8,7 @@ import {
   createFolder,
   upload,
   trashDrive,
+  listDrive,
   normalizeProtonPath,
   type FileStrategy,
   type RunResult,
@@ -525,35 +526,67 @@ export async function runCatalogDelta(
   // the deletion pass below is gated on !cancelled, so a partial flush never trashes.
   flushTouches();
 
-  // Mirror: trash catalog entries that no longer exist locally (scoped to roots).
+  // Mirror: trash catalog entries that no longer exist locally (scoped to the set
+  // folder). Two safety nets first — a vanished source mount or a bug must never
+  // let a no-change scan wipe the whole backup:
+  //   (1) if any configured source path is missing on disk (e.g. an unmounted NAS
+  //       share), skip deletion entirely — "gone locally" can't be trusted.
+  //   (2) if a run would remove more than DELETE_SAFETY_PCT of the catalog, skip
+  //       deletion and flag it rather than trash a huge swath in one go.
+  let deletionSkipped: string | null = null;
   if (mode === 'mirror' && !cancelled) {
-    const stale = catalog.stale(setId, seenAt).filter((s) => managedRoots.has(s.rel.split('/')[0]));
-    // Only trash top-most items; trashing a folder removes its children.
-    const tops = stale.filter((s) => !stale.some((o) => o !== s && s.rel.startsWith(`${o.rel}/`)));
-    const removedRels: string[] = [];
-    for (const s of tops) {
-      if (shouldCancel()) break;
-      const res = await trashDrive(`${target}/${s.rel}`);
-      if (res.ok) {
-        deletedCount++;
-        removedRels.push(s.rel);
-      } else {
-        failedCount++;
+    let sourcesIntact = true;
+    for (const s of sources) {
+      try {
+        await fsp.stat(s.abs);
+      } catch {
+        sourcesIntact = false;
+        break;
       }
     }
-    // Drop trashed entries (and their descendants) from the catalog.
-    const gone = stale
-      .filter((s) => removedRels.some((r) => s.rel === r || s.rel.startsWith(`${r}/`)))
-      .map((s) => s.rel);
-    if (gone.length) catalog.remove(setId, gone);
-    if (tops.length) log(`Removed ${deletedCount} item(s) no longer present locally`);
+
+    const stale = catalog.stale(setId, seenAt).filter((s) => managedRoots.has(s.rel.split('/')[0]));
+    const totalEntries = catalog.count(setId);
+    const pctGone = totalEntries > 0 ? stale.length / totalEntries : 0;
+    const DELETE_SAFETY_PCT = 0.3;
+
+    if (!sourcesIntact) {
+      deletionSkipped = 'a source path is missing on disk (mount offline?)';
+    } else if (pctGone > DELETE_SAFETY_PCT) {
+      deletionSkipped = `${stale.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
+    }
+
+    if (deletionSkipped) {
+      log(`Safety: ${deletionSkipped} — deletion skipped. Re-check the source, then re-run to apply deletions.`);
+    } else {
+      // Only trash top-most items; trashing a folder removes its children.
+      const tops = stale.filter((s) => !stale.some((o) => o !== s && s.rel.startsWith(`${o.rel}/`)));
+      const removedRels: string[] = [];
+      for (const s of tops) {
+        if (shouldCancel()) break;
+        const res = await trashDrive(`${target}/${s.rel}`);
+        if (res.ok) {
+          deletedCount++;
+          removedRels.push(s.rel);
+        } else {
+          failedCount++;
+        }
+      }
+      // Drop trashed entries (and their descendants) from the catalog.
+      const gone = stale
+        .filter((s) => removedRels.some((r) => s.rel === r || s.rel.startsWith(`${r}/`)))
+        .map((s) => s.rel);
+      if (gone.length) catalog.remove(setId, gone);
+      if (tops.length) log(`Removed ${deletedCount} item(s) no longer present locally`);
+    }
   }
 
   const parts = [`${doneFiles} uploaded`, `${unchangedCount} unchanged`];
-  if (mode === 'mirror' && !cancelled) parts.push(`${deletedCount} removed`);
+  if (mode === 'mirror' && !cancelled && !deletionSkipped) parts.push(`${deletedCount} removed`);
+  if (deletionSkipped) parts.push(`deletion skipped for safety (${deletionSkipped})`);
   if (failedCount) parts.push(`${failedCount} failed`);
   return {
-    ok: failedCount === 0 && !cancelled,
+    ok: failedCount === 0 && !cancelled && !deletionSkipped,
     cancelled,
     newCount,
     changedCount,
@@ -562,4 +595,75 @@ export async function runCatalogDelta(
     failedCount,
     message: cancelled ? `Cancelled - ${parts.join(', ')}` : parts.join(', '),
   };
+}
+
+export interface VerifyResult {
+  ok: boolean;
+  checked: number; // catalog file entries examined
+  repaired: number; // entries dropped (missing/changed on Drive) → re-uploaded next run
+  message: string;
+}
+
+/**
+ * Reconcile the catalog against Drive truth (opt-in; this is the expensive full
+ * per-folder `list` scan the catalog design otherwise avoids). Lists the set's
+ * Drive subtree, then drops any catalog FILE entry that is missing on Drive or
+ * whose size no longer matches — e.g. a file deleted or changed externally on
+ * Drive — so the next backup re-uploads it.
+ *
+ * Safety: it never trashes anything on Drive (worst case it schedules a
+ * re-upload), and it ABORTS without touching the catalog if a Drive listing fails
+ * for any reason other than "folder not found", so a transient network/auth blip
+ * can't wipe the catalog.
+ */
+export async function verifyCatalog(
+  setId: string,
+  targetPath: string,
+  subfolder: string,
+  log: (msg: string) => void = () => {},
+  shouldCancel: () => boolean = () => false,
+): Promise<VerifyResult> {
+  const target = normalizeProtonPath(targetPath);
+
+  // Map of present Drive files: rel (catalog-style "<subfolder>/…") → size (-1 = unknown).
+  const present = new Map<string, number>();
+  let aborted: string | null = null;
+
+  async function recur(drivePath: string, relPrefix: string): Promise<void> {
+    if (aborted || shouldCancel()) return;
+    const res = await listDrive(drivePath);
+    if (!res.ok) {
+      // Folder genuinely gone → treat as empty. Any other failure → don't risk it.
+      if (/not found|no such|not exist|does not exist|cannot be found/i.test(res.error)) return;
+      aborted = res.error;
+      return;
+    }
+    for (const e of res.data) {
+      if (aborted || shouldCancel()) return;
+      const rel = `${relPrefix}/${e.name}`;
+      if (e.type === 'folder') await recur(`${drivePath}/${e.name}`, rel);
+      else present.set(rel, e.size ?? -1);
+    }
+  }
+
+  log('Scanning Drive…');
+  await recur(`${target}/${subfolder}`, subfolder);
+  if (shouldCancel()) return { ok: false, checked: 0, repaired: 0, message: 'Cancelled' };
+  if (aborted) {
+    return { ok: false, checked: 0, repaired: 0, message: `Verify aborted (Drive listing failed): ${aborted}` };
+  }
+
+  // Drop catalog file entries Drive no longer backs (missing, or size changed).
+  const invalid: string[] = [];
+  let checked = 0;
+  catalog.eachFile(setId, (f) => {
+    checked++;
+    const size = present.get(f.rel);
+    if (size === undefined || (size >= 0 && size !== f.size)) invalid.push(f.rel);
+  });
+  if (invalid.length) catalog.remove(setId, invalid);
+
+  const message = `${checked} checked · ${invalid.length} to re-upload on next run`;
+  log(message);
+  return { ok: true, checked, repaired: invalid.length, message };
 }

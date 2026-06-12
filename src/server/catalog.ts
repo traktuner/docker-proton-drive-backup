@@ -33,6 +33,7 @@ let _stmts: {
   removeOne: Stmt;
   clear: Stmt;
   count: Stmt;
+  eachFile: Stmt;
 } | null = null;
 
 let ensured = false;
@@ -85,6 +86,7 @@ function stmts() {
     removeOne: d.prepare('DELETE FROM backup_catalog WHERE set_id = ? AND rel = ?'),
     clear: d.prepare('DELETE FROM backup_catalog WHERE set_id = ?'),
     count: d.prepare('SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ?'),
+    eachFile: d.prepare("SELECT rel, size, sha1 FROM backup_catalog WHERE set_id = ? AND kind = 'file'"),
   };
   return _stmts;
 }
@@ -151,6 +153,17 @@ export const catalog = {
 
   count(setId: string): number {
     return (stmts().count.get(setId) as { n: number }).n;
+  },
+
+  /** Stream every file entry (rel/size/sha1) — bounded memory for huge sets. */
+  eachFile(setId: string, cb: (f: { rel: string; size: number; sha1: string | null }) => void): void {
+    for (const r of stmts().eachFile.iterate(setId) as IterableIterator<{
+      rel: string;
+      size: number;
+      sha1: string | null;
+    }>) {
+      cb(r);
+    }
   },
 
   /** Run a batch of writes in a single transaction (big speed-up at scale). */

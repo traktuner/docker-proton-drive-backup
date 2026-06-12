@@ -1,0 +1,94 @@
+# Proton Drive Backup — docker-compose reference.
+# Copy, adjust the volume host paths, and `docker compose up -d`.
+# Then open http://<host>:3005 and sign in once (the session persists in /data).
+
+services:
+  proton-drive:
+    container_name: proton-drive-backup
+
+    # Pin to a specific version-revision tag so Renovate proposes updates, e.g.:
+    #   image: ghcr.io/traktuner/docker-proton-drive-backup:0.4.3-22
+    # or track the rolling tag:
+    image: ghcr.io/traktuner/docker-proton-drive-backup:latest
+    # Or build locally instead of pulling:
+    # build: .
+
+    ports:
+      # host:container — change the host port (3005) freely; keep container 3000.
+      - "3000:3000"
+
+    # ---------------------------------------------------------------------------
+    # VOLUMES
+    # ---------------------------------------------------------------------------
+    volumes:
+      # (1) /data — REQUIRED, READ-WRITE. Holds the Proton session, the SQLite job
+      #     database and the CLI cache. Must be writable and persistent: without
+      #     it you'd lose your login and all backup sets on every restart.
+      #     A bind mount (shown) or a named volume both work.
+      #     Security note: the session token is stored here in plaintext (the CLI
+      #     has no encryption option) — encrypt this volume at the storage layer
+      #     (encrypted ZFS dataset / LUKS). See README → "Session security".
+      - ./data:/data
+
+      # (2) /sources — the folders you want to BACK UP. They appear in the left
+      #     "Local files" pane. Mount READ-ONLY (:ro): the tool only ever READS
+      #     sources, so :ro guarantees it can never modify or delete your data.
+      #     (:rw is not needed — there is no restore-to-source feature; restore
+      #     via Proton Drive web.)
+      - ./sources:/sources:ro
+      #
+      #     MULTIPLE SOURCES: mount each share UNDER /sources as its own subfolder.
+      #     They then show up as top-level folders in the left pane, and backup-set
+      #     source paths are relative to /sources (e.g. "/movies/...").
+      # - /mnt/nas/movies:/sources/movies:ro
+      # - /mnt/nas/photos:/sources/photos:ro
+      # - /mnt/nas/documents:/sources/documents:ro
+
+      # (3) /config — OPTIONAL, declarative job deploy (Ansible/GitOps). Drop a
+      #     "backup-sets.yaml" (or .yml / .json) here and the container auto-imports
+      #     those backup sets on startup (idempotent, upsert by name). You only log
+      #     in interactively once; the jobs are already there. Export the format
+      #     from the UI (Backup sets → Export). READ-ONLY is fine.
+      # - ./config:/config:ro
+
+    # ---------------------------------------------------------------------------
+    # ENVIRONMENT (all optional — sensible defaults are baked in)
+    # ---------------------------------------------------------------------------
+    environment:
+      # Timezone for the scheduler (scheduled run times use it). Default: UTC.
+      - TZ=Europe/Vienna
+
+      # --- The rest rarely need changing; defaults shown ---
+
+      # Folder shown in the left "Local files" pane. Keep "/sources" unless you
+      # change the mount target above.
+      # - LOCAL_ROOT=/sources
+
+      # Where the declarative job config is read from (volume 3).
+      # - CONFIG_DIR=/config
+
+      # SQLite job database path — keep it under /data so it persists.
+      # - DB_PATH=/data/backup.db
+
+      # Proton session + cache dir — keep it under /data so your login persists.
+      # - PROTON_DRIVE_CACHE_DIR=/data/proton
+
+      # Required inside a container (file-based session store; the OS keyring is
+      # unavailable). Do not disable.
+      # - PROTON_DRIVE_UNSAFE_SECRETS=1
+
+      # CLI log verbosity: ERROR | WARN | INFO | DEBUG. Default ERROR.
+      # - PROTON_DRIVE_LOG_LEVEL=ERROR
+
+      # Proton API host — do not change.
+      # - PROTON_DRIVE_BASE_URL=drive-api.proton.me
+
+      # Repo used for the in-app "container update available?" check. Override if
+      # you run a fork.
+      # - GITHUB_REPO=traktuner/docker-proton-drive-backup
+
+    restart: unless-stopped
+
+# Alternative: use a named volume for /data instead of a bind mount.
+# volumes:
+#   proton-drive-data:

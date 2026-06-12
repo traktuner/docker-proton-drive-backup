@@ -1,0 +1,430 @@
+@import 'tailwindcss';
+
+/* v4 scans for class names - point it at the app sources explicitly. */
+@source '../**/*.{ts,tsx}';
+
+/*
+ * Proton "Carbon" (dark) design tokens - taken 1:1 from
+ * ProtonMail/WebClients packages/colors/themes/src/carbon/standard-base.css
+ */
+:root {
+  --interaction-norm: #6d4aff;
+  --interaction-norm-hover: #7c5cff;
+  --interaction-norm-active: #5e3df0;
+  --primary: #8a6eff;
+
+  --signal-danger: #f5385a;
+  --signal-warning: #ff9900;
+  --signal-success: #1ea885;
+  --signal-info: #239ece;
+
+  --text-norm: #ffffff;
+  --text-weak: #a7a4b5;
+  --text-hint: #6d697d;
+  --text-invert: #1c1b24;
+
+  --field-norm: #5b576b;
+  --field-hover: #6d697d;
+
+  --focus-outline: #6d4aff;
+  --focus-ring: rgb(109 74 255 / 0.3);
+
+  --border-norm: #4a4658;
+  --border-weak: #343140;
+
+  --background-norm: #16141c;
+  --background-weak: #292733;
+  --background-strong: #3f3b4c;
+  --background-elevated: #1e1c26;
+  --background-lowered: #0e0d12;
+
+  --interaction-default-hover: rgb(91 87 107 / 0.2);
+  --interaction-default-active: rgb(91 87 107 / 0.4);
+
+  --backdrop-norm: rgb(22 20 28 / 0.48);
+  --shadow-lifted: 0 1.5rem 3rem rgb(0 0 0 / 0.75);
+
+  /* Proton easings */
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out-cubic: cubic-bezier(0.33, 1, 0.68, 1);
+
+  /* ---- aliases used throughout the app, mapped onto Proton tokens ---- */
+  --bg: var(--background-norm);
+  --panel: var(--background-elevated);
+  --panel-2: var(--background-weak);
+  --border: var(--border-weak);
+  --border-strong: var(--border-norm);
+  --text: var(--text-norm);
+  --muted: var(--text-weak);
+  --accent: var(--interaction-norm);
+  --accent-2: var(--primary);
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--background-norm);
+  color: var(--text-norm);
+}
+
+body {
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.011em; /* Geist reads tighter, more "product"-like */
+}
+
+/* Tabular figures for live-updating numbers (sizes, counts, speed) so they don't
+   jitter as digits change. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Monospace (Geist Mono) for technical, fixed-width bits like version tags. */
+.font-mono,
+.mono {
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Proton interactive behaviour: 0.15s ease-out-quint + focus ring */
+button,
+a,
+[role='button'],
+summary {
+  transition:
+    background-color 0.15s var(--ease-out-quint),
+    color 0.15s var(--ease-out-quint),
+    border-color 0.15s var(--ease-out-quint),
+    box-shadow 0.15s var(--ease-out-quint),
+    transform 0.15s var(--ease-out-quint);
+}
+button {
+  cursor: pointer;
+}
+button:disabled {
+  cursor: default;
+}
+button:focus-visible,
+a:focus-visible,
+[role='button']:focus-visible,
+summary:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--focus-outline);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+/* Remove the native number-input spin arrows app-wide (Proton uses plain fields
+   or explicit steppers, never the browser default). */
+input[type='number'] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Proton button shapes (solid / ghost / danger) - ghost has NO border, just a
+   hover background, matching Proton's %interactive pattern. */
+@layer components {
+  .pbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: 0.5rem;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    transition:
+      background-color 0.15s var(--ease-out-quint),
+      color 0.15s var(--ease-out-quint),
+      box-shadow 0.15s var(--ease-out-quint),
+      opacity 0.15s var(--ease-out-quint);
+  }
+  .pbtn:disabled {
+    opacity: 0.5;
+    pointer-events: none;
+  }
+  .pbtn--solid {
+    background: var(--interaction-norm);
+    color: #fff;
+  }
+  .pbtn--solid:hover {
+    background: var(--interaction-norm-hover);
+  }
+  .pbtn--solid:active {
+    background: var(--interaction-norm-active);
+  }
+  .pbtn--ghost {
+    background: transparent;
+    color: var(--text-norm);
+  }
+  .pbtn--ghost:hover {
+    background: var(--interaction-default-hover);
+  }
+  .pbtn--ghost:active {
+    background: var(--interaction-default-active);
+  }
+  .pbtn--danger {
+    background: transparent;
+    color: var(--signal-danger);
+  }
+  .pbtn--danger:hover {
+    background: rgb(245 56 90 / 0.12);
+  }
+
+  /* Proton form field (field-two): border == background so it reads as a filled
+     field, with the border appearing on hover/focus. */
+  .pfield {
+    border-radius: 0.5rem; /* --border-radius-md (8px) */
+    border: 1px solid var(--background-weak);
+    background-color: var(--background-weak);
+    color: var(--text-norm);
+    transition:
+      border-color 0.15s var(--ease-out-quint),
+      box-shadow 0.15s var(--ease-out-quint),
+      background-color 0.15s var(--ease-out-quint);
+  }
+  .pfield:hover {
+    border-color: var(--background-strong);
+  }
+  .pfield:focus,
+  .pfield:focus-within {
+    outline: none;
+    border-color: var(--focus-outline);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+  .pfield::placeholder {
+    color: var(--text-hint);
+  }
+  .pfield:disabled {
+    opacity: 0.6;
+  }
+
+  /* Proton number stepper (StepperInput): a filled field with − / + controls.
+     Native spin buttons are removed; the value input is borderless inside. */
+  .pstepper {
+    display: inline-flex;
+    align-items: stretch;
+    overflow: hidden;
+    border-radius: 0.5rem;
+    border: 1px solid var(--background-weak);
+    background-color: var(--background-weak);
+    transition:
+      border-color 0.15s var(--ease-out-quint),
+      box-shadow 0.15s var(--ease-out-quint);
+  }
+  .pstepper:hover {
+    border-color: var(--background-strong);
+  }
+  .pstepper:focus-within {
+    border-color: var(--focus-outline);
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+  .pstepper__btn {
+    display: flex;
+    width: 2rem;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-weak);
+    transition:
+      background-color 0.15s var(--ease-out-quint),
+      color 0.15s var(--ease-out-quint);
+  }
+  .pstepper__btn:hover {
+    background: var(--interaction-default-hover);
+    color: var(--text-norm);
+  }
+  .pstepper__btn:disabled {
+    opacity: 0.35;
+    pointer-events: none;
+  }
+  .pstepper__input {
+    width: 3rem;
+    background: transparent;
+    text-align: center;
+    color: var(--text-norm);
+    outline: none;
+    appearance: textfield;
+    -moz-appearance: textfield;
+  }
+  .pstepper__input::-webkit-inner-spin-button,
+  .pstepper__input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  /* Proton range slider: filled track + interaction-norm thumb. */
+  .prange {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 0.375rem;
+    border-radius: 9999px;
+    background: var(--background-weak);
+    cursor: pointer;
+  }
+  .prange::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 1rem;
+    height: 1rem;
+    border-radius: 9999px;
+    background: var(--interaction-norm);
+    border: 2px solid var(--background-norm);
+    transition: background-color 0.15s var(--ease-out-quint);
+  }
+  .prange::-webkit-slider-thumb:hover {
+    background: var(--interaction-norm-hover);
+  }
+  .prange::-moz-range-thumb {
+    width: 1rem;
+    height: 1rem;
+    border-radius: 9999px;
+    background: var(--interaction-norm);
+    border: 2px solid var(--background-norm);
+  }
+  .prange:focus-visible {
+    outline: none;
+  }
+  .prange:focus-visible::-webkit-slider-thumb {
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+}
+
+/* Indeterminate progress: a segment that slides across the track, for runs whose
+   total size isn't known up front (the streaming catalog engine). */
+@keyframes pd-indeterminate {
+  0% {
+    left: -35%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+.pd-indeterminate {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  width: 35%;
+  border-radius: 9999px;
+  background: var(--interaction-norm);
+  animation: pd-indeterminate 1.8s var(--ease-out-quint) infinite;
+}
+
+/* Toast slide-in */
+@keyframes pd-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.pd-toast {
+  animation: pd-toast-in 0.18s var(--ease-out-quint) both;
+}
+
+/* Proton modal motion (Modal.scss) */
+@keyframes proton-modal-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes proton-modal-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+@keyframes proton-dialog-in {
+  0% {
+    transform: scale(0.9);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+@keyframes proton-dialog-out {
+  0% {
+    transform: scale(1);
+  }
+  100% {
+    transform: scale(0.9);
+  }
+}
+.proton-modal {
+  animation: 0.1s ease-out both proton-modal-in;
+}
+.proton-modal--out {
+  animation: 0.1s ease-out both proton-modal-out;
+}
+.proton-dialog {
+  transform-origin: center top;
+  animation: 0.25s var(--ease-out-cubic) both proton-dialog-in;
+}
+.proton-dialog--out {
+  animation: 0.2s var(--ease-out-cubic) both proton-dialog-out;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-norm) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-norm);
+  border-radius: 9px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--field-hover);
+  background-clip: content-box;
+}
+
+::selection {
+  background: rgb(109 74 255 / 0.35);
+}
+
+/* Respect the OS "reduce motion" setting — stop the genuinely continuous,
+   looping motion (the sliding indeterminate bar, pulsing placeholders), but keep
+   the short, one-shot UI transitions (modal/toast entrance, hovers) which read as
+   feedback, not motion. A blanket `* { animation: none }` made the modal feel
+   broken for reduce-motion users. */
+@media (prefers-reduced-motion: reduce) {
+  /* Stop the continuous, looping motion entirely. */
+  .pd-indeterminate,
+  .animate-pulse {
+    animation: none !important;
+  }
+  /* Swap the modal's scale-in/out and the toast's slide for a plain opacity fade:
+     a deliberate transition, minus the motion the setting is meant to avoid. */
+  .proton-dialog {
+    animation: proton-modal-in 0.18s ease-out both;
+  }
+  .proton-dialog--out {
+    animation: proton-modal-out 0.15s ease-out both;
+  }
+  .pd-toast {
+    animation: proton-modal-in 0.18s ease-out both;
+  }
+}

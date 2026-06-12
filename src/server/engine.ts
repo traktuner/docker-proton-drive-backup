@@ -1,17 +1,10 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { walkSource, walkSourceStream, type WalkedFile } from './local';
+import { walkSourceStream, type WalkedFile } from './local';
 import { catalog, diffFile } from './catalog';
 import { getUploadConfig, resolvePlan } from './upload-config';
-import {
-  listDrive,
-  createFolder,
-  upload,
-  trashDrive,
-  normalizeProtonPath,
-  type DriveEntry,
-} from './cli';
+import { createFolder, upload, trashDrive, normalizeProtonPath } from './cli';
 
 /**
  * Delta backup engine.
@@ -37,15 +30,6 @@ export interface DeltaResult {
   deletedCount: number;
   failedCount: number;
   message: string;
-}
-
-interface DriveNode {
-  rel: string;
-  type: 'file' | 'folder';
-  drivePath: string;
-  size?: number;
-  mtimeMs?: number;
-  sha1?: string;
 }
 
 /** Minimal glob → RegExp ( * within a segment, ** across, ? one char ). */
@@ -76,54 +60,6 @@ function sha1File(abs: string): Promise<string> {
   });
 }
 
-/** Recursively map the Drive target subtree: rel (relative to target) -> node. */
-async function listDriveSubtree(
-  targetDrivePath: string,
-  shouldCancel: () => boolean = () => false,
-): Promise<Map<string, DriveNode>> {
-  const map = new Map<string, DriveNode>();
-  const root = normalizeProtonPath(targetDrivePath);
-
-  async function recur(drivePath: string, relPrefix: string) {
-    if (shouldCancel()) return; // stop descending; runDelta returns cancelled after
-    const res = await listDrive(drivePath);
-    if (!res.ok) {
-      // Non-existent subfolder on first run → nothing to compare; ignore.
-      if (/not found|no such|not exist/i.test(res.error)) return;
-      throw new Error(res.error);
-    }
-    for (const e of res.data as DriveEntry[]) {
-      const rel = relPrefix ? `${relPrefix}/${e.name}` : e.name;
-      const childPath = `${drivePath}/${e.name}`;
-      map.set(rel, {
-        rel,
-        type: e.type,
-        drivePath: childPath,
-        size: e.size,
-        mtimeMs: e.mtimeMs,
-        sha1: e.sha1,
-      });
-      if (e.type === 'folder') await recur(childPath, rel);
-    }
-  }
-
-  await recur(root, '');
-  return map;
-}
-
-async function isChanged(local: WalkedFile, drive: DriveNode): Promise<boolean> {
-  if (drive.size !== local.size) return true;
-  // Same size + mtime (±2s) → treat as unchanged without hashing.
-  if (drive.mtimeMs != null && Math.abs(local.mtimeMs - drive.mtimeMs) <= 2000) return false;
-  // Size matches but mtime drifted: hash to avoid a needless re-upload.
-  if (!drive.sha1) return true;
-  try {
-    return (await sha1File(local.abs)) !== drive.sha1;
-  } catch {
-    return true; // unreadable → attempt re-upload
-  }
-}
-
 export interface EngineProgress {
   doneFiles: number;
   totalFiles: number;
@@ -151,250 +87,15 @@ function makeSpeedMeter() {
   };
 }
 
-export async function runDelta(
-  sourcePaths: string[],
-  targetPath: string,
-  mode: 'backup' | 'mirror',
-  excludes: string[] = [],
-  log: (msg: string) => void = () => {},
-  onProgress: (p: EngineProgress) => void = () => {},
-  shouldCancel: () => boolean = () => false,
-): Promise<DeltaResult> {
-  const target = normalizeProtonPath(targetPath);
-  const isExcluded = makeExcluder(excludes);
-  const cancelledResult = (): DeltaResult => ({
-    ok: false,
-    cancelled: true,
-    newCount: 0,
-    changedCount: 0,
-    unchangedCount: 0,
-    deletedCount: 0,
-    failedCount: 0,
-    message: 'Cancelled',
-  });
-
-  // 1. Local inventory (excluded paths removed). Collect element-by-element and
-  // filter into a new array — never `push(...bigArray)` / spread, which blows the
-  // call stack ("Maximum call stack size exceeded") past ~100k files.
-  const collected: WalkedFile[] = [];
-  for (const sp of sourcePaths) {
-    for (const f of await walkSource(sp)) collected.push(f);
-  }
-  const localFiles = collected.filter((f) => !isExcluded(f.rel));
-  if (collected.length !== localFiles.length) {
-    log(`Excluded ${collected.length - localFiles.length} file(s) by pattern`);
-  }
-  const localByRel = new Map(localFiles.map((f) => [f.rel, f]));
-  const managedRoots = new Set(sourcePaths.map((sp) => path.basename(sp)));
-
-  // All directory rels implied by the local tree (for mirror folder retention).
-  const localDirs = new Set<string>();
-  for (const f of localFiles) {
-    const parts = f.rel.split('/');
-    for (let i = 1; i < parts.length; i++) localDirs.add(parts.slice(0, i).join('/'));
-  }
-
-  // 2. Drive inventory.
-  log('Scanning Drive…');
-  const drive = await listDriveSubtree(target, shouldCancel);
-  if (shouldCancel()) return cancelledResult();
-
-  // 3. Classify local files.
-  const toUpload: WalkedFile[] = [];
-  let newCount = 0;
-  let changedCount = 0;
-  let unchangedCount = 0;
-  for (const f of localFiles) {
-    if (shouldCancel()) return cancelledResult();
-    const d = drive.get(f.rel);
-    if (!d || d.type !== 'file') {
-      toUpload.push(f);
-      newCount++;
-    } else if (await isChanged(f, d)) {
-      toUpload.push(f);
-      changedCount++;
-    } else {
-      unchangedCount++;
-    }
-  }
-  log(`${newCount} new, ${changedCount} changed, ${unchangedCount} unchanged`);
-
-  // 4. Ensure parent folders exist (shallow → deep), then upload.
-  let failedCount = 0;
-  // Logged once if the CLI still can't `merge` files and we fell back to replace
-  // (so the job log shows whether Proton's fix has landed yet for this run).
-  let mergeFellBack = false;
-  const parentOf = (f: WalkedFile) => {
-    const relDir = path.dirname(f.rel);
-    return relDir === '.' ? target : `${target}/${relDir}`;
-  };
-
-  const neededDirs = new Set<string>();
-  for (const f of toUpload) {
-    const parts = path.dirname(f.rel).split('/');
-    if (parts[0] === '.') continue;
-    for (let i = 1; i <= parts.length; i++) neededDirs.add(parts.slice(0, i).join('/'));
-  }
-  for (const relDir of [...neededDirs].sort((a, b) => a.split('/').length - b.split('/').length)) {
-    if (drive.has(relDir)) continue;
-    const parts = relDir.split('/');
-    const name = parts[parts.length - 1];
-    const parentRel = parts.slice(0, -1).join('/');
-    const parentDrive = parentRel ? `${target}/${parentRel}` : target;
-    const res = await createFolder(parentDrive, name);
-    if (res.ok) drive.set(relDir, { rel: relDir, type: 'folder', drivePath: `${target}/${relDir}` });
-    // If it already exists the CLI errors harmlessly; ignore.
-  }
-
-  const totalFiles = toUpload.length;
-  const totalBytes = toUpload.reduce((s, f) => s + f.size, 0);
-  let doneFiles = 0;
-  let doneBytes = 0;
-  let cancelled = false;
-  onProgress({ doneFiles, totalFiles, doneBytes, totalBytes, current: 'Starting upload…' });
-
-  // Upload one batch (single parent folder) with backoff + cancel-awareness.
-  const uploadBatch = async (parentDrive: string, files: WalkedFile[]): Promise<void> => {
-    if (shouldCancel()) {
-      cancelled = true;
-      return;
-    }
-    const where = parentDrive.replace('/my-files', '') || '/';
-    onProgress({ doneFiles, totalFiles, doneBytes, totalBytes, current: where });
-    let ok = false;
-    let lastErr = '';
-    const maxAttempts = 4;
-    for (let attempt = 1; attempt <= maxAttempts && !shouldCancel(); attempt++) {
-      // `merge` = write a new revision (preserves Drive's version history). The
-      // CLI can't merge files yet and upload() transparently falls back to
-      // `replace` until Proton ships the fix - at which point this becomes a true
-      // revisioned update with no code change here.
-      const res = await upload(
-        files.map((f) => f.abs),
-        parentDrive,
-        'merge',
-        'merge',
-        () => {
-          if (!mergeFellBack) {
-            mergeFellBack = true;
-            log('Note: CLI can’t merge files yet - using replace (no version history this run)');
-          }
-        },
-      );
-      if (res.code === 0) {
-        ok = true;
-        break;
-      }
-      lastErr = (res.stderr || res.stdout).trim().slice(0, 200);
-      if (attempt < maxAttempts) {
-        const waitMs = 5000 * 2 ** (attempt - 1); // 5s, 10s, 20s
-        log(`  batch failed (try ${attempt}/${maxAttempts}), retrying in ${waitMs / 1000}s: ${lastErr}`);
-        for (let w = 0; w < waitMs && !shouldCancel(); w += 500) await new Promise((r) => setTimeout(r, 500));
-      }
-    }
-    if (ok) {
-      doneFiles += files.length;
-      doneBytes += files.reduce((s, f) => s + f.size, 0);
-    } else if (!shouldCancel()) {
-      failedCount += files.length;
-      log(`  upload failed after ${maxAttempts} tries: ${lastErr}`);
-    }
-    onProgress({ doneFiles, totalFiles, doneBytes, totalBytes, current: where });
-  };
-
-  // Partition by size, smallest first. Small files upload in parallel (worker
-  // pool); large files strictly one-at-a-time (bandwidth-bound, avoids several
-  // huge transfers at once).
-  const cfg = getUploadConfig();
-  const thresholdBytes = cfg.thresholdMB * 1024 * 1024;
-  const { workers, streamsPerWorker } = resolvePlan(cfg.concurrency);
-  const asc = (a: WalkedFile, b: WalkedFile) => a.size - b.size;
-  const smallFiles = toUpload.filter((f) => f.size < thresholdBytes).sort(asc);
-  const largeFiles = toUpload.filter((f) => f.size >= thresholdBytes).sort(asc);
-  log(
-    `${smallFiles.length} small (<${cfg.thresholdMB}MB, ${workers}×~${streamsPerWorker} parallel) + ${largeFiles.length} large (serial)`,
-  );
-
-  // Small-file jobs: group by parent, chunk so the pool stays fed and the CLI
-  // runs ~streamsPerWorker streams per call (big batch when not throttling).
-  const chunkSize = streamsPerWorker >= 4 ? 200 : streamsPerWorker;
-  const smallByParent = new Map<string, WalkedFile[]>();
-  for (const f of smallFiles) {
-    const p = parentOf(f);
-    if (!smallByParent.has(p)) smallByParent.set(p, []);
-    smallByParent.get(p)!.push(f);
-  }
-  const jobs: { parent: string; files: WalkedFile[] }[] = [];
-  for (const [p, files] of smallByParent) {
-    for (let i = 0; i < files.length; i += chunkSize) jobs.push({ parent: p, files: files.slice(i, i + chunkSize) });
-  }
-
-  // Worker pool for small files.
-  let nextJob = 0;
-  await Promise.all(
-    Array.from({ length: Math.max(1, workers) }, async () => {
-      while (nextJob < jobs.length && !shouldCancel()) {
-        const job = jobs[nextJob++];
-        await uploadBatch(job.parent, job.files);
-      }
-    }),
-  );
-
-  // Large files: strictly serial, one file per call.
-  for (const f of largeFiles) {
-    if (shouldCancel()) break;
-    await uploadBatch(parentOf(f), [f]);
-  }
-  if (shouldCancel()) cancelled = true;
-
-  // 5. Mirror: trash Drive items (within managed roots) with no local match.
-  // Skipped if the run was cancelled - deleting on a partial upload is unsafe.
-  let deletedCount = 0;
-  if (mode === 'mirror' && !cancelled) {
-    const toDelete: DriveNode[] = [];
-    for (const node of drive.values()) {
-      const top = node.rel.split('/')[0];
-      if (!managedRoots.has(top)) continue; // never touch unrelated Drive content
-      const existsLocally =
-        node.type === 'file' ? localByRel.has(node.rel) : localDirs.has(node.rel) || managedRoots.has(node.rel);
-      if (!existsLocally) toDelete.push(node);
-    }
-    // Only trash top-most items (trashing a folder removes its children).
-    const tops = toDelete.filter(
-      (n) => !toDelete.some((o) => o !== n && n.rel.startsWith(`${o.rel}/`)),
-    );
-    for (const n of tops) {
-      const res = await trashDrive(n.drivePath);
-      if (res.ok) deletedCount++;
-      else failedCount++;
-    }
-    if (tops.length) log(`Removed ${deletedCount} item(s) no longer present locally`);
-  }
-
-  const parts = [`${doneFiles} uploaded`, `${unchangedCount} unchanged`];
-  if (mode === 'mirror' && !cancelled) parts.push(`${deletedCount} removed`);
-  if (failedCount) parts.push(`${failedCount} failed`);
-  return {
-    ok: failedCount === 0 && !cancelled,
-    cancelled,
-    newCount,
-    changedCount,
-    unchangedCount,
-    deletedCount,
-    failedCount,
-    message: cancelled ? `Cancelled - ${parts.join(', ')}` : parts.join(', '),
-  };
-}
-
 /**
  * Catalog-based delta engine — scales to millions of files.
  *
- * vs runDelta(): never re-lists Drive (the per-folder `list` spawn is fatal at
- * scale) and never holds the whole tree in memory. It streams the local walk,
- * diffs each file against our persisted catalog (catalog.ts), uploads only what
- * changed in bounded per-folder batches, and records the result. Drive is hit
- * only to upload (and, in mirror mode, to trash). Memory stays flat regardless
- * of file count.
+ * Never re-lists Drive (a per-folder `list` spawn is fatal at scale) and never
+ * holds the whole tree in memory. It streams the local walk, diffs each file
+ * against our persisted catalog (catalog.ts), uploads only what changed in
+ * bounded per-folder batches, and records the result. Drive is hit only to
+ * upload (and, in mirror mode, to trash). Memory stays flat regardless of file
+ * count.
  *
  *  - backup: upload new + changed; never delete; only writes the catalog for
  *    files it actually uploads, so an unchanged 4M-file run does ~no DB writes.
@@ -608,6 +309,25 @@ export async function runCatalogDelta(
     else pending.set(parentDrive, [item]);
   };
 
+  // Mirror mode marks every unchanged file as "seen this run" so the deletion pass
+  // can tell what vanished locally. Doing that as one UPDATE per file means one
+  // WAL commit per file — fatal for millions of unchanged files. We buffer the
+  // rels and flush them in one transaction every TOUCH_FLUSH. CRITICAL: the buffer
+  // MUST be drained before catalog.stale() runs, or still-buffered (unflushed)
+  // files would be misread as stale and wrongly trashed. flushTouches() below is
+  // called both at the threshold and right before the stale() computation.
+  const TOUCH_FLUSH = 2000;
+  const touchBuf: string[] = [];
+  const flushTouches = () => {
+    if (touchBuf.length === 0) return;
+    catalog.touchMany(setId, touchBuf, seenAt);
+    touchBuf.length = 0;
+  };
+  const queueTouch = (rel: string) => {
+    touchBuf.push(rel);
+    if (touchBuf.length >= TOUCH_FLUSH) flushTouches();
+  };
+
   log('Comparing against catalog…');
   for (const sp of sourcePaths) {
     for await (const file of walkSourceStream(sp)) {
@@ -616,7 +336,7 @@ export async function runCatalogDelta(
         break;
       }
       if (isExcluded(file.rel)) {
-        if (mode === 'mirror') catalog.touch(setId, file.rel, seenAt); // keep, don't trash
+        if (mode === 'mirror') queueTouch(file.rel); // keep, don't trash
         continue;
       }
 
@@ -633,7 +353,7 @@ export async function runCatalogDelta(
           // Same content, only mtime drifted: refresh catalog so we skip hashing
           // next time, count as unchanged, no upload.
           unchangedCount++;
-          if (mode === 'mirror') catalog.touch(setId, file.rel, seenAt);
+          if (mode === 'mirror') queueTouch(file.rel);
           else catalog.upsertFile(setId, file.rel, file.size, file.mtimeMs, sha1, seenAt);
           continue;
         }
@@ -641,7 +361,7 @@ export async function runCatalogDelta(
 
       if (!doUpload) {
         unchangedCount++;
-        if (mode === 'mirror') catalog.touch(setId, file.rel, seenAt);
+        if (mode === 'mirror') queueTouch(file.rel);
         continue;
       }
 
@@ -674,6 +394,11 @@ export async function runCatalogDelta(
   }
   await Promise.all(inflight);
   if (shouldCancel()) cancelled = true;
+
+  // Persist any buffered "seen" marks before deciding what's stale — otherwise an
+  // unflushed touch would make a present file look deleted. Safe on cancel too:
+  // the deletion pass below is gated on !cancelled, so a partial flush never trashes.
+  flushTouches();
 
   // Mirror: trash catalog entries that no longer exist locally (scoped to roots).
   if (mode === 'mirror' && !cancelled) {

@@ -13,6 +13,28 @@ import { getDb } from './db';
  * huge sets you simply don't run that often.
  */
 
+import type { Statement } from 'better-sqlite3';
+type Stmt = Statement<unknown[]>;
+
+/**
+ * Prepared statements, compiled once for the process lifetime. better-sqlite3
+ * (11.x) does NOT cache compiled statements, so calling db().prepare(...) per file
+ * would re-parse the SQL millions of times in the hot diff loop. We compile each
+ * statement lazily on first use — AFTER the table exists — and reuse it. getDb()
+ * returns a process singleton (one connection, no reconnect), so these stay valid.
+ */
+let _stmts: {
+  getFile: Stmt;
+  hasDir: Stmt;
+  upsertFile: Stmt;
+  upsertDir: Stmt;
+  touch: Stmt;
+  stale: Stmt;
+  removeOne: Stmt;
+  clear: Stmt;
+  count: Stmt;
+} | null = null;
+
 let ensured = false;
 function db(): ReturnType<typeof getDb> {
   const d = getDb();
@@ -35,6 +57,38 @@ function db(): ReturnType<typeof getDb> {
   return d;
 }
 
+/** The compiled statements, prepared once against the (ensured) catalog table. */
+function stmts() {
+  if (_stmts) return _stmts;
+  const d = db(); // ensures the table exists before we compile against it
+  _stmts = {
+    getFile: d.prepare(
+      "SELECT size, mtime_ms, sha1 FROM backup_catalog WHERE set_id = ? AND rel = ? AND kind = 'file'",
+    ),
+    hasDir: d.prepare("SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel = ? AND kind = 'dir'"),
+    upsertFile: d.prepare(
+      `INSERT INTO backup_catalog (set_id, rel, kind, size, mtime_ms, sha1, seen_at)
+       VALUES (?, ?, 'file', ?, ?, ?, ?)
+       ON CONFLICT(set_id, rel) DO UPDATE SET
+         kind = 'file', size = excluded.size, mtime_ms = excluded.mtime_ms,
+         sha1 = excluded.sha1, seen_at = excluded.seen_at`,
+    ),
+    upsertDir: d.prepare(
+      `INSERT INTO backup_catalog (set_id, rel, kind, seen_at)
+       VALUES (?, ?, 'dir', ?)
+       ON CONFLICT(set_id, rel) DO UPDATE SET seen_at = excluded.seen_at`,
+    ),
+    touch: d.prepare('UPDATE backup_catalog SET seen_at = ? WHERE set_id = ? AND rel = ?'),
+    stale: d.prepare(
+      'SELECT rel, kind FROM backup_catalog WHERE set_id = ? AND seen_at < ? ORDER BY length(rel)',
+    ),
+    removeOne: d.prepare('DELETE FROM backup_catalog WHERE set_id = ? AND rel = ?'),
+    clear: d.prepare('DELETE FROM backup_catalog WHERE set_id = ?'),
+    count: d.prepare('SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ?'),
+  };
+  return _stmts;
+}
+
 export interface CatalogFile {
   size: number;
   mtimeMs: number;
@@ -43,66 +97,60 @@ export interface CatalogFile {
 
 export const catalog = {
   getFile(setId: string, rel: string): CatalogFile | undefined {
-    const r = db()
-      .prepare("SELECT size, mtime_ms, sha1 FROM backup_catalog WHERE set_id = ? AND rel = ? AND kind = 'file'")
-      .get(setId, rel) as { size: number; mtime_ms: number; sha1: string | null } | undefined;
+    const r = stmts().getFile.get(setId, rel) as
+      | { size: number; mtime_ms: number; sha1: string | null }
+      | undefined;
     return r ? { size: r.size, mtimeMs: r.mtime_ms, sha1: r.sha1 } : undefined;
   },
 
   hasDir(setId: string, rel: string): boolean {
-    return !!db()
-      .prepare("SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel = ? AND kind = 'dir'")
-      .get(setId, rel);
+    return !!stmts().hasDir.get(setId, rel);
   },
 
   upsertFile(setId: string, rel: string, size: number, mtimeMs: number, sha1: string | null, seenAt: number): void {
-    db()
-      .prepare(
-        `INSERT INTO backup_catalog (set_id, rel, kind, size, mtime_ms, sha1, seen_at)
-         VALUES (?, ?, 'file', ?, ?, ?, ?)
-         ON CONFLICT(set_id, rel) DO UPDATE SET
-           kind = 'file', size = excluded.size, mtime_ms = excluded.mtime_ms,
-           sha1 = excluded.sha1, seen_at = excluded.seen_at`,
-      )
-      .run(setId, rel, size, mtimeMs, sha1, seenAt);
+    stmts().upsertFile.run(setId, rel, size, mtimeMs, sha1, seenAt);
   },
 
   upsertDir(setId: string, rel: string, seenAt: number): void {
-    db()
-      .prepare(
-        `INSERT INTO backup_catalog (set_id, rel, kind, seen_at)
-         VALUES (?, ?, 'dir', ?)
-         ON CONFLICT(set_id, rel) DO UPDATE SET seen_at = excluded.seen_at`,
-      )
-      .run(setId, rel, seenAt);
+    stmts().upsertDir.run(setId, rel, seenAt);
   },
 
   /** Mark an existing row as seen this run (used for mirror deletion detection). */
   touch(setId: string, rel: string, seenAt: number): void {
-    db().prepare('UPDATE backup_catalog SET seen_at = ? WHERE set_id = ? AND rel = ?').run(seenAt, setId, rel);
+    stmts().touch.run(seenAt, setId, rel);
+  },
+
+  /**
+   * Mark many rows as seen this run, in a single transaction. The hot path for a
+   * mirror backup of a mostly-unchanged tree: instead of one autocommit (and one
+   * WAL frame) per file, the whole batch commits once. Callers MUST flush all
+   * pending touches before stale() runs, or unflushed files would look stale.
+   */
+  touchMany(setId: string, rels: string[], seenAt: number): void {
+    const stmt = stmts().touch;
+    db().transaction((rs: string[]) => {
+      for (const r of rs) stmt.run(seenAt, setId, r);
+    })(rels);
   },
 
   /** Rows not seen this run = present in the catalog but gone locally. */
   stale(setId: string, before: number): { rel: string; kind: string }[] {
-    return db()
-      .prepare('SELECT rel, kind FROM backup_catalog WHERE set_id = ? AND seen_at < ? ORDER BY length(rel)')
-      .all(setId, before) as { rel: string; kind: string }[];
+    return stmts().stale.all(setId, before) as { rel: string; kind: string }[];
   },
 
   remove(setId: string, rels: string[]): void {
-    const stmt = db().prepare('DELETE FROM backup_catalog WHERE set_id = ? AND rel = ?');
+    const stmt = stmts().removeOne;
     db().transaction((rs: string[]) => {
       for (const r of rs) stmt.run(setId, r);
     })(rels);
   },
 
   clear(setId: string): void {
-    db().prepare('DELETE FROM backup_catalog WHERE set_id = ?').run(setId);
+    stmts().clear.run(setId);
   },
 
   count(setId: string): number {
-    return (db().prepare('SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ?').get(setId) as { n: number })
-      .n;
+    return (stmts().count.get(setId) as { n: number }).n;
   },
 
   /** Run a batch of writes in a single transaction (big speed-up at scale). */

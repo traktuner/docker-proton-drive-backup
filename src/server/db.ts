@@ -52,7 +52,18 @@ export function getDb(): Database.Database {
   if (_db) return _db;
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   const db = new Database(DB_PATH);
+  // WAL + NORMAL is the recommended high-throughput, crash-safe combo: no fsync
+  // per commit (the dominant cost when writing the catalog for millions of files),
+  // and still no corruption — at most the last transaction is lost on an OS/power
+  // crash, which the next backup run self-heals (the catalog only records what we
+  // uploaded). The other pragmas keep temp data and the page cache in memory and
+  // let SQLite mmap the DB, all of which speed up the per-file point lookups.
   db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('temp_store = MEMORY');
+  db.pragma('cache_size = -65536'); // ~64 MB page cache (negative = KiB)
+  db.pragma('mmap_size = 268435456'); // 256 MB
+  db.pragma('wal_autocheckpoint = 2000');
   db.exec(`
     CREATE TABLE IF NOT EXISTS backup_sets (
       id TEXT PRIMARY KEY,

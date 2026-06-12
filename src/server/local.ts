@@ -35,58 +35,14 @@ export interface WalkedFile {
 }
 
 /**
- * Recursively list all files under an absolute source path. A single source
- * file yields one entry (rel = its name); a directory yields its files with
- * rel = "<dirname>/<path-inside>" - mirroring how the CLI lays them on Drive.
- * Hidden dotfiles are skipped (consistent with the browser).
- */
-export async function walkSource(absPath: string): Promise<WalkedFile[]> {
-  const base = path.basename(absPath);
-  let st;
-  try {
-    st = await fs.stat(absPath);
-  } catch {
-    return [];
-  }
-  if (st.isFile()) {
-    return [{ abs: absPath, rel: base, size: st.size, mtimeMs: st.mtimeMs }];
-  }
-  if (!st.isDirectory()) return [];
-
-  const out: WalkedFile[] = [];
-  async function recur(dir: string, relPrefix: string) {
-    let ents;
-    try {
-      ents = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of ents) {
-      if (e.name.startsWith('.')) continue;
-      const childAbs = path.join(dir, e.name);
-      const childRel = `${relPrefix}/${e.name}`;
-      if (e.isDirectory()) {
-        await recur(childAbs, childRel);
-      } else if (e.isFile()) {
-        try {
-          const s = await fs.stat(childAbs);
-          out.push({ abs: childAbs, rel: childRel, size: s.size, mtimeMs: s.mtimeMs });
-        } catch {
-          /* unreadable file - skip */
-        }
-      }
-    }
-  }
-  await recur(absPath, base);
-  return out;
-}
-
-/**
- * Streaming variant of walkSource: yields one file at a time instead of building
- * the full array. This is what keeps the catalog engine's memory bounded — a
- * 4-million-file source never materialises as a 4-million-element array/Map.
- * Directories are not yielded; the engine derives needed parent folders from
- * each file's rel path.
+ * Streaming walk of all files under an absolute source path: yields one file at
+ * a time instead of building the full array. A single source file yields one
+ * entry (rel = its name); a directory yields its files with rel =
+ * "<dirname>/<path-inside>" — mirroring how the CLI lays them on Drive. Hidden
+ * dotfiles are skipped (consistent with the browser). This is what keeps the
+ * catalog engine's memory bounded — a 4-million-file source never materialises
+ * as a 4-million-element array/Map. Directories are not yielded; the engine
+ * derives needed parent folders from each file's rel path.
  */
 export async function* walkSourceStream(absPath: string): AsyncGenerator<WalkedFile> {
   const base = path.basename(absPath);

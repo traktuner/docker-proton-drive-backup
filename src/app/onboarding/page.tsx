@@ -86,8 +86,9 @@ export default function Onboarding() {
         backgroundRepeat: 'no-repeat',
       }}
     >
-      {/* Login box centred within the top third of the viewport. */}
-      <div className="flex min-h-[100vh] items-center justify-center p-6">
+      {/* Leave the first third empty; the box begins right below that line. */}
+      <div className="h-[33.333vh] shrink-0" />
+      <div className="flex justify-center px-6">
         <div className="w-full max-w-md rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)] p-8 shadow-2xl">
         <div className="mb-6 flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[color:var(--accent)]">

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Footer from '@/components/Footer';
 
 type Phase = 'checking' | 'idle' | 'connecting' | 'awaiting' | 'error';
 
@@ -75,8 +76,18 @@ export default function Onboarding() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center p-6">
-      <div className="w-full max-w-md rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)] p-8 shadow-2xl">
+    // Proton account-style radial gradient, scoped to onboarding (the app proper
+    // keeps its own flat panel background).
+    <div
+      className="flex min-h-screen flex-col"
+      style={{
+        background: 'radial-gradient(#221850 15%, #191333 35%, #0e0d12)',
+        backgroundAttachment: 'fixed',
+        backgroundRepeat: 'no-repeat',
+      }}
+    >
+      <div className="flex flex-1 items-center justify-center p-6">
+        <div className="w-full max-w-md rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)] p-8 shadow-2xl">
         <div className="mb-6 flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[color:var(--accent)]">
             <svg
@@ -163,7 +174,9 @@ export default function Onboarding() {
             </button>
           </div>
         )}
+        </div>
       </div>
+      <Footer />
     </div>
   );
 }

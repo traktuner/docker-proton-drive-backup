@@ -79,12 +79,27 @@ export async function runCli(
 // Active upload processes (possibly several concurrent), so a cancel kills them
 // all. On globalThis so the cancel API route (a separate Next.js module instance)
 // kills the SAME processes the running job registered — see control.ts.
-const _g = globalThis as unknown as { __pdActiveUploads?: Set<ChildProcessWithoutNullStreams> };
+const _g = globalThis as unknown as {
+  __pdActiveUploads?: Set<ChildProcessWithoutNullStreams>;
+  __pdBackupRunning?: { v: boolean };
+};
 const activeUploads = _g.__pdActiveUploads ?? (_g.__pdActiveUploads = new Set<ChildProcessWithoutNullStreams>());
 export function killActiveUpload() {
   for (const p of activeUploads) p.kill('SIGKILL');
 }
-export const uploadsBusy = () => activeUploads.size > 0;
+
+// A backup run does more than spawn upload processes — it also creates folders and
+// diffs/hashes between batches, leaving windows with no active upload. Clearing the
+// CLI tree cache (resync) in one of those windows can evict a just-created folder
+// node and break the run ("Node not found"). So mark the whole run busy, not just
+// the upload spawns. On globalThis to survive across route module instances.
+const backupRunning = _g.__pdBackupRunning ?? (_g.__pdBackupRunning = { v: false });
+export function setBackupRunning(v: boolean) {
+  backupRunning.v = v;
+}
+
+/** True while a backup is uploading OR otherwise mid-run — used to defer resync. */
+export const uploadsBusy = () => activeUploads.size > 0 || backupRunning.v;
 
 /**
  * Clear the CLI's tree cache so the next `list` re-fetches fresh from the server.

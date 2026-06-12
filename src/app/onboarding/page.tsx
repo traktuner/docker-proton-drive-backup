@@ -86,8 +86,7 @@ export default function Onboarding() {
         backgroundRepeat: 'no-repeat',
       }}
     >
-      {/* Leave the first third empty; the box begins right below that line. */}
-      <div className="h-[33.333vh] shrink-0" />
+      <div className="h-[22vh] shrink-0" />
       <div className="flex justify-center px-6">
         <div className="w-full max-w-md rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)] p-8 shadow-2xl">
         <div className="mb-6 flex items-center gap-3">

@@ -1,5 +1,5 @@
 import { backupSets } from './db';
-import { killActiveUpload, drivePathExists, normalizeProtonPath } from './cli';
+import { killActiveUpload, drivePathExists, normalizeProtonPath, setBackupRunning } from './cli';
 import { runCatalogDelta, uploadSourceTrees, relBaseFor } from './engine';
 import { progress } from './progress';
 import { control } from './control';
@@ -37,6 +37,9 @@ async function doRunBackupSet(id: string): Promise<void> {
 
   const startedAt = Date.now();
   control.clear(id);
+  // Mark the whole run busy so a concurrent cache resync can't wipe folder nodes
+  // we just created (cleared in the finally below).
+  setBackupRunning(true);
   backupSets.updateStatus(id, 'running', 'Starting…', true);
   const log = (msg: string) => backupSets.updateStatus(id, 'running', msg, false);
   let ok = false;
@@ -132,6 +135,7 @@ async function doRunBackupSet(id: string): Promise<void> {
     }
     progress.clear(id);
     control.clear(id);
+    setBackupRunning(false);
   }
 }
 

@@ -73,10 +73,12 @@ function relTime(ts: number): string {
   return d < 7 ? `${d}d ago` : `${Math.round(d / 7)}w ago`;
 }
 
+// Proton signal tokens (see storybook): success → green, error/cancelled → the
+// danger red. A run that didn't complete successfully reads as the failure colour.
 const RUN_DOT: Record<RunRow['status'], string> = {
   success: 'var(--signal-success)',
   error: 'var(--signal-danger)',
-  cancelled: 'var(--text-weak)',
+  cancelled: 'var(--signal-danger)',
 };
 
 const STATUS_SIGNAL: Record<BackupSet['lastStatus'], string | null> = {
@@ -338,33 +340,33 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                     )}
                   </p>
 
-                  {/* Trust signals: last successful run + a sparkline of recent outcomes. */}
-                  {s.lastStatus !== 'running' && (s.lastSuccessAt || (s.recentRuns?.length ?? 0) > 0) && (
-                    <div className="mt-1.5 flex items-center gap-2 text-[11px] text-[color:var(--muted)]">
-                      <span className="inline-flex items-center gap-1">
+                  {/* Trust signal: one dot for the LAST run (colour = its outcome,
+                      hover for status/time/message) + whether a success ever happened. */}
+                  {(() => {
+                    if (s.lastStatus === 'running') return null;
+                    const last = s.recentRuns?.[0];
+                    const status =
+                      last?.status ??
+                      (s.lastStatus === 'success' || s.lastStatus === 'error' || s.lastStatus === 'cancelled'
+                        ? s.lastStatus
+                        : null);
+                    if (!status) return null; // never run yet → nothing to show
+                    const when = last?.finishedAt ?? s.lastRunAt ?? undefined;
+                    const message = last?.message ?? s.lastMessage ?? undefined;
+                    const tip = `${status}${when ? ` · ${relTime(when)}` : ''}${message ? ` · ${message}` : ''}`;
+                    return (
+                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-[color:var(--muted)]">
                         <span
-                          className="h-1.5 w-1.5 rounded-full"
-                          style={{ background: s.lastSuccessAt ? 'var(--signal-success)' : 'var(--text-weak)' }}
+                          className="h-1.5 w-1.5 shrink-0 cursor-help rounded-full"
+                          style={{ background: RUN_DOT[status] }}
+                          title={tip}
                         />
-                        {s.lastSuccessAt ? `Last success ${relTime(s.lastSuccessAt)}` : 'No successful run yet'}
-                      </span>
-                      {s.recentRuns && s.recentRuns.length > 0 && (
-                        <span className="flex items-center gap-1" title="Recent runs (newest right)">
-                          {s.recentRuns
-                            .slice()
-                            .reverse()
-                            .map((r) => (
-                              <span
-                                key={r.id}
-                                className="h-1.5 w-1.5 rounded-full"
-                                style={{ background: RUN_DOT[r.status] }}
-                                title={`${r.status} · ${relTime(r.finishedAt)}${r.message ? ` · ${r.message}` : ''}`}
-                              />
-                            ))}
+                        <span>
+                          {s.lastSuccessAt ? `Last success ${relTime(s.lastSuccessAt)}` : 'No successful run yet'}
                         </span>
-                      )}
-                    </div>
-                  )}
+                      </div>
+                    );
+                  })()}
 
                   {s.lastStatus === 'running' && s.progress ? (
                     <div className="mt-1.5">

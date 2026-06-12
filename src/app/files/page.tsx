@@ -49,15 +49,18 @@ interface Estimate {
   counting: boolean;
 }
 
-/** Convert unticked descendants into engine exclude globs (relative to source). */
+/**
+ * Convert unticked descendants into engine exclude globs. The engine matches
+ * excludes against each file's path relative to LOCAL_ROOT (the "<set-folder>/"
+ * prefix is stripped before matching), so the globs are simply that LOCAL_ROOT-
+ * relative path — e.g. an unticked "/a/b/Fotos/private" → "a/b/Fotos/private".
+ */
 function derivedExcludes(roots: string[], excluded: string[]): string[] {
   const out: string[] = [];
   for (const e of excluded) {
-    const r = roots.find((x) => e === x || e.startsWith(`${x}/`));
-    if (!r) continue;
-    const base = r.split('/').filter(Boolean).pop() || '';
-    const within = e.slice(r.length).replace(/^\//, '');
-    const rel = within ? `${base}/${within}` : base;
+    const underRoot = roots.some((x) => e === x || e.startsWith(`${x}/`));
+    if (!underRoot) continue;
+    const rel = e.replace(/^\/+/, '');
     out.push(rel, `${rel}/**`); // match the item itself and everything under it
   }
   return out;
@@ -372,6 +375,9 @@ export default function FilesPage() {
   };
 
   const targetLabel = targetPath === '/' ? 'Drive (root)' : `Drive${targetPath}`;
+  // Preview of the set's top-level Drive folder (mirrors server sanitizeSegment).
+  // eslint-disable-next-line no-control-regex
+  const previewFolder = name.replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
 
   return (
     <div className="flex min-h-screen flex-col lg:h-screen">
@@ -489,6 +495,15 @@ export default function FilesPage() {
                 placeholder="e.g. Photos to Drive"
                 className="w-full pfield px-3 py-2 text-sm"
               />
+              {name.trim() && (
+                <p className="truncate text-[11px] text-[color:var(--muted)]">
+                  Saved to{' '}
+                  <span className="text-[color:var(--accent-2)]">
+                    {targetLabel}/{previewFolder}/…
+                  </span>{' '}
+                  — each source keeps its folder path, so same-named folders never collide.
+                </p>
+              )}
             </div>
 
             {/* Mode */}

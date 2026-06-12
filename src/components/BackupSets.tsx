@@ -19,6 +19,7 @@ export interface BackupSet {
   name: string;
   sourcePaths: string[];
   targetPath: string;
+  targetSubfolder: string;
   mode: 'add' | 'backup' | 'mirror';
   schedule: 'off' | 'hourly' | 'daily' | 'weekly';
   scheduleHour: number;
@@ -326,7 +327,9 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   </div>
                   <p className="mt-1 truncate text-xs text-[color:var(--muted)]">
                     {s.sourcePaths.length} source{s.sourcePaths.length > 1 ? 's' : ''} →{' '}
-                    <span className="text-[color:var(--accent-2)]">{targetLabel(s.targetPath)}</span>
+                    <span className="text-[color:var(--accent-2)]">
+                      {targetLabel(s.targetPath)}/{s.targetSubfolder}
+                    </span>
                   </p>
                   <p className="mt-0.5 text-xs text-[color:var(--muted)]">
                     {MODE_LABEL[s.mode]} · {scheduleLabel(s)}

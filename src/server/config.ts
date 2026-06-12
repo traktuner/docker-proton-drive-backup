@@ -3,7 +3,7 @@ import path from 'node:path';
 import YAML from 'yaml';
 import { backupSets, type BackupMode, type Schedule } from './db';
 import { catalog } from './catalog';
-import { LOCAL_ROOT, resolveLocal } from './local';
+import { LOCAL_ROOT, resolveLocal, sanitizeSegment } from './local';
 
 /**
  * Backup sets as portable, version-controllable YAML. Source paths are exported
@@ -28,6 +28,9 @@ export function exportConfig(): string {
       mode: s.mode,
       schedule: s.schedule,
     };
+    // Only emit the subfolder when it isn't the plain derived-from-name default
+    // (e.g. a uniqueness suffix), so common configs stay clean and human-readable.
+    if (s.targetSubfolder !== sanitizeSegment(s.name)) item.targetFolder = s.targetSubfolder;
     if (s.schedule === 'daily' || s.schedule === 'weekly') {
       item.time = `${pad(s.scheduleHour)}:${pad(s.scheduleMinute)}`;
     }
@@ -82,10 +85,13 @@ export function importConfig(text: string): ImportResult {
     const [h, m] = String(raw?.time ?? '03:00').split(':');
     const dowIdx = DOW.findIndex((d) => d.toLowerCase() === String(raw?.dayOfWeek ?? '').toLowerCase());
 
+    const rawFolder = typeof raw?.targetFolder === 'string' ? raw.targetFolder.trim() : '';
     const payload = {
       name,
       sourcePaths,
       targetPath: target,
+      // Only honoured on create (stable after that); db.create derives it if empty.
+      targetSubfolder: rawFolder || undefined,
       mode,
       schedule,
       scheduleHour: Math.min(23, Math.max(0, parseInt(h, 10) || 3)),

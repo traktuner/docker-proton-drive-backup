@@ -78,8 +78,23 @@ export default function Onboarding() {
     <div className="flex min-h-screen items-center justify-center p-6">
       <div className="w-full max-w-md rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)] p-8 shadow-2xl">
         <div className="mb-6 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[color:var(--accent)] text-lg font-bold">
-            ◇
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[color:var(--accent)]">
+            <svg
+              viewBox="0 0 32 32"
+              className="h-6 w-6"
+              fill="none"
+              stroke="#fff"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <g transform="translate(4 4)">
+                <path d="M7 18a4.6 4.4 0 0 1 0 -9a5 4.5 0 0 1 11 2h1a3.5 3.5 0 0 1 0 7h-1" />
+                <path d="M9 15l3 -3l3 3" />
+                <path d="M12 12l0 9" />
+              </g>
+            </svg>
           </div>
           <div>
             <h1 className="text-lg font-semibold">Proton Drive Backup</h1>

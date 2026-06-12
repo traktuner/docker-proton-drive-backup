@@ -1,6 +1,6 @@
 import { backupSets } from './db';
-import { upload, killActiveUpload, drivePathExists } from './cli';
-import { runCatalogDelta } from './engine';
+import { killActiveUpload, drivePathExists, normalizeProtonPath } from './cli';
+import { runCatalogDelta, uploadSourceTrees, relBaseFor } from './engine';
 import { progress } from './progress';
 import { control } from './control';
 import { runs } from './runs';
@@ -74,7 +74,9 @@ async function doRunBackupSet(id: string): Promise<void> {
 
     if (set.mode === 'add') {
       log('Uploading new files…');
-      const res = await upload(set.sourcePaths, set.targetPath, 'skip', 'merge');
+      const target = normalizeProtonPath(set.targetPath);
+      const sources = set.sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(set.targetSubfolder, abs) }));
+      const res = await uploadSourceTrees(sources, target, 'skip', 'merge');
       const cancelled = control.isCancelled(id);
       ok = res.code === 0 && !cancelled;
       backupSets.updateStatus(
@@ -92,6 +94,7 @@ async function doRunBackupSet(id: string): Promise<void> {
         id,
         set.sourcePaths,
         set.targetPath,
+        set.targetSubfolder,
         set.mode,
         set.excludes,
         log,

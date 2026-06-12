@@ -1,10 +1,17 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { walkSourceStream, type WalkedFile } from './local';
+import { createReadStream, promises as fsp } from 'node:fs';
+import { walkSourceStream, relToLocalRoot, type WalkedFile } from './local';
 import { catalog, diffFile } from './catalog';
 import { getUploadConfig, resolvePlan } from './upload-config';
-import { createFolder, upload, trashDrive, normalizeProtonPath } from './cli';
+import {
+  createFolder,
+  upload,
+  trashDrive,
+  normalizeProtonPath,
+  type FileStrategy,
+  type RunResult,
+} from './cli';
 
 /**
  * Delta backup engine.
@@ -87,6 +94,100 @@ function makeSpeedMeter() {
   };
 }
 
+/** The rel-prefix for a source: "<set-folder>/<source path relative to LOCAL_ROOT>". */
+export function relBaseFor(subfolder: string, abs: string): string {
+  const rel = relToLocalRoot(abs);
+  return rel ? `${subfolder}/${rel}` : subfolder;
+}
+
+/**
+ * Bulk-upload whole source trees while preserving their structure under
+ * `<target>/<relBase>`. The CLI always names an uploaded folder after its
+ * basename, so we never upload a source folder directly (its basename wouldn't
+ * match the desired relBase). Instead:
+ *   - a directory source → ensure `<target>/<relBase>` exists, then upload its
+ *     (non-dot) immediate children into it; the CLI recurses each child.
+ *   - a file source → upload it into `<target>/<dirname(relBase)>` (basename matches).
+ * This keeps the layout exactly `<target>/<relBase>/…` regardless of basenames and
+ * matches what the per-file engine/catalog records. Used by the fast first-run
+ * seed and the lightweight 'add' mode. Returns the first failing CLI result, else
+ * the last success.
+ */
+export async function uploadSourceTrees(
+  sources: { abs: string; relBase: string }[],
+  target: string,
+  fileStrategy: FileStrategy,
+  folderStrategy: FileStrategy,
+  onMergeFallback?: () => void,
+  onUploadedFile?: (bytes: number) => void,
+): Promise<RunResult> {
+  // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
+  const ensured = new Set<string>();
+  const ensureChain = async (relDir: string) => {
+    if (relDir === '' || relDir === '.') return;
+    const parts = relDir.split('/');
+    for (let i = 1; i <= parts.length; i++) {
+      const sub = parts.slice(0, i).join('/');
+      if (ensured.has(sub)) continue;
+      ensured.add(sub);
+      const parentRel = parts.slice(0, i - 1).join('/');
+      await createFolder(parentRel ? `${target}/${parentRel}` : target, parts[i - 1]);
+    }
+  };
+
+  let last: RunResult = { code: 0, stdout: '', stderr: '' };
+  const run = async (absList: string[], parentDrive: string): Promise<boolean> => {
+    if (absList.length === 0) return true;
+    const res = await upload(absList, parentDrive, fileStrategy, folderStrategy, onMergeFallback, onUploadedFile);
+    if (res.code !== 0) {
+      last = res;
+      return false;
+    }
+    last = res;
+    return true;
+  };
+
+  // File sources grouped by destination parent dir (basename matches relBase).
+  const fileGroups = new Map<string, string[]>();
+  const dirSources: { abs: string; relBase: string }[] = [];
+  for (const s of sources) {
+    let st;
+    try {
+      st = await fsp.stat(s.abs);
+    } catch {
+      continue; // unreadable source → skip
+    }
+    if (st.isDirectory()) {
+      dirSources.push(s);
+    } else if (st.isFile()) {
+      const parentRel = path.dirname(s.relBase);
+      const arr = fileGroups.get(parentRel);
+      if (arr) arr.push(s.abs);
+      else fileGroups.set(parentRel, [s.abs]);
+    }
+  }
+
+  for (const [parentRel, absList] of fileGroups) {
+    await ensureChain(parentRel === '.' ? '' : parentRel);
+    const parentDrive = parentRel === '.' ? target : `${target}/${parentRel}`;
+    if (!(await run(absList, parentDrive))) return last;
+  }
+
+  for (const s of dirSources) {
+    await ensureChain(s.relBase); // create <target>/<relBase> in full
+    let ents;
+    try {
+      ents = await fsp.readdir(s.abs, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const children = ents.filter((e) => !e.name.startsWith('.')).map((e) => path.join(s.abs, e.name));
+    if (!(await run(children, `${target}/${s.relBase}`))) return last;
+  }
+
+  return last;
+}
+
 /**
  * Catalog-based delta engine — scales to millions of files.
  *
@@ -106,6 +207,7 @@ export async function runCatalogDelta(
   setId: string,
   sourcePaths: string[],
   targetPath: string,
+  subfolder: string,
   mode: 'backup' | 'mirror',
   excludes: string[] = [],
   log: (msg: string) => void = () => {},
@@ -113,8 +215,16 @@ export async function runCatalogDelta(
   shouldCancel: () => boolean = () => false,
 ): Promise<DeltaResult> {
   const target = normalizeProtonPath(targetPath);
-  const isExcluded = makeExcluder(excludes);
-  const managedRoots = new Set(sourcePaths.map((sp) => path.basename(sp)));
+  // Each source is laid out at "<target>/<subfolder>/<source rel to LOCAL_ROOT>",
+  // so same-named folders from different paths never collide and the structure is
+  // preserved. The set's subfolder is the single managed root for mirror scoping.
+  const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
+  const managedRoots = new Set([subfolder]);
+  // Exclude globs are authored relative to LOCAL_ROOT (no subfolder prefix), so we
+  // match them against the rel with the "<subfolder>/" prefix stripped off.
+  const matchExclude = makeExcluder(excludes);
+  const prefix = `${subfolder}/`;
+  const isExcluded = (rel: string) => matchExclude(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
   const seenAt = Date.now();
 
   const cfg = getUploadConfig();
@@ -147,10 +257,11 @@ export async function runCatalogDelta(
   });
 
   // Fast initial seed: on the first run (empty catalog) with no excludes, let the
-  // CLI recurse the whole tree in ONE process (`upload <dirs> -f skip`) instead of
-  // tens of thousands of per-folder batch spawns, then record the catalog from a
-  // local walk. Excludes can't be honoured by the CLI recursion, so those sets
-  // fall through to the per-file path below.
+  // CLI recurse the whole tree in ~one process per source (`upload … -f skip`)
+  // instead of tens of thousands of per-folder batch spawns, then record the
+  // catalog from a local walk. Structure is preserved via uploadSourceTrees.
+  // Excludes can't be honoured by the CLI recursion, so those sets fall through to
+  // the per-file path below.
   if (excludes.length === 0 && catalog.count(setId) === 0) {
     log('Initial upload (recursive)…');
     report('initial upload');
@@ -158,7 +269,7 @@ export async function runCatalogDelta(
     // count, bytes and speed even though the CLI does the whole tree in one go.
     let uploaded = 0;
     let lastReport = 0;
-    const res = await upload(sourcePaths, target, 'skip', 'merge', undefined, (bytes) => {
+    const res = await uploadSourceTrees(sources, target, 'skip', 'merge', undefined, (bytes) => {
       uploaded += 1;
       doneFiles = uploaded;
       doneBytes += bytes;
@@ -207,8 +318,8 @@ export async function runCatalogDelta(
       doneFiles = seeded;
       buf = [];
     };
-    for (const sp of sourcePaths) {
-      for await (const f of walkSourceStream(sp)) {
+    for (const s of sources) {
+      for await (const f of walkSourceStream(s.abs, s.relBase)) {
         if (shouldCancel()) return cancelledResult();
         buf.push(f);
         if (buf.length >= 1000) {
@@ -318,19 +429,33 @@ export async function runCatalogDelta(
   // called both at the threshold and right before the stale() computation.
   const TOUCH_FLUSH = 2000;
   const touchBuf: string[] = [];
+  // Ancestor dirs already marked seen this run — so each is touched at most once
+  // (O(#dirs), not O(#files)).
+  const seenDirs = new Set<string>();
   const flushTouches = () => {
     if (touchBuf.length === 0) return;
     catalog.touchMany(setId, touchBuf, seenAt);
     touchBuf.length = 0;
   };
+  // Mark a kept file as seen, plus its ancestor directory chain. Dirs only get a
+  // fresh seen_at via ensureDir (i.e. for *uploaded* files), so without this a
+  // no-change mirror run would leave every dir row stale and the deletion pass
+  // would trash the whole subtree (down to the set folder). Touching the chain
+  // keeps a dir iff it still holds at least one surviving file.
   const queueTouch = (rel: string) => {
     touchBuf.push(rel);
+    let dir = path.dirname(rel);
+    while (dir && dir !== '.' && !seenDirs.has(dir)) {
+      seenDirs.add(dir);
+      touchBuf.push(dir);
+      dir = path.dirname(dir);
+    }
     if (touchBuf.length >= TOUCH_FLUSH) flushTouches();
   };
 
   log('Comparing against catalog…');
-  for (const sp of sourcePaths) {
-    for await (const file of walkSourceStream(sp)) {
+  for (const s of sources) {
+    for await (const file of walkSourceStream(s.abs, s.relBase)) {
       if (shouldCancel()) {
         cancelled = true;
         break;

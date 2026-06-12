@@ -53,10 +53,13 @@ export async function POST(req: Request) {
     return Response.json({ error: 'invalid source path' }, { status: 400 });
   }
 
+  const targetFolder = (body as any).targetFolder;
   const created = backupSets.create({
     name: name.trim(),
     sourcePaths: resolved,
     targetPath: targetPath.trim(),
+    // Optional explicit Drive subfolder; db.create sanitises and de-dupes per target.
+    targetSubfolder: typeof targetFolder === 'string' && targetFolder.trim() ? targetFolder.trim() : undefined,
     mode: MODES.includes(mode as BackupMode) ? (mode as BackupMode) : 'add',
     schedule: SCHEDULES.includes(schedule as Schedule) ? (schedule as Schedule) : 'off',
     scheduleHour: clampInt((body as any).scheduleHour, 0, 23, 3),

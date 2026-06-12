@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { nanoid } from 'nanoid';
 import path from 'node:path';
 import fs from 'node:fs';
+import { sanitizeSegment } from './local';
 
 const DB_PATH = process.env.DB_PATH || '/data/backup.db';
 
@@ -16,6 +17,13 @@ export interface BackupSet {
   name: string;
   sourcePaths: string[]; // absolute in-container paths
   targetPath: string; // Proton path, '/' = drive root
+  /**
+   * Stable top-level Drive folder for this set, under targetPath. Snapshotted from
+   * the set name at creation (sanitised, unique per target) so files land at
+   * `<targetPath>/<targetSubfolder>/<source-rel-to-LOCAL_ROOT>/…`. Kept stable on
+   * rename so the catalog keys (and thus uploads) don't churn.
+   */
+  targetSubfolder: string;
   mode: BackupMode;
   schedule: Schedule;
   scheduleHour: number; // 0-23, for daily/weekly
@@ -33,6 +41,7 @@ interface Row {
   name: string;
   source_paths: string;
   target_path: string;
+  target_subfolder: string | null;
   mode: string; // may hold a legacy value (e.g. 'overwrite') until migrated
   schedule: Schedule;
   schedule_hour: number;
@@ -103,6 +112,7 @@ function ensureColumns(db: Database.Database) {
   add('schedule_dow', 'schedule_dow INTEGER NOT NULL DEFAULT 1');
   add('excludes', 'excludes TEXT');
   add('ping_url', 'ping_url TEXT');
+  add('target_subfolder', 'target_subfolder TEXT');
 }
 
 function rowToSet(r: Row): BackupSet {
@@ -111,6 +121,7 @@ function rowToSet(r: Row): BackupSet {
     name: r.name,
     sourcePaths: JSON.parse(r.source_paths || '[]'),
     targetPath: r.target_path,
+    targetSubfolder: r.target_subfolder || sanitizeSegment(r.name),
     // migrate legacy 'overwrite' → 'backup' (smarter, delta-based)
     mode: r.mode === 'backup' || r.mode === 'mirror' ? r.mode : r.mode === 'overwrite' ? 'backup' : 'add',
     schedule: r.schedule ?? 'off',
@@ -129,6 +140,8 @@ export interface CreateBackupSet {
   name: string;
   sourcePaths: string[];
   targetPath: string;
+  /** Explicit Drive subfolder; if omitted, derived from name (unique per target). */
+  targetSubfolder?: string;
   mode?: BackupMode;
   schedule?: Schedule;
   scheduleHour?: number;
@@ -149,19 +162,43 @@ export const backupSets = {
     return row ? rowToSet(row) : null;
   },
 
+  /**
+   * A Drive subfolder name that doesn't clash with another set pointing at the
+   * same targetPath. Starts from `desired` (already sanitised), then appends
+   * -2/-3/… until free, so two sets sharing a target never write into the same
+   * top-level folder.
+   */
+  uniqueSubfolder(desired: string, targetPath: string): string {
+    const taken = new Set(
+      this.all()
+        .filter((s) => s.targetPath === targetPath)
+        .map((s) => s.targetSubfolder),
+    );
+    if (!taken.has(desired)) return desired;
+    for (let i = 2; ; i++) {
+      const candidate = `${desired}-${i}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+  },
+
   create(input: CreateBackupSet): BackupSet {
     const id = nanoid(12);
+    const subfolder = this.uniqueSubfolder(
+      sanitizeSegment(input.targetSubfolder || input.name),
+      input.targetPath,
+    );
     getDb()
       .prepare(
         `INSERT INTO backup_sets
-           (id, name, source_paths, target_path, mode, schedule, schedule_hour, schedule_minute, schedule_dow, excludes, last_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'never', ?)`,
+           (id, name, source_paths, target_path, target_subfolder, mode, schedule, schedule_hour, schedule_minute, schedule_dow, excludes, last_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'never', ?)`,
       )
       .run(
         id,
         input.name,
         JSON.stringify(input.sourcePaths),
         input.targetPath,
+        subfolder,
         input.mode ?? 'add',
         input.schedule ?? 'off',
         input.scheduleHour ?? 3,

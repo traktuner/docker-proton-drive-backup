@@ -153,11 +153,16 @@ export default function FilesPage() {
     const rootOf = (p: string) => arr(roots).find((r) => p === r || p.startsWith(`${r}/`));
     const exAncestor = (p: string) => arr(excluded).find((e) => p === e || p.startsWith(`${e}/`));
     const hasExDesc = (p: string) => arr(excluded).some((e) => e.startsWith(`${p}/`));
+    // True if some ticked root lives strictly below p — i.e. p is an ancestor of a
+    // selection made deeper in the tree (e.g. a file ticked in a sub-subfolder of
+    // an otherwise-unticked folder). Such ancestors must read as indeterminate all
+    // the way up to the visible root, not as empty.
+    const hasRootDesc = (p: string) => arr(roots).some((r) => r.startsWith(`${p}/`));
     const parentOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/';
 
     return {
       getState: (p, isFolder) => {
-        if (!rootOf(p)) return 'unchecked';
+        if (!rootOf(p)) return isFolder && hasRootDesc(p) ? 'indeterminate' : 'unchecked';
         if (exAncestor(p)) return 'unchecked';
         if (isFolder && hasExDesc(p)) return 'indeterminate';
         return 'checked';

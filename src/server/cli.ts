@@ -500,7 +500,12 @@ export async function listDrive(path: string): Promise<CliResult<DriveEntry[]>> 
  * Invalidated on any folder create/trash and on the deep-refresh resync.
  */
 const LIST_TTL = 30_000;
-const listCache = new Map<string, { data: DriveEntry[]; at: number }>();
+// On globalThis so EVERY Next.js route module instance shares ONE cache: otherwise
+// invalidateListCache() (called from the refresh-cache / create / trash routes)
+// clears only that route's copy, while the drive/list route keeps serving its own
+// stale copy for up to LIST_TTL — i.e. the Refresh button wouldn't actually refresh.
+const _lc = globalThis as unknown as { __pdListCache?: Map<string, { data: DriveEntry[]; at: number }> };
+const listCache = _lc.__pdListCache ?? (_lc.__pdListCache = new Map());
 export function invalidateListCache() {
   listCache.clear();
 }

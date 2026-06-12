@@ -585,7 +585,7 @@ export default function FilesPage() {
                 never need globs). Constant min-height so switching modes doesn't jump. */}
             <div className="min-h-[1.5rem]">
               {mode === 'add' ? (
-                <p className="text-[11px] text-[color:var(--muted)]">
+                <p className="pl-[18px] text-[11px] text-[color:var(--muted)]">
                   Add mode uploads only new files — nothing to exclude.
                 </p>
               ) : (

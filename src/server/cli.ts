@@ -560,18 +560,6 @@ export async function drivePathExists(p: string): Promise<boolean | null> {
 
 export type FileStrategy = 'merge' | 'keep-both' | 'replace' | 'skip';
 
-/**
- * The CLI cannot yet apply `merge` to a FILE: it fails with "Content key packet
- * is required" on the small-revision path (Proton has acknowledged the bug and is
- * actively shipping a fix). `merge` is nonetheless the *correct* strategy for our
- * delta uploads - it writes a new revision and preserves Drive's version history,
- * unlike `replace`. So we always request `merge` and, only on that one specific
- * error, transparently fall back to `replace` for this call. Once Proton's fix
- * lands the first attempt succeeds and this fallback self-deactivates - no logic
- * change needed here. See memory/proton-drive-cli-internals.
- */
-const CLI_MERGE_UNSUPPORTED = /content key packet is required/i;
-
 /** Parse one verbose stderr line for a per-file upload metric (bytes uploaded). */
 function parseUploadMetric(line: string): number | null {
   const m = line.match(/\[metric\] upload (\{.*\})/);
@@ -590,52 +578,41 @@ export async function upload(
   targetPath: string,
   fileStrategy: FileStrategy = 'skip',
   folderStrategy: FileStrategy = 'merge',
-  onMergeFallback?: () => void,
   /** If set, the CLI runs verbose and this is called with each file's byte size
       as it completes — used to show live progress/speed during the recursive seed. */
   onUploadedFile?: (bytes: number) => void,
 ): Promise<RunResult> {
-  const run = async (fStrategy: FileStrategy): Promise<RunResult> => {
-    const args = [
-      'filesystem',
-      'upload',
-      '-f',
-      fStrategy,
-      '-d',
-      folderStrategy,
-      ...localPaths,
-      normalizeProtonPath(targetPath),
-    ];
-    if (onUploadedFile) args.push('-v'); // emit per-file [metric] upload lines
-    // Concurrency is managed by the engine's worker pool (and one backup set runs
-    // at a time via the runner). No timeout - large files can upload for hours.
-    // retryOnLock: a SQLITE_BUSY only hits during the CLI's startup cache init
-    // (before bytes are sent), so retrying is cheap and safe under concurrency.
-    let proc: ChildProcessWithoutNullStreams | null = null;
-    try {
-      return await runCli(args, 0, {
-        retryOnLock: true,
-        onSpawn: (p) => {
-          proc = p;
-          activeUploads.add(p);
-        },
-        onStderrLine: onUploadedFile
-          ? (line) => {
-              const bytes = parseUploadMetric(line);
-              if (bytes != null) onUploadedFile(bytes);
-            }
-          : undefined,
-      });
-    } finally {
-      if (proc) activeUploads.delete(proc);
-    }
-  };
-
-  const res = await run(fileStrategy);
-  if (fileStrategy === 'merge' && res.code !== 0 && CLI_MERGE_UNSUPPORTED.test(res.stderr + res.stdout)) {
-    // CLI can't merge files yet → fall back to replace for this upload only.
-    onMergeFallback?.();
-    return run('replace');
+  const args = [
+    'filesystem',
+    'upload',
+    '-f',
+    fileStrategy,
+    '-d',
+    folderStrategy,
+    ...localPaths,
+    normalizeProtonPath(targetPath),
+  ];
+  if (onUploadedFile) args.push('-v'); // emit per-file [metric] upload lines
+  // Concurrency is managed by the engine's worker pool (and one backup set runs
+  // at a time via the runner). No timeout - large files can upload for hours.
+  // retryOnLock: a SQLITE_BUSY only hits during the CLI's startup cache init
+  // (before bytes are sent), so retrying is cheap and safe under concurrency.
+  let proc: ChildProcessWithoutNullStreams | null = null;
+  try {
+    return await runCli(args, 0, {
+      retryOnLock: true,
+      onSpawn: (p) => {
+        proc = p;
+        activeUploads.add(p);
+      },
+      onStderrLine: onUploadedFile
+        ? (line) => {
+            const bytes = parseUploadMetric(line);
+            if (bytes != null) onUploadedFile(bytes);
+          }
+        : undefined,
+    });
+  } finally {
+    if (proc) activeUploads.delete(proc);
   }
-  return res;
 }

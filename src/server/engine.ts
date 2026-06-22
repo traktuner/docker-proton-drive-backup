@@ -119,7 +119,6 @@ export async function uploadSourceTrees(
   target: string,
   fileStrategy: FileStrategy,
   folderStrategy: FileStrategy,
-  onMergeFallback?: () => void,
   onUploadedFile?: (bytes: number) => void,
 ): Promise<RunResult> {
   // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
@@ -139,7 +138,7 @@ export async function uploadSourceTrees(
   let last: RunResult = { code: 0, stdout: '', stderr: '' };
   const run = async (absList: string[], parentDrive: string): Promise<boolean> => {
     if (absList.length === 0) return true;
-    const res = await upload(absList, parentDrive, fileStrategy, folderStrategy, onMergeFallback, onUploadedFile);
+    const res = await upload(absList, parentDrive, fileStrategy, folderStrategy, onUploadedFile);
     if (res.code !== 0) {
       last = res;
       return false;
@@ -241,7 +240,6 @@ export async function runCatalogDelta(
   let doneFiles = 0;
   let doneBytes = 0;
   let cancelled = false;
-  let mergeFellBack = false;
 
   const speed = makeSpeedMeter();
   const report = (current: string) =>
@@ -270,7 +268,7 @@ export async function runCatalogDelta(
     // count, bytes and speed even though the CLI does the whole tree in one go.
     let uploaded = 0;
     let lastReport = 0;
-    const res = await uploadSourceTrees(sources, target, 'skip', 'merge', undefined, (bytes) => {
+    const res = await uploadSourceTrees(sources, target, 'skip', 'merge', (bytes) => {
       uploaded += 1;
       doneFiles = uploaded;
       doneBytes += bytes;
@@ -377,18 +375,7 @@ export async function runCatalogDelta(
     let ok = false;
     let lastErr = '';
     for (let attempt = 1; attempt <= 4 && !shouldCancel(); attempt++) {
-      const res = await upload(
-        files.map((x) => x.f.abs),
-        parentDrive,
-        'merge',
-        'merge',
-        () => {
-          if (!mergeFellBack) {
-            mergeFellBack = true;
-            log('Note: CLI can’t merge files yet - using replace (no version history this run)');
-          }
-        },
-      );
+      const res = await upload(files.map((x) => x.f.abs), parentDrive, 'merge', 'merge');
       if (res.code === 0) {
         ok = true;
         break;

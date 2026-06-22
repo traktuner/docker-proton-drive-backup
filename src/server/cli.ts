@@ -57,6 +57,13 @@ interface RunOpts {
   onSpawn?: (proc: ChildProcessWithoutNullStreams) => void;
   /** Called for each complete stderr line (used to parse live upload metrics). */
   onStderrLine?: (line: string) => void;
+  /**
+   * Skip the central dead-session detector for this call. Set ONLY for the auth
+   * probe itself and the version reads — they must not recursively flip auth state.
+   * Every other call leaves detection ON so a real op that hits an expired session
+   * promptly demotes the in-memory auth flag and the UI can prompt a reconnect.
+   */
+  skipAuthDetect?: boolean;
 }
 
 /** Run the CLI once and resolve when the process exits (with lock-retry). */
@@ -71,6 +78,13 @@ export async function runCli(
     if (attempt < maxAttempts && res.code !== 0 && isLockError(res.stdout + res.stderr)) {
       await sleep(120 * attempt + Math.random() * 100);
       continue;
+    }
+    // Central dead-session detector: ANY real op (list, upload, trash, create…)
+    // that the CLI rejects with an auth error flips the in-memory auth flag, so the
+    // status endpoint stops lying and the UI can prompt a reconnect. Suppressed for
+    // the probe and version reads (skipAuthDetect) so it never self-triggers.
+    if (!opts.skipAuthDetect && res.code !== 0 && looksUnauthenticated(res.stdout + res.stderr)) {
+      markSessionUnauthenticated();
     }
     return res;
   }
@@ -367,6 +381,22 @@ class LoginManager {
     this.buffer = '';
   }
 
+  /**
+   * Demote the sticky 'authenticated' flag when a real CLI call reveals the Proton
+   * session is gone. Deliberately narrow: it only clears the SUCCESS state, so it
+   * never kills a live 'awaiting' sign-in (no SIGKILL of the login proc) and never
+   * erases a 'failed' state the onboarding screen needs to show. In-memory only —
+   * it does not sign out or touch any file, so the session token stays refreshable
+   * and backup sets are untouched.
+   */
+  markUnauthenticated() {
+    if (this.state === 'authenticated') {
+      this.state = 'idle';
+      this.signInUrl = undefined;
+      this.error = undefined;
+    }
+  }
+
   private cleanup() {
     if (this.proc && this.proc.exitCode === null) {
       this.proc.kill('SIGKILL');
@@ -389,26 +419,62 @@ const PROBE_TTL = 8_000;
 /** True if a Proton session exists. Cheap, cached probe via `filesystem list`. */
 export async function isAuthenticated(force = false): Promise<boolean> {
   const loginState = loginManager.status().state;
-  if (loginState === 'authenticated') {
+  // A login is in flight: don't spawn a probe that would race the login process.
+  if (loginState === 'awaiting') return false;
+  // Fast paths, taken only when NOT forcing a fresh check: trust a just-completed
+  // login and the short-lived probe cache. A forced check always re-verifies
+  // against the server, so a session that silently expired can't keep hiding
+  // behind the sticky 'authenticated' flag (the root of the stale-state bug).
+  if (!force) {
+    if (loginState === 'authenticated') {
+      probeCache = { authed: true, at: Date.now() };
+      return true;
+    }
+    if (probeCache && Date.now() - probeCache.at < PROBE_TTL) {
+      return probeCache.authed;
+    }
+  }
+  let res: RunResult;
+  try {
+    res = await runCli(['filesystem', 'list', PROTON_ROOT, '-j'], 20_000, { skipAuthDetect: true });
+  } catch {
+    // Probe timed out / failed to spawn — transient, NOT a definitive sign-out.
+    // Don't throw (callers like the run pre-flight rely on this) and don't demote a
+    // healthy session on a blip; report the last-known answer.
+    return probeCache?.authed ?? false;
+  }
+  const text = res.stdout + res.stderr;
+  if (looksUnauthenticated(text)) {
+    // A real "you're signed out" answer — demote the sticky flag and remember it.
+    probeCache = { authed: false, at: Date.now() };
+    loginManager.markUnauthenticated();
+    return false;
+  }
+  if (res.code === 0) {
     probeCache = { authed: true, at: Date.now() };
     return true;
   }
-  // A login is in flight: don't spawn a probe that would race the login process.
-  if (loginState === 'awaiting') {
-    return false;
-  }
-  if (!force && probeCache && Date.now() - probeCache.at < PROBE_TTL) {
-    return probeCache.authed;
-  }
-  const res = await runCli(['filesystem', 'list', PROTON_ROOT, '-j'], 20_000);
-  const authed =
-    res.code === 0 && !looksUnauthenticated(res.stdout + res.stderr);
-  probeCache = { authed, at: Date.now() };
-  return authed;
+  // Non-auth failure (network/CLI hiccup): don't flip a known-good session on a
+  // blip — report the last-known state (default false if never established).
+  return probeCache?.authed ?? false;
 }
 
 export function clearAuthCache() {
   probeCache = null;
+}
+
+/**
+ * Record that a real CLI operation found the Proton session gone: demote the
+ * sticky in-memory auth flag and drop the probe cache so /api/auth/status reports
+ * the truth and the UI can prompt a reconnect. Deliberately passive — it does NOT
+ * run `auth logout` or delete the session file (a token that can still be refreshed
+ * by the next sign-in stays recoverable) and touches nothing on disk, so backup
+ * sets are never affected. Called from the runCli chokepoint on any auth-looking
+ * failure.
+ */
+export function markSessionUnauthenticated() {
+  loginManager.markUnauthenticated();
+  probeCache = { authed: false, at: Date.now() };
 }
 
 let cliVersionCache: string | null = null;
@@ -418,7 +484,7 @@ let cliAppVersionCache: string | null = null;
 export async function getCliVersion(): Promise<string> {
   if (cliVersionCache) return cliVersionCache;
   try {
-    const res = await runCli(['version'], 15_000);
+    const res = await runCli(['version'], 15_000, { skipAuthDetect: true });
     // "Proton Drive CLI cli-drive@0.4.3+6a83701" -> 0.4.3
     const m = res.stdout.match(/cli-drive@([0-9][^\s+]*)/);
     cliVersionCache = m?.[1] || res.stdout.trim().split('\n')[0] || 'unknown';
@@ -432,7 +498,7 @@ export async function getCliVersion(): Promise<string> {
 export async function getCliAppVersion(): Promise<string> {
   if (cliAppVersionCache) return cliAppVersionCache;
   try {
-    const res = await runCli(['version'], 15_000);
+    const res = await runCli(['version'], 15_000, { skipAuthDetect: true });
     const m = res.stdout.match(/(cli-drive@[^\s]+)/);
     cliAppVersionCache = m?.[1] || 'cli-drive@0.4.3';
   } catch {

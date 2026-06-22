@@ -8,6 +8,7 @@ import Footer from '@/components/Footer';
 import StorageBar from '@/components/StorageBar';
 import Settings from '@/components/Settings';
 import { useToast } from '@/components/Toast';
+import { useAuth } from '@/components/AuthProvider';
 
 type Mode = 'add' | 'backup' | 'mirror';
 type Schedule = 'off' | 'hourly' | 'daily' | 'weekly';
@@ -69,6 +70,7 @@ function derivedExcludes(roots: string[], excluded: string[]): string[] {
 export default function FilesPage() {
   const router = useRouter();
   const { toast } = useToast();
+  const { status: authStatus, reconnect, reportAuthError } = useAuth();
   const [ready, setReady] = useState(false);
 
   // Tri-state source selection: ticked roots, minus unticked descendants.
@@ -115,17 +117,25 @@ export default function FilesPage() {
     return { entries };
   }, []);
 
-  const loadDrive = useCallback(async (path: string) => {
-    const d = await fetch(`/api/drive/list?path=${encodeURIComponent(path)}`).then((r) => r.json());
-    if (d.error) throw new Error(d.error);
-    const entries: PaneEntry[] = (d.entries ?? []).map((e: any) => ({
-      name: e.name,
-      type: e.type,
-      size: e.size,
-      id: e.uid,
-    }));
-    return { entries };
-  }, []);
+  const loadDrive = useCallback(
+    async (path: string) => {
+      const d = await fetch(`/api/drive/list?path=${encodeURIComponent(path)}`).then((r) => r.json());
+      if (d.error) {
+        // The Drive pane is the surface that first reveals a dead session; let the
+        // shared auth state verify and raise the reconnect banner immediately.
+        reportAuthError(d.error);
+        throw new Error(d.error);
+      }
+      const entries: PaneEntry[] = (d.entries ?? []).map((e: any) => ({
+        name: e.name,
+        type: e.type,
+        size: e.size,
+        id: e.uid,
+      }));
+      return { entries };
+    },
+    [reportAuthError],
+  );
 
   const newDriveFolder = useCallback(async (currentPath: string, folderName: string) => {
     const res = await fetch('/api/drive/folder', {
@@ -409,10 +419,26 @@ export default function FilesPage() {
         </div>
         <div className="flex shrink-0 items-center gap-3 text-sm">
           <StorageBar />
-          <span className="flex items-center gap-1.5 text-[color:var(--muted)]" title="Connected">
-            <span className="h-2 w-2 rounded-full" style={{ background: 'var(--signal-success)' }} />
-            <span className="hidden sm:inline">Connected</span>
-          </span>
+          {authStatus === 'expired' ? (
+            <button
+              onClick={reconnect}
+              className="flex items-center gap-1.5 text-[color:var(--signal-danger)] hover:underline"
+              title="Proton session expired — click to reconnect"
+            >
+              <span className="h-2 w-2 rounded-full" style={{ background: 'var(--signal-danger)' }} />
+              <span className="hidden sm:inline">Reconnect</span>
+            </button>
+          ) : authStatus === 'reconnecting' ? (
+            <span className="flex items-center gap-1.5 text-[color:var(--muted)]" title="Reconnecting…">
+              <span className="h-2 w-2 animate-pulse rounded-full" style={{ background: 'var(--signal-warning)' }} />
+              <span className="hidden sm:inline">Reconnecting…</span>
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-[color:var(--muted)]" title="Connected">
+              <span className="h-2 w-2 rounded-full" style={{ background: 'var(--signal-success)' }} />
+              <span className="hidden sm:inline">Connected</span>
+            </span>
+          )}
           <Settings />
         </div>
       </header>

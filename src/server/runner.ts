@@ -1,5 +1,12 @@
 import { backupSets } from './db';
-import { killActiveUpload, drivePathExists, normalizeProtonPath, setBackupRunning } from './cli';
+import {
+  killActiveUpload,
+  drivePathExists,
+  normalizeProtonPath,
+  setBackupRunning,
+  isAuthenticated,
+  looksUnauthenticated,
+} from './cli';
 import { runCatalogDelta, uploadSourceTrees, relBaseFor } from './engine';
 import { progress } from './progress';
 import { control } from './control';
@@ -34,6 +41,24 @@ export async function runBackupSet(id: string): Promise<void> {
 async function doRunBackupSet(id: string): Promise<void> {
   const set = backupSets.get(id);
   if (!set) return;
+
+  // Failsafe: don't start an upload phase against a session we already know is dead
+  // (a prior op flipped the flag, or the cached probe says so) — fail fast with a
+  // clear "reconnect" message and no 'running' flash. Deliberately NOT forced: a
+  // forced probe could spuriously fail on a transient network blip and skip a
+  // healthy run with no retry. If the in-memory flag is still optimistically
+  // 'authenticated' but the session has silently expired, the engine's precise
+  // (auth-text-gated) sessionDead detection aborts the run cleanly instead. Either
+  // way the set itself is left untouched.
+  if (!(await isAuthenticated())) {
+    backupSets.updateStatus(
+      id,
+      'error',
+      'Proton session expired — reconnect to Proton Drive to resume backups. Your backup set is unchanged.',
+      true,
+    );
+    return;
+  }
 
   const startedAt = Date.now();
   control.clear(id);
@@ -82,14 +107,13 @@ async function doRunBackupSet(id: string): Promise<void> {
       const res = await uploadSourceTrees(sources, target, 'skip', 'merge');
       const cancelled = control.isCancelled(id);
       ok = res.code === 0 && !cancelled;
+      const failMsg = looksUnauthenticated(res.stderr + res.stdout)
+        ? 'Proton session expired — reconnect to Proton Drive to resume backups. Your backup set is unchanged.'
+        : (res.stderr.trim() || res.stdout.trim() || `CLI exited with code ${res.code}`).slice(0, 1000);
       backupSets.updateStatus(
         id,
         cancelled ? 'cancelled' : ok ? 'success' : 'error',
-        cancelled
-          ? 'Cancelled'
-          : ok
-            ? 'Added new files'
-            : (res.stderr.trim() || res.stdout.trim() || `CLI exited with code ${res.code}`).slice(0, 1000),
+        cancelled ? 'Cancelled' : ok ? 'Added new files' : failMsg,
         true,
       );
     } else {

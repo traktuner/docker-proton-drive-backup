@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useToast } from './Toast';
+import { useAuth } from './AuthProvider';
 
 export interface RunRow {
   id: number;
@@ -114,6 +115,7 @@ const targetLabel = (p: string) => (p === '/' ? 'Drive (root)' : `Drive${p}`);
 
 export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   const { toast } = useToast();
+  const { reportAuthError } = useAuth();
   const [sets, setSets] = useState<BackupSet[]>([]);
   const [loading, setLoading] = useState(true);
   const [editId, setEditId] = useState<string | null>(null);
@@ -134,8 +136,10 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
           const prev = sets.find((s) => s.id === n.id);
           if (prev?.lastStatus === 'running' && n.lastStatus !== 'running') {
             if (n.lastStatus === 'success') toast(`“${n.name}” finished — ${n.lastMessage ?? 'done'}`, 'success');
-            else if (n.lastStatus === 'error') toast(`“${n.name}” failed — ${n.lastMessage ?? 'error'}`, 'error');
-            else if (n.lastStatus === 'cancelled') toast(`“${n.name}” cancelled`, 'info');
+            else if (n.lastStatus === 'error') {
+              toast(`“${n.name}” failed — ${n.lastMessage ?? 'error'}`, 'error');
+              reportAuthError(n.lastMessage ?? undefined); // raise the banner if it was a session expiry
+            } else if (n.lastStatus === 'cancelled') toast(`“${n.name}” cancelled`, 'info');
           }
         }
         setSets(next);
@@ -187,7 +191,9 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
         d.repaired > 0 ? 'info' : 'success',
       );
     } catch (e) {
-      toast(e instanceof Error ? e.message : String(e), 'error');
+      const msg = e instanceof Error ? e.message : String(e);
+      toast(msg, 'error');
+      reportAuthError(msg); // raise the reconnect banner if verify failed on a dead session
     } finally {
       setVerifying((prev) => {
         const n = new Set(prev);

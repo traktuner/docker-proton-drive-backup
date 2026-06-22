@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAuth, looksLikeAuthError } from './AuthProvider';
 
 export interface PaneEntry {
   name: string;
@@ -91,6 +92,7 @@ export default function FilePane({
   onDelete,
   onDeepRefresh,
 }: FilePaneProps) {
+  const { status: authStatus, reconnect } = useAuth();
   const [path, setPath] = useState('/');
   const [entries, setEntries] = useState<PaneEntry[]>([]);
   const [firstLoad, setFirstLoad] = useState(true);
@@ -148,6 +150,24 @@ export default function FilePane({
     fetchPath(path);
     onPathChange?.(path);
   }, [path, fetchPath, onPathChange]);
+
+  // Recover the pane on its own once the session is (still/again) authenticated but
+  // the pane is showing an auth-looking error — covers genuine recovery AND a false
+  // alarm where the forced re-probe confirmed the session was fine all along (so
+  // authStatus never transitions). One-shot per distinct error string so a truly
+  // persistent auth error can't spin the fetch.
+  const authRetryRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!error) {
+      authRetryRef.current = null; // healthy again — arm for the next error
+      return;
+    }
+    if (authStatus === 'authenticated' && looksLikeAuthError(error) && authRetryRef.current !== error) {
+      authRetryRef.current = error;
+      fetchPath(path, { force: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authStatus, error]);
 
   const segments = path === '/' ? [] : path.replace(/^\//, '').split('/');
   const navigate = (p: string) => {
@@ -281,11 +301,22 @@ export default function FilePane({
 
       {/* List */}
       <div className="min-h-0 flex-1 overflow-auto">
-        {error && (
-          <div className="m-3 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-300">
-            {error}
-          </div>
-        )}
+        {error &&
+          (authStatus !== 'authenticated' && looksLikeAuthError(error) ? (
+            // Defer to the global session banner — show a calm reconnect prompt here
+            // instead of the raw "no session" CLI text.
+            <div className="m-3 rounded-md border border-[color:var(--border)] bg-[color:var(--panel-2)] p-3 text-sm text-[color:var(--muted)]">
+              Disconnected from Proton Drive.{' '}
+              <button onClick={reconnect} className="underline hover:no-underline" style={{ color: 'var(--accent-2)' }}>
+                Reconnect
+              </button>{' '}
+              to view your files.
+            </div>
+          ) : (
+            <div className="m-3 rounded-md border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-300">
+              {error}
+            </div>
+          ))}
         {showSkeleton ? (
           <ul className="animate-pulse space-y-2 p-4">
             {Array.from({ length: 6 }).map((_, i) => (

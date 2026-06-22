@@ -10,9 +10,14 @@ import {
   trashDrive,
   listDrive,
   normalizeProtonPath,
+  looksUnauthenticated,
   type FileStrategy,
   type RunResult,
 } from './cli';
+
+/** Message shown when a run stops because the Proton session expired mid-flight. */
+const SESSION_EXPIRED_MSG =
+  'Proton session expired — reconnect to Proton Drive to resume. Nothing was deleted and your backup set is unchanged.';
 
 /**
  * Delta backup engine.
@@ -240,6 +245,11 @@ export async function runCatalogDelta(
   let doneFiles = 0;
   let doneBytes = 0;
   let cancelled = false;
+  // Set the moment a CLI op reports the Proton session is gone. We then stop
+  // scheduling work, skip the mirror deletion pass entirely, and end the run with a
+  // clear "reconnect" message instead of grinding every batch through 4 doomed
+  // retries (and never risking a delete pass against a half-dead session).
+  let sessionDead = false;
 
   const speed = makeSpeedMeter();
   const report = (current: string) =>
@@ -280,6 +290,7 @@ export async function runCatalogDelta(
     });
     if (shouldCancel()) return cancelledResult();
     if (res.code !== 0) {
+      const authDead = looksUnauthenticated(res.stderr + res.stdout);
       return {
         ok: false,
         cancelled: false,
@@ -288,7 +299,9 @@ export async function runCatalogDelta(
         unchangedCount: 0,
         deletedCount: 0,
         failedCount: 1,
-        message: (res.stderr || res.stdout).trim().slice(0, 500) || `CLI exited with code ${res.code}`,
+        message: authDead
+          ? SESSION_EXPIRED_MSG
+          : (res.stderr || res.stdout).trim().slice(0, 500) || `CLI exited with code ${res.code}`,
       };
     }
 
@@ -370,21 +383,28 @@ export async function runCatalogDelta(
 
   // Upload one batch (single parent) with retry, then record it in the catalog.
   const flush = async (parentDrive: string, files: { f: WalkedFile; sha1: string | null }[]): Promise<void> => {
-    if (shouldCancel() || files.length === 0) return;
+    if (shouldCancel() || sessionDead || files.length === 0) return;
     report(parentDrive.replace('/my-files', '') || '/');
     let ok = false;
     let lastErr = '';
-    for (let attempt = 1; attempt <= 4 && !shouldCancel(); attempt++) {
+    for (let attempt = 1; attempt <= 4 && !shouldCancel() && !sessionDead; attempt++) {
       const res = await upload(files.map((x) => x.f.abs), parentDrive, 'merge', 'merge');
       if (res.code === 0) {
         ok = true;
         break;
       }
       lastErr = (res.stderr || res.stdout).trim().slice(0, 200);
+      // A dead session won't recover by retrying — stop now so one expired token
+      // can't turn into a multi-hour zombie run holding the global run mutex.
+      if (looksUnauthenticated(res.stderr + res.stdout)) {
+        sessionDead = true;
+        log('Proton session expired — stopping this run. Reconnect to resume.');
+        return;
+      }
       if (attempt < 4) {
         const waitMs = 5000 * 2 ** (attempt - 1);
         log(`  batch failed (try ${attempt}/4), retrying in ${waitMs / 1000}s: ${lastErr}`);
-        for (let w = 0; w < waitMs && !shouldCancel(); w += 500) await new Promise((r) => setTimeout(r, 500));
+        for (let w = 0; w < waitMs && !shouldCancel() && !sessionDead; w += 500) await new Promise((r) => setTimeout(r, 500));
       }
     }
     if (ok) {
@@ -393,7 +413,7 @@ export async function runCatalogDelta(
       });
       doneFiles += files.length;
       doneBytes += files.reduce((s, x) => s + x.f.size, 0);
-    } else if (!shouldCancel()) {
+    } else if (!shouldCancel() && !sessionDead) {
       failedCount += files.length;
       log(`  upload failed after 4 tries: ${lastErr}`);
     }
@@ -448,6 +468,7 @@ export async function runCatalogDelta(
         cancelled = true;
         break;
       }
+      if (sessionDead) break; // an in-flight batch reported the session is gone
       if (isExcluded(file.rel)) {
         if (mode === 'mirror') queueTouch(file.rel); // keep, don't trash
         continue;
@@ -492,16 +513,17 @@ export async function runCatalogDelta(
         await schedule(() => flush(parentDrive, bucket));
       }
     }
-    if (cancelled) break;
+    if (cancelled || sessionDead) break;
   }
 
   // Flush any partially-filled buckets.
-  if (!cancelled) {
+  if (!cancelled && !sessionDead) {
     for (const [parentDrive, bucket] of pending) {
       if (shouldCancel()) {
         cancelled = true;
         break;
       }
+      if (sessionDead) break;
       await schedule(() => flush(parentDrive, bucket));
     }
   }
@@ -513,12 +535,32 @@ export async function runCatalogDelta(
   // the deletion pass below is gated on !cancelled, so a partial flush never trashes.
   flushTouches();
 
+  // Session died mid-run: end now with a clear reconnect message, BEFORE the mirror
+  // deletion pass. Files already uploaded this run are recorded in the catalog
+  // (per-batch), so a reconnect + re-run just resumes the remainder. Crucially this
+  // skips stale-deletion entirely, so a half-dead session can never trash Drive.
+  if (sessionDead) {
+    return {
+      ok: false,
+      cancelled: false,
+      newCount,
+      changedCount,
+      unchangedCount,
+      deletedCount: 0,
+      failedCount,
+      message: SESSION_EXPIRED_MSG,
+    };
+  }
+
   // Mirror: trash catalog entries that no longer exist locally (scoped to the set
-  // folder). Two safety nets first — a vanished source mount or a bug must never
-  // let a no-change scan wipe the whole backup:
+  // folder). Three safety nets first — a vanished source mount, an upload failure,
+  // or a bug must never let a scan wipe Drive data the user still has:
   //   (1) if any configured source path is missing on disk (e.g. an unmounted NAS
   //       share), skip deletion entirely — "gone locally" can't be trusted.
-  //   (2) if a run would remove more than DELETE_SAFETY_PCT of the catalog, skip
+  //   (2) if ANY upload failed this run (a changed file that didn't make it to
+  //       Drive keeps its old catalog timestamp and would look "stale"), skip
+  //       deletion — we must not trash a present-but-failed file's Drive copy.
+  //   (3) if a run would remove more than DELETE_SAFETY_PCT of the catalog, skip
   //       deletion and flag it rather than trash a huge swath in one go.
   let deletionSkipped: string | null = null;
   if (mode === 'mirror' && !cancelled) {
@@ -539,6 +581,8 @@ export async function runCatalogDelta(
 
     if (!sourcesIntact) {
       deletionSkipped = 'a source path is missing on disk (mount offline?)';
+    } else if (failedCount > 0) {
+      deletionSkipped = `${failedCount} file(s) failed to upload — "gone locally" can't be trusted until uploads succeed`;
     } else if (pctGone > DELETE_SAFETY_PCT) {
       deletionSkipped = `${stale.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
     }
@@ -550,11 +594,17 @@ export async function runCatalogDelta(
       const tops = stale.filter((s) => !stale.some((o) => o !== s && s.rel.startsWith(`${o.rel}/`)));
       const removedRels: string[] = [];
       for (const s of tops) {
-        if (shouldCancel()) break;
+        if (shouldCancel() || sessionDead) break;
         const res = await trashDrive(`${target}/${s.rel}`);
         if (res.ok) {
           deletedCount++;
           removedRels.push(s.rel);
+        } else if (looksUnauthenticated((res.error || '') + (res.raw || ''))) {
+          // Session died mid-deletion — stop now (don't grind a doomed trash per
+          // entry) and end with the clear reconnect message below.
+          sessionDead = true;
+          log('Proton session expired — stopping this run. Reconnect to resume.');
+          break;
         } else {
           failedCount++;
         }
@@ -566,6 +616,22 @@ export async function runCatalogDelta(
       if (gone.length) catalog.remove(setId, gone);
       if (tops.length) log(`Removed ${deletedCount} item(s) no longer present locally`);
     }
+  }
+
+  // Session died during the deletion pass — end with the clear reconnect message
+  // (deletedCount reflects what was already trashed before it died) instead of the
+  // generic summary.
+  if (sessionDead) {
+    return {
+      ok: false,
+      cancelled: false,
+      newCount,
+      changedCount,
+      unchangedCount,
+      deletedCount,
+      failedCount,
+      message: SESSION_EXPIRED_MSG,
+    };
   }
 
   const parts = [`${doneFiles} uploaded`, `${unchangedCount} unchanged`];

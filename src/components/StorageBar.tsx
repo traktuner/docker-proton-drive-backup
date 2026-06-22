@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useAuth } from './AuthProvider';
 
 interface Quota {
   maxSpace: number;
@@ -20,6 +21,7 @@ function fmt(n: number): string {
 }
 
 export default function StorageBar() {
+  const { status: authStatus } = useAuth();
   const [q, setQ] = useState<Quota | null>(null);
 
   useEffect(() => {
@@ -31,7 +33,9 @@ export default function StorageBar() {
     load();
     const t = setInterval(load, 60_000);
     return () => clearInterval(t);
-  }, []);
+    // Reload immediately when the session is (re)authenticated so the bar — which
+    // hides itself on a dead session — comes back without waiting for the interval.
+  }, [authStatus]);
 
   if (!q || !q.maxSpace) return null;
   const pct = Math.min(100, (q.driveUsed / q.maxSpace) * 100);

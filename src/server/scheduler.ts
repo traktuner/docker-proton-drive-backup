@@ -46,8 +46,14 @@ async function tick() {
     if (due.length === 0) return;
 
     if (!(await isAuthenticated())) {
+      // Pause scheduled runs while signed out. Write the skip once per set (not every
+      // tick) so we don't clobber the real last-run result or churn the DB each
+      // minute. isDue() still treats the slot as attempted-later, so each set resumes
+      // automatically on its next due slot after the user reconnects.
+      const msg = 'Skipped: not signed in to Proton Drive';
       for (const s of due) {
-        backupSets.updateStatus(s.id, 'error', 'Skipped: not signed in to Proton Drive', false);
+        if (s.lastStatus === 'error' && s.lastMessage === msg) continue;
+        backupSets.updateStatus(s.id, 'error', msg, false);
       }
       return;
     }

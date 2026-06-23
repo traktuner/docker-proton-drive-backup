@@ -17,18 +17,33 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    
+  # Build each arch on its OWN native runner (amd64 on ubuntu-latest, arm64 on the
+  # free public-repo ubuntu-24.04-arm runner) and push it BY DIGEST (no tag). No
+  # QEMU emulation, so the Next.js build runs at full speed on both. The `merge`
+  # job below stitches the two digests into one multi-arch manifest under the tags.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # full history for the revision count
+          fetch-depth: 0 # full history for the revision count (IMAGE_TAG build-arg)
+
+      - name: Prepare platform pair
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Log in to Container Registry
         uses: docker/login-action@v4
@@ -47,9 +62,76 @@ jobs:
           # Debian-style revision: commits since the current CLI version was set.
           BUMP=$(git log -1 --format=%H -S"PROTON_CLI_VERSION=$V" -- Dockerfile || true)
           if [ -n "$BUMP" ]; then REV=$(( $(git rev-list --count "$BUMP"..HEAD) + 1 )); else REV=1; fi
-          echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=$V-$REV" >> "$GITHUB_OUTPUT"
-          echo "Image version: $V-$REV"
+
+      # Push by digest only (no tag). On PRs push=false, so this just validates that
+      # the image builds natively on both arches. gha cache is scoped per-arch so the
+      # two concurrent legs don't clobber each other's cache.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
+            IMAGE_TAG=${{ steps.cliv.outputs.tag }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the per-arch digests into a single multi-arch manifest and apply the
+  # real tags here (the only place tags are set). Skipped on PRs (nothing pushed).
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # for the revision-count raw tag below
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Compute version-revision tag
+        id: cliv
+        run: |
+          V=$(grep -oP '^ARG PROTON_CLI_VERSION=\K.*' Dockerfile)
+          BUMP=$(git log -1 --format=%H -S"PROTON_CLI_VERSION=$V" -- Dockerfile || true)
+          if [ -n "$BUMP" ]; then REV=$(( $(git rev-list --count "$BUMP"..HEAD) + 1 )); else REV=1; fi
+          echo "tag=$V-$REV" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -58,7 +140,6 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
@@ -67,16 +148,12 @@ jobs:
             type=raw,value=${{ steps.cliv.outputs.tag }},enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          build-args: |
-            APP_VERSION=${{ github.sha }}
-            IMAGE_TAG=${{ steps.cliv.outputs.tag }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest || true

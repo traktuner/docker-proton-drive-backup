@@ -124,6 +124,10 @@ jobs:
           git push --atomic origin HEAD:main "refs/tags/v$V"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Set up QEMU
+        if: steps.detect.outputs.update == 'true'
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
         if: steps.detect.outputs.update == 'true'
         uses: docker/setup-buildx-action@v4
@@ -143,7 +147,7 @@ jobs:
           V: ${{ steps.detect.outputs.latest }}
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             APP_VERSION=${{ steps.bump.outputs.sha }}

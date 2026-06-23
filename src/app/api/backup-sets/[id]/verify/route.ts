@@ -4,6 +4,11 @@ import { uploadsBusy } from '@/server/cli';
 
 export const dynamic = 'force-dynamic';
 
+// One verify at a time across the process (a full Drive scan is expensive). On
+// globalThis so the flag is shared across route module instances. This is exactly
+// the normal UI behaviour and bounds an unauthenticated caller to a single scan.
+const g = globalThis as unknown as { __pdVerifying?: boolean };
+
 /**
  * Reconcile a set's catalog against Drive truth: drop entries that were deleted or
  * changed externally on Drive so the next backup re-uploads them. Read-only on
@@ -20,9 +25,16 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   if (set.mode === 'add') {
     return Response.json({ error: 'Verify applies to backup/mirror sets only.' }, { status: 400 });
   }
-  // Read-only on Drive; only removes catalog rows (idempotent). The uploadsBusy()
-  // guard above keeps it off while a backup runs; a stray concurrent verify is
-  // harmless (same DELETEs), so no extra busy flag is needed here.
-  const res = await verifyCatalog(id, set.targetPath, set.targetSubfolder);
-  return Response.json(res, { status: res.ok ? 200 : 502 });
+  if (g.__pdVerifying) {
+    return Response.json({ error: 'A verify is already running - wait for it to finish.' }, { status: 409 });
+  }
+  // Read-only on Drive; only removes catalog rows (idempotent). Single-flighted so
+  // concurrent requests can't pile up multiple full-Drive scans.
+  g.__pdVerifying = true;
+  try {
+    const res = await verifyCatalog(id, set.targetPath, set.targetSubfolder);
+    return Response.json(res, { status: res.ok ? 200 : 502 });
+  } finally {
+    g.__pdVerifying = false;
+  }
 }

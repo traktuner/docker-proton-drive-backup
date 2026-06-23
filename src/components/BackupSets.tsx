@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useToast } from './Toast';
 import { useAuth } from './AuthProvider';
+import { formatBytes } from '@/lib/format';
+import { DOW, DOW_ORDER, pad } from '@/lib/schedule';
 
 export interface RunRow {
   id: number;
@@ -41,17 +43,6 @@ export interface BackupSet {
     current: string;
     bytesPerSec?: number;
   } | null;
-}
-
-function fmtBytes(n: number): string {
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
 function fmtWhen(ts: number): string {
@@ -95,12 +86,8 @@ function statusStyle(s: BackupSet['lastStatus']): CSSProperties {
   return { color: `var(${v})`, background: `color-mix(in srgb, var(${v}) 15%, transparent)` };
 }
 
-const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-// Display order Mon→Sun (values stay JS getDay indices: 0=Sun..6=Sat).
-const DOW_ORDER = [1, 2, 3, 4, 5, 6, 0];
 const MODE_LABEL = { add: 'add new', backup: 'backup', mirror: 'mirror' } as const;
 
-const pad = (n: number) => String(n).padStart(2, '0');
 function scheduleLabel(s: BackupSet): string {
   const t = `${pad(s.scheduleHour)}:${pad(s.scheduleMinute)}`;
   return s.schedule === 'hourly'
@@ -416,9 +403,9 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                       </div>
                       <p className="tnum mt-1 truncate text-[11px] text-[color:var(--muted)]">
                         {s.progress.totalBytes
-                          ? `${s.progress.doneFiles}/${s.progress.totalFiles} files · ${fmtBytes(s.progress.doneBytes)}/${fmtBytes(s.progress.totalBytes)}`
-                          : `${s.progress.doneFiles.toLocaleString()} uploaded · ${fmtBytes(s.progress.doneBytes)}`}
-                        {s.progress.bytesPerSec ? ` · ${fmtBytes(s.progress.bytesPerSec)}/s` : ''}
+                          ? `${s.progress.doneFiles}/${s.progress.totalFiles} files · ${formatBytes(s.progress.doneBytes)}/${formatBytes(s.progress.totalBytes)}`
+                          : `${s.progress.doneFiles.toLocaleString()} uploaded · ${formatBytes(s.progress.doneBytes)}`}
+                        {s.progress.bytesPerSec ? ` · ${formatBytes(s.progress.bytesPerSec)}/s` : ''}
                         {' · '}
                         {s.progress.current}
                       </p>

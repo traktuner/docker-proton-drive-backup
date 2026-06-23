@@ -4,6 +4,7 @@ import YAML from 'yaml';
 import { backupSets, type BackupMode, type Schedule } from './db';
 import { catalog } from './catalog';
 import { LOCAL_ROOT, resolveLocal, sanitizeSegment } from './local';
+import { DOW, pad } from '@/lib/schedule';
 
 /**
  * Backup sets as portable, version-controllable YAML. Source paths are exported
@@ -12,8 +13,6 @@ import { LOCAL_ROOT, resolveLocal, sanitizeSegment } from './local';
 
 const MODES: BackupMode[] = ['add', 'backup', 'mirror'];
 const SCHEDULES: Schedule[] = ['off', 'hourly', 'daily', 'weekly'];
-const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const pad = (n: number) => String(n).padStart(2, '0');
 
 function relSource(abs: string): string {
   return abs === LOCAL_ROOT ? '/' : abs.startsWith(LOCAL_ROOT) ? abs.slice(LOCAL_ROOT.length) : abs;

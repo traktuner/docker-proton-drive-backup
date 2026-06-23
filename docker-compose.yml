@@ -89,6 +89,26 @@ services:
 
     restart: unless-stopped
 
+    # ---------------------------------------------------------------------------
+    # HARDENING (safe defaults — the app needs no extra Linux capabilities)
+    # ---------------------------------------------------------------------------
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Optional, stronger: read-only root filesystem. Needs writable tmpfs for the
+    # Next.js cache and /tmp, so it's opt-in. Uncomment together:
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
+    #   - /app/.next/cache
+    #
+    # The app has NO built-in authentication (see README → Security). If the host
+    # is not fully trusted, bind the published port to localhost and put an
+    # authenticating reverse proxy in front, e.g.:
+    #   ports:
+    #     - "127.0.0.1:3005:3000"
+
 # Alternative: use a named volume for /data instead of a bind mount.
 # volumes:
 #   proton-drive-data:

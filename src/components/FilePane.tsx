@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuth, looksLikeAuthError } from './AuthProvider';
+import { formatBytes } from '@/lib/format';
 
 export interface PaneEntry {
   name: string;
@@ -31,18 +32,6 @@ interface FilePaneProps {
   onDelete?: (entryPath: string, entry: PaneEntry) => Promise<void>;
   /** If set, the refresh button first clears the server-side cache (deep resync). */
   onDeepRefresh?: () => Promise<void>;
-}
-
-function fmtSize(n?: number): string {
-  if (n == null) return '';
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
 function sortEntries(a: PaneEntry[]): PaneEntry[] {
@@ -382,7 +371,7 @@ export default function FilePane({
                   ) : (
                     <>
                       <span className="shrink-0 text-xs text-[color:var(--muted)]">
-                        {entry.type === 'file' ? fmtSize(entry.size) : ''}
+                        {entry.type === 'file' && entry.size != null ? formatBytes(entry.size) : ''}
                       </span>
                       {onDelete && (
                         <button

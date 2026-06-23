@@ -313,7 +313,12 @@ class LoginManager {
 
   /** Start (or reuse) a login flow and resolve once we have the sign-in URL. */
   async start(): Promise<LoginStatus> {
-    if (this.state === 'awaiting' && this.signInUrl) {
+    // A login process is already alive and in flight: reuse it (the caller polls
+    // status for the URL) instead of killing it and racing a second process onto
+    // this shared state. Only (re)spawn when no live login exists. Guarding on the
+    // live proc - not on signInUrl - is what closes the double-click race window
+    // between setting state='awaiting' and the URL arriving.
+    if (this.state === 'awaiting' && this.proc && this.proc.exitCode === null) {
       return this.status();
     }
     // Reset any previous terminal state and (re)spawn.
@@ -479,32 +484,54 @@ export function markSessionUnauthenticated() {
 
 let cliVersionCache: string | null = null;
 let cliAppVersionCache: string | null = null;
+let cliVersionRaw: string | null = null;
+
+/** Raw `proton-drive version` stdout, fetched once and cached (both version
+ *  getters parse from it, so the CLI is only spawned a single time). */
+async function readCliVersionRaw(): Promise<string> {
+  if (cliVersionRaw !== null) return cliVersionRaw;
+  try {
+    const res = await runCli(['version'], 15_000, { skipAuthDetect: true });
+    cliVersionRaw = res.stdout;
+  } catch {
+    cliVersionRaw = '';
+  }
+  return cliVersionRaw;
+}
 
 /** The proton-drive CLI version, e.g. "0.4.3". Cached for the process lifetime. */
 export async function getCliVersion(): Promise<string> {
   if (cliVersionCache) return cliVersionCache;
-  try {
-    const res = await runCli(['version'], 15_000, { skipAuthDetect: true });
-    // "Proton Drive CLI cli-drive@0.4.3+6a83701" -> 0.4.3
-    const m = res.stdout.match(/cli-drive@([0-9][^\s+]*)/);
-    cliVersionCache = m?.[1] || res.stdout.trim().split('\n')[0] || 'unknown';
-  } catch {
-    cliVersionCache = 'unknown';
-  }
+  const raw = await readCliVersionRaw();
+  // "Proton Drive CLI cli-drive@0.4.3+6a83701" -> 0.4.3
+  const m = raw.match(/cli-drive@([0-9][^\s+]*)/);
+  cliVersionCache = m?.[1] || raw.trim().split('\n')[0] || 'unknown';
   return cliVersionCache;
 }
 
 /** The full x-pm-appversion the CLI uses, e.g. "cli-drive@0.4.3+6a83701". */
 export async function getCliAppVersion(): Promise<string> {
   if (cliAppVersionCache) return cliAppVersionCache;
-  try {
-    const res = await runCli(['version'], 15_000, { skipAuthDetect: true });
-    const m = res.stdout.match(/(cli-drive@[^\s]+)/);
-    cliAppVersionCache = m?.[1] || 'cli-drive@0.4.3';
-  } catch {
-    cliAppVersionCache = 'cli-drive@0.4.3';
-  }
+  const raw = await readCliVersionRaw();
+  const m = raw.match(/(cli-drive@[^\s]+)/);
+  cliAppVersionCache = m?.[1] || 'cli-drive@0.4.3';
   return cliAppVersionCache;
+}
+
+/**
+ * Map a raw CLI error to a user-safe message for API responses. Never echoes raw
+ * stderr/stdout (which can contain local paths or token-ish material) to an
+ * unauthenticated client. Keeps the "session expired" wording so the client's
+ * reconnect detection (looksLikeAuthError) still fires.
+ */
+export function cleanCliError(text: string | undefined | null): string {
+  const t = (text || '').toLowerCase();
+  if (looksUnauthenticated(t)) return 'Proton session expired - reconnect to continue.';
+  if (/not found|no such|does not exist|cannot be found/.test(t)) return 'Not found on Drive.';
+  if (/already exists|duplicate|name.*conflict/.test(t)) return 'An item with that name already exists.';
+  if (/timed out|timeout/.test(t)) return 'The Drive operation timed out - try again.';
+  if (/network|connection|econn|socket|dns|getaddrinfo/.test(t)) return 'Network error talking to Proton - try again.';
+  return 'The Drive operation failed.';
 }
 
 /* ------------------------------------------------------------------ */

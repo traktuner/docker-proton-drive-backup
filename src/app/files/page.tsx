@@ -9,6 +9,8 @@ import StorageBar from '@/components/StorageBar';
 import Settings from '@/components/Settings';
 import { useToast } from '@/components/Toast';
 import { useAuth } from '@/components/AuthProvider';
+import { formatBytes } from '@/lib/format';
+import { DOW, DOW_ORDER } from '@/lib/schedule';
 
 type Mode = 'add' | 'backup' | 'mirror';
 type Schedule = 'off' | 'hourly' | 'daily' | 'weekly';
@@ -28,20 +30,6 @@ const MODE_INFO: Record<Mode, { label: string; desc: string }> = {
   },
 };
 
-const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-// Display order Mon→Sun (values stay JS getDay indices: 0=Sun..6=Sat).
-const DOW_ORDER = [1, 2, 3, 4, 5, 6, 0];
-
-function fmtBytes(n: number): string {
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
-}
 
 interface Estimate {
   bytes: number;
@@ -497,7 +485,7 @@ export default function FilesPage() {
                       <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--accent)]" />
                     )}
                     <span>
-                      <strong className="text-[color:var(--text)]">{fmtBytes(estimate.bytes)}</strong>
+                      <strong className="text-[color:var(--text)]">{formatBytes(estimate.bytes)}</strong>
                       {' · '}
                       {estimate.files.toLocaleString()} file{estimate.files === 1 ? '' : 's'}
                       {' · '}

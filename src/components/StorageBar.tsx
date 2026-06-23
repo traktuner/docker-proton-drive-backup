@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useAuth } from './AuthProvider';
+import { formatBytes } from '@/lib/format';
 
 interface Quota {
   maxSpace: number;
@@ -9,16 +10,7 @@ interface Quota {
   driveUsed: number;
 }
 
-function fmt(n: number): string {
-  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v < 10 && i > 0 ? 2 : v < 100 ? 1 : 0)} ${u[i]}`;
-}
+const fmt = (n: number) => formatBytes(n, 'precise');
 
 export default function StorageBar() {
   const { status: authStatus } = useAuth();

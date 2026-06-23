@@ -1,4 +1,4 @@
-import { trashDrive, normalizeProtonPath } from '@/server/cli';
+import { trashDrive, normalizeProtonPath, cleanCliError } from '@/server/cli';
 import { backupSets } from '@/server/db';
 
 export const dynamic = 'force-dynamic';
@@ -31,7 +31,7 @@ export async function POST(req: Request) {
 
   const res = await trashDrive(path);
   if (!res.ok) {
-    return Response.json({ error: res.error }, { status: 502 });
+    return Response.json({ error: cleanCliError(res.error) }, { status: 502 });
   }
   return Response.json({ ok: true });
 }

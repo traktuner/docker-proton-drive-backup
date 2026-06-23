@@ -117,11 +117,6 @@ export const catalog = {
     stmts().upsertDir.run(setId, rel, seenAt);
   },
 
-  /** Mark an existing row as seen this run (used for mirror deletion detection). */
-  touch(setId: string, rel: string, seenAt: number): void {
-    stmts().touch.run(seenAt, setId, rel);
-  },
-
   /**
    * Mark many rows as seen this run, in a single transaction. The hot path for a
    * mirror backup of a mostly-unchanged tree: instead of one autocommit (and one

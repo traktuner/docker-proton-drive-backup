@@ -31,7 +31,7 @@ export interface BackupSet {
   scheduleDow: number; // 0=Sun..6=Sat, for weekly
   excludes: string[]; // glob patterns to skip (backup/mirror modes)
   lastRunAt: number | null;
-  lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled';
+  lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
   lastMessage: string | null;
   createdAt: number;
 }

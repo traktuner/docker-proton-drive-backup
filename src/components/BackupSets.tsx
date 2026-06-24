@@ -30,7 +30,7 @@ export interface BackupSet {
   scheduleDow: number;
   excludes: string[];
   lastRunAt: number | null;
-  lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled';
+  lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
   lastMessage: string | null;
   nextRunAt?: number | null;
   recentRuns?: RunRow[];
@@ -79,6 +79,7 @@ const STATUS_SIGNAL: Record<BackupSet['lastStatus'], string | null> = {
   success: '--signal-success',
   error: '--signal-danger',
   cancelled: null,
+  paused: '--signal-warning',
 };
 function statusStyle(s: BackupSet['lastStatus']): CSSProperties {
   const v = STATUS_SIGNAL[s];
@@ -110,6 +111,8 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   // Ids the user just hit Cancel on — show immediate feedback until the run
   // actually stops (the backend may take a moment to kill the transfer).
   const [cancelling, setCancelling] = useState<Set<string>>(new Set());
+  const [pausing, setPausing] = useState<Set<string>>(new Set());
+  const [pauseChoice, setPauseChoice] = useState<string | null>(null);
   const [verifying, setVerifying] = useState<Set<string>>(new Set());
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
@@ -127,17 +130,20 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
               toast(`“${n.name}” failed — ${n.lastMessage ?? 'error'}`, 'error');
               reportAuthError(n.lastMessage ?? undefined); // raise the banner if it was a session expiry
             } else if (n.lastStatus === 'cancelled') toast(`“${n.name}” cancelled`, 'info');
+            else if (n.lastStatus === 'paused') toast(`“${n.name}” paused`, 'info');
           }
         }
         setSets(next);
-        // Drop the cancelling flag once a set is no longer running.
-        setCancelling((prev) => {
+        // Drop the cancelling/pausing flags once a set is no longer running.
+        const stillRunning = (id: string) => next.find((s) => s.id === id)?.lastStatus === 'running';
+        const prune = (prev: Set<string>) => {
           if (prev.size === 0) return prev;
-          const still = new Set(
-            [...prev].filter((id) => next.find((s) => s.id === id)?.lastStatus === 'running'),
-          );
+          const still = new Set([...prev].filter(stillRunning));
           return still.size === prev.size ? prev : still;
-        });
+        };
+        setCancelling(prune);
+        setPausing(prune);
+        setPauseChoice((cur) => (cur && !stillRunning(cur) ? null : cur));
       })
       .finally(() => setLoading(false));
 
@@ -152,15 +158,21 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   }, [sets]);
 
   const run = async (id: string) => {
-    const name = sets.find((s) => s.id === id)?.name;
+    const cur = sets.find((s) => s.id === id);
+    const verb = cur?.lastStatus === 'paused' ? 'Resuming' : 'Running';
     setSets((prev) => prev.map((s) => (s.id === id ? { ...s, lastStatus: 'running' } : s)));
-    toast(`Running${name ? ` “${name}”` : ''}…`, 'info');
+    toast(`${verb}${cur?.name ? ` “${cur.name}”` : ''}…`, 'info');
     await fetch(`/api/backup-sets/${id}/run`, { method: 'POST' });
     load();
   };
   const cancel = async (id: string) => {
     setCancelling((prev) => new Set(prev).add(id)); // immediate feedback
     await fetch(`/api/backup-sets/${id}/cancel`, { method: 'POST' });
+    load();
+  };
+  const pause = async (id: string, force: boolean) => {
+    setPausing((prev) => new Set(prev).add(id)); // immediate feedback
+    await fetch(`/api/backup-sets/${id}/pause${force ? '?force=1' : ''}`, { method: 'POST' });
     load();
   };
   const verify = async (id: string) => {
@@ -338,11 +350,11 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                 </div>
               </div>
             ) : (
-              <div className="flex items-start justify-between gap-3">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="font-medium">{s.name}</span>
-                    <span className="rounded px-1.5 py-0.5 text-[11px]" style={statusStyle(s.lastStatus)}>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate font-medium">{s.name}</span>
+                    <span className="shrink-0 rounded px-1.5 py-0.5 text-[11px]" style={statusStyle(s.lastStatus)}>
                       {s.lastStatus}
                     </span>
                   </div>
@@ -354,9 +366,12 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   </p>
                   <p className="mt-0.5 text-xs text-[color:var(--muted)]">
                     {MODE_LABEL[s.mode]} · {scheduleLabel(s)}
-                    {s.schedule !== 'off' && s.nextRunAt && s.lastStatus !== 'running' && (
-                      <span className="text-[color:var(--muted)]"> · next {fmtWhen(s.nextRunAt)}</span>
-                    )}
+                    {s.schedule !== 'off' &&
+                      s.nextRunAt &&
+                      s.lastStatus !== 'running' &&
+                      s.lastStatus !== 'paused' && (
+                        <span className="text-[color:var(--muted)]"> · next {fmtWhen(s.nextRunAt)}</span>
+                      )}
                   </p>
 
                   {/* Trust signal: one dot for the LAST run (colour = its outcome,
@@ -418,7 +433,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                     )
                   )}
                 </div>
-                <div className="flex shrink-0 items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
                   {confirmDel === s.id ? (
                     <span className="flex items-center gap-1.5 text-xs">
                       <span className="text-[color:var(--muted)]">Delete?</span>
@@ -439,20 +454,80 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   ) : (
                     <>
                       {s.lastStatus === 'running' ? (
-                        <button
-                          onClick={() => cancel(s.id)}
-                          disabled={cancelling.has(s.id)}
-                          className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
-                          style={{ color: 'var(--signal-warning)' }}
-                        >
-                          {cancelling.has(s.id) && (
+                        pausing.has(s.id) ? (
+                          // Graceful pause pending: the current upload is finishing.
+                          // Offer an escape hatch to stop it now (discards in-flight).
+                          <span
+                            className="inline-flex items-center gap-1.5 text-xs"
+                            style={{ color: 'var(--signal-warning)' }}
+                          >
                             <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
-                          )}
-                          {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
-                        </button>
+                            Pausing…
+                            <button
+                              onClick={() => pause(s.id, true)}
+                              className="pbtn pbtn--ghost px-2 py-1 text-xs"
+                              title="Stop the current upload immediately (it re-uploads on resume)"
+                            >
+                              Stop now
+                            </button>
+                          </span>
+                        ) : pauseChoice === s.id ? (
+                          // Ask how to pause while a transfer is in flight.
+                          <span className="inline-flex flex-wrap items-center gap-1.5 text-xs">
+                            <span className="text-[color:var(--muted)]">Pause:</span>
+                            <button
+                              onClick={() => {
+                                setPauseChoice(null);
+                                pause(s.id, true);
+                              }}
+                              className="pbtn pbtn--ghost px-2.5 py-1 text-xs"
+                              title="Stop immediately. The file currently uploading restarts on resume."
+                            >
+                              Now
+                            </button>
+                            <button
+                              onClick={() => {
+                                setPauseChoice(null);
+                                pause(s.id, false);
+                              }}
+                              className="pbtn pbtn--ghost px-2.5 py-1 text-xs"
+                              title="Let the current upload finish first, so it isn't re-done"
+                            >
+                              After current file
+                            </button>
+                            <button
+                              onClick={() => setPauseChoice(null)}
+                              className="pbtn pbtn--ghost px-2 py-1 text-xs text-[color:var(--muted)]"
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        ) : (
+                          <>
+                            <button
+                              onClick={() => (s.progress ? setPauseChoice(s.id) : pause(s.id, false))}
+                              className="pbtn pbtn--ghost px-3 py-1.5 text-xs"
+                              style={{ color: 'var(--signal-warning)' }}
+                              title="Pause and resume later (continues from where it left off)"
+                            >
+                              Pause
+                            </button>
+                            <button
+                              onClick={() => cancel(s.id)}
+                              disabled={cancelling.has(s.id)}
+                              className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                              style={{ color: 'var(--signal-danger)' }}
+                            >
+                              {cancelling.has(s.id) && (
+                                <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
+                              )}
+                              {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
+                            </button>
+                          </>
+                        )
                       ) : (
                         <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
-                          Run
+                          {s.lastStatus === 'paused' ? 'Resume' : 'Run'}
                         </button>
                       )}
                       <button

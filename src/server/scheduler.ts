@@ -107,7 +107,9 @@ export function lastOccurrence(s: BackupSet, now: Date): number | null {
  * handled separately at startup via reconcileInterrupted().
  */
 export function isDue(s: BackupSet, now: Date): boolean {
-  if (s.schedule === 'off' || s.lastStatus === 'running') return false;
+  // A manually paused set stays paused until the user resumes it - the scheduler
+  // must not auto-resume it at the next slot.
+  if (s.schedule === 'off' || s.lastStatus === 'running' || s.lastStatus === 'paused') return false;
   const occ = lastOccurrence(s, now);
   if (occ == null) return false;
   return (s.lastRunAt ?? 0) < occ;

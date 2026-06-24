@@ -69,11 +69,16 @@ async function doRunBackupSet(id: string): Promise<void> {
   const log = (msg: string) => backupSets.updateStatus(id, 'running', msg, false);
   let ok = false;
 
-  // If a cancel landed, stop here and mark it cancelled. Checked after each
-  // awaited phase (verify, etc.) so cancelling between steps takes effect.
+  // A stop can be a hard cancel or a pause (resumes later via the delta engine).
+  // Both stop the transfer; only the resulting status/label differ.
+  const stopStatus = (): 'cancelled' | 'paused' => (control.reason(id) === 'pause' ? 'paused' : 'cancelled');
+  const stopMsg = (): string => (control.reason(id) === 'pause' ? 'Paused' : 'Cancelled');
+
+  // If a stop landed, record it and bail. Checked after each awaited phase so
+  // stopping between steps takes effect.
   const bailIfCancelled = (): boolean => {
     if (!control.isCancelled(id)) return false;
-    backupSets.updateStatus(id, 'cancelled', 'Cancelled', true);
+    backupSets.updateStatus(id, stopStatus(), stopMsg(), true);
     return true;
   };
 
@@ -112,8 +117,8 @@ async function doRunBackupSet(id: string): Promise<void> {
         : (res.stderr.trim() || res.stdout.trim() || `CLI exited with code ${res.code}`).slice(0, 1000);
       backupSets.updateStatus(
         id,
-        cancelled ? 'cancelled' : ok ? 'success' : 'error',
-        cancelled ? 'Cancelled' : ok ? 'Added new files' : failMsg,
+        cancelled ? stopStatus() : ok ? 'success' : 'error',
+        cancelled ? stopMsg() : ok ? 'Added new files' : failMsg,
         true,
       );
     } else {
@@ -129,18 +134,19 @@ async function doRunBackupSet(id: string): Promise<void> {
         () => control.isCancelled(id),
       );
       ok = result.ok;
-      backupSets.updateStatus(
-        id,
-        result.cancelled ? 'cancelled' : ok ? 'success' : 'error',
-        result.message,
-        true,
-      );
+      const status = result.cancelled ? stopStatus() : ok ? 'success' : 'error';
+      // The engine labels a stopped run "Cancelled - …"; relabel for a pause.
+      const message =
+        result.cancelled && status === 'paused'
+          ? result.message.replace(/^Cancelled/, 'Paused')
+          : result.message;
+      backupSets.updateStatus(id, status, message, true);
     }
   } catch (e) {
     backupSets.updateStatus(
       id,
-      control.isCancelled(id) ? 'cancelled' : 'error',
-      control.isCancelled(id) ? 'Cancelled' : e instanceof Error ? e.message : String(e),
+      control.isCancelled(id) ? stopStatus() : 'error',
+      control.isCancelled(id) ? stopMsg() : e instanceof Error ? e.message : String(e),
       true,
     );
   } finally {
@@ -163,8 +169,16 @@ async function doRunBackupSet(id: string): Promise<void> {
   }
 }
 
-/** Request cancellation of a running set and stop the active upload promptly. */
-export function cancelBackupSet(id: string) {
-  control.requestCancel(id);
-  killActiveUpload();
+/**
+ * Stop a running set. `reason: 'pause'` marks it resumable (status 'paused'); the
+ * default hard-cancels it (status 'cancelled'). `force` (default true) SIGKILLs the
+ * active transfer NOW - instant, but a file mid-upload is discarded and re-uploaded
+ * on resume (Proton uploads don't survive a kill). `force: false` is a GRACEFUL
+ * stop: the current upload finishes (nothing wasted), then the engine stops before
+ * the next batch - so no work is thrown away, at the cost of waiting out the
+ * in-flight file. Either way the delta engine continues from the catalog next run.
+ */
+export function cancelBackupSet(id: string, reason: 'cancel' | 'pause' = 'cancel', force = true) {
+  control.requestCancel(id, reason);
+  if (force) killActiveUpload();
 }

@@ -8,6 +8,15 @@ export async function register() {
       console.error('[unhandledRejection]', reason);
     });
 
+    // Recovery: repair any source paths an older edit accidentally doubled under
+    // LOCAL_ROOT (e.g. "/sources/sources/…") before anything runs against them.
+    try {
+      const { healDoubledSourcePaths } = await import('./server/db');
+      healDoubledSourcePaths();
+    } catch (e) {
+      console.error('[heal] source-path recovery failed:', e);
+    }
+
     // Declarative deploy: import backup sets from CONFIG_DIR if present.
     const { autoImportFromConfigDir } = await import('./server/config');
     autoImportFromConfigDir();

@@ -214,11 +214,32 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   };
   const saveEdit = async () => {
     if (!editId) return;
-    await fetch(`/api/backup-sets/${editId}`, {
+    // Send ONLY the fields the edit form actually changes. Never round-trip
+    // sourcePaths/targetPath: they're stored as absolute in-container paths and the
+    // API would re-resolve them under LOCAL_ROOT (doubling the prefix), and sending
+    // them would needlessly reset the upload catalog. The edit form has no source/
+    // target pickers, so they can't change here anyway.
+    const payload = {
+      name: draft.name,
+      mode: draft.mode,
+      schedule: draft.schedule,
+      scheduleHour: draft.scheduleHour,
+      scheduleMinute: draft.scheduleMinute,
+      scheduleDow: draft.scheduleDow,
+      excludes: draft.excludes,
+      skipThumbnails: draft.skipThumbnails,
+      watch: draft.watch,
+    };
+    const res = await fetch(`/api/backup-sets/${editId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft),
+      body: JSON.stringify(payload),
     });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      toast(d.error || 'Failed to save changes', 'error');
+      return;
+    }
     setEditId(null);
     toast('Changes saved', 'success');
     load();

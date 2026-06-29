@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { backupSets, getDb } from '@/server/db';
+import fs from 'node:fs';
+import path from 'node:path';
+import { backupSets, getDb, healDoubledSourcePaths } from '@/server/db';
+import { LOCAL_ROOT } from '@/server/local';
 
 beforeEach(() => {
   getDb().exec('DELETE FROM backup_sets');
@@ -51,5 +54,56 @@ describe('backupSets store', () => {
     const s = backupSets.create({ name: 'C', sourcePaths: ['/x'], targetPath: '/' });
     backupSets.delete(s.id);
     expect(backupSets.get(s.id)).toBeNull();
+  });
+});
+
+describe('healDoubledSourcePaths (recovery for the edit-route doubling bug)', () => {
+  // The doubling resolveLocal produced for an already-absolute path: it joins
+  // LOCAL_ROOT onto a path that already starts with LOCAL_ROOT, so the prefix
+  // repeats — "/sources/Photos" → "/sources/sources/Photos".
+  const correct = path.join(LOCAL_ROOT, 'Photos');
+  const doubled = LOCAL_ROOT + LOCAL_ROOT + '/Photos';
+  const tripled = LOCAL_ROOT + LOCAL_ROOT + LOCAL_ROOT + '/Photos';
+
+  beforeEach(() => {
+    fs.mkdirSync(correct, { recursive: true });
+  });
+
+  it('repairs a doubled source path when the real folder exists', () => {
+    const s = backupSets.create({ name: 'Photos', sourcePaths: [doubled], targetPath: '/' });
+    healDoubledSourcePaths();
+    expect(backupSets.get(s.id)!.sourcePaths).toEqual([correct]);
+  });
+
+  it('repairs a path doubled more than once', () => {
+    const s = backupSets.create({ name: 'Photos', sourcePaths: [tripled], targetPath: '/' });
+    healDoubledSourcePaths();
+    expect(backupSets.get(s.id)!.sourcePaths).toEqual([correct]);
+  });
+
+  it('leaves a correct, existing source path untouched', () => {
+    const s = backupSets.create({ name: 'Photos', sourcePaths: [correct], targetPath: '/' });
+    healDoubledSourcePaths();
+    expect(backupSets.get(s.id)!.sourcePaths).toEqual([correct]);
+  });
+
+  it('does NOT heal when the de-doubled path does not exist (e.g. offline mount)', () => {
+    const missingDoubled = LOCAL_ROOT + LOCAL_ROOT + '/NotMounted';
+    const s = backupSets.create({ name: 'X', sourcePaths: [missingDoubled], targetPath: '/' });
+    healDoubledSourcePaths();
+    // Can't trust "gone locally" → leave it exactly as stored.
+    expect(backupSets.get(s.id)!.sourcePaths).toEqual([missingDoubled]);
+  });
+
+  it('does NOT touch a real folder that happens to look doubled (stored path exists)', () => {
+    // Pathological but real: BOTH "<root>/Deep" and the look-doubled
+    // "<root><root>/Deep" exist on disk. Since the stored path itself exists, the
+    // `!exists(stored)` guard must refuse to rewrite it — no data points the wrong way.
+    fs.mkdirSync(path.join(LOCAL_ROOT, 'Deep'), { recursive: true });
+    const realNested = LOCAL_ROOT + LOCAL_ROOT + '/Deep';
+    fs.mkdirSync(realNested, { recursive: true });
+    const s = backupSets.create({ name: 'Nested', sourcePaths: [realNested], targetPath: '/' });
+    healDoubledSourcePaths();
+    expect(backupSets.get(s.id)!.sourcePaths).toEqual([realNested]);
   });
 });

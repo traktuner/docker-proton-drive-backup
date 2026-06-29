@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { nanoid } from 'nanoid';
 import path from 'node:path';
 import fs from 'node:fs';
-import { sanitizeSegment } from './local';
+import { sanitizeSegment, LOCAL_ROOT } from './local';
 
 const DB_PATH = process.env.DB_PATH || '/data/backup.db';
 
@@ -299,3 +299,32 @@ export const backupSets = {
       .run(id);
   },
 };
+
+/**
+ * One-time recovery for sets whose source paths got doubled (e.g.
+ * "/sources/sources/Photos") by an older edit that re-resolved an already-absolute
+ * path under LOCAL_ROOT. Peels the redundant leading LOCAL_ROOT copies, but ONLY
+ * rewrites a path when the de-doubled version actually exists on disk AND the stored
+ * one does not — so a real folder literally named like LOCAL_ROOT is never touched,
+ * and an offline mount (where nothing exists) is left untouched. Idempotent and safe
+ * to run on every startup. Does NOT touch the catalog (a later run re-seeds it).
+ */
+export function healDoubledSourcePaths(): void {
+  const dbl = LOCAL_ROOT + LOCAL_ROOT; // e.g. "/sources" + "/sources" = "/sources/sources"
+  for (const s of backupSets.all()) {
+    let changed = false;
+    const fixed = s.sourcePaths.map((p) => {
+      let cur = p;
+      while (cur === dbl || cur.startsWith(dbl + '/')) cur = cur.slice(LOCAL_ROOT.length);
+      if (cur !== p && fs.existsSync(cur) && !fs.existsSync(p)) {
+        changed = true;
+        return cur;
+      }
+      return p;
+    });
+    if (changed) {
+      getDb().prepare('UPDATE backup_sets SET source_paths = ? WHERE id = ?').run(JSON.stringify(fixed), s.id);
+      console.log(`[heal] fixed doubled source path(s) for backup set "${s.name}" → ${JSON.stringify(fixed)}`);
+    }
+  }
+}

@@ -674,17 +674,12 @@ export async function upload(
   /** If set, the CLI runs verbose and this is called with each file's byte size
       as it completes — used to show live progress/speed during the recursive seed. */
   onUploadedFile?: (bytes: number) => void,
+  /** Skip generating Drive thumbnails (CLI `-t`). Faster, no previews on Drive. */
+  skipThumbnails = false,
 ): Promise<RunResult> {
-  const args = [
-    'filesystem',
-    'upload',
-    '-f',
-    fileStrategy,
-    '-d',
-    folderStrategy,
-    ...localPaths,
-    normalizeProtonPath(targetPath),
-  ];
+  const args = ['filesystem', 'upload', '-f', fileStrategy, '-d', folderStrategy];
+  if (skipThumbnails) args.push('-t');
+  args.push(...localPaths, normalizeProtonPath(targetPath));
   if (onUploadedFile) args.push('-v'); // emit per-file [metric] upload lines
   // Concurrency is managed by the engine's worker pool (and one backup set runs
   // at a time via the runner). No timeout - large files can upload for hours.

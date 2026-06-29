@@ -125,6 +125,8 @@ export async function uploadSourceTrees(
   fileStrategy: FileStrategy,
   folderStrategy: FileStrategy,
   onUploadedFile?: (bytes: number) => void,
+  shouldCancel: () => boolean = () => false,
+  skipThumbnails = false,
 ): Promise<RunResult> {
   // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
   const ensured = new Set<string>();
@@ -143,7 +145,7 @@ export async function uploadSourceTrees(
   let last: RunResult = { code: 0, stdout: '', stderr: '' };
   const run = async (absList: string[], parentDrive: string): Promise<boolean> => {
     if (absList.length === 0) return true;
-    const res = await upload(absList, parentDrive, fileStrategy, folderStrategy, onUploadedFile);
+    const res = await upload(absList, parentDrive, fileStrategy, folderStrategy, onUploadedFile, skipThumbnails);
     if (res.code !== 0) {
       last = res;
       return false;
@@ -173,12 +175,14 @@ export async function uploadSourceTrees(
   }
 
   for (const [parentRel, absList] of fileGroups) {
+    if (shouldCancel()) return last;
     await ensureChain(parentRel === '.' ? '' : parentRel);
     const parentDrive = parentRel === '.' ? target : `${target}/${parentRel}`;
     if (!(await run(absList, parentDrive))) return last;
   }
 
   for (const s of dirSources) {
+    if (shouldCancel()) return last;
     await ensureChain(s.relBase); // create <target>/<relBase> in full
     let ents;
     try {
@@ -218,7 +222,9 @@ export async function runCatalogDelta(
   log: (msg: string) => void = () => {},
   onProgress: (p: EngineProgress) => void = () => {},
   shouldCancel: () => boolean = () => false,
+  opts: { skipThumbnails?: boolean; dryRun?: boolean } = {},
 ): Promise<DeltaResult> {
+  const { skipThumbnails = false, dryRun = false } = opts;
   const target = normalizeProtonPath(targetPath);
   // Each source is laid out at "<target>/<subfolder>/<source rel to LOCAL_ROOT>",
   // so same-named folders from different paths never collide and the structure is
@@ -271,23 +277,31 @@ export async function runCatalogDelta(
   // catalog from a local walk. Structure is preserved via uploadSourceTrees.
   // Excludes can't be honoured by the CLI recursion, so those sets fall through to
   // the per-file path below.
-  if (excludes.length === 0 && catalog.count(setId) === 0) {
+  if (!dryRun && excludes.length === 0 && catalog.count(setId) === 0) {
     log('Initial upload (recursive)…');
     report('initial upload');
     // Verbose upload so we get a per-file [metric] upload line — gives live file
     // count, bytes and speed even though the CLI does the whole tree in one go.
     let uploaded = 0;
     let lastReport = 0;
-    const res = await uploadSourceTrees(sources, target, 'skip', 'merge', (bytes) => {
-      uploaded += 1;
-      doneFiles = uploaded;
-      doneBytes += bytes;
-      const now = Date.now();
-      if (now - lastReport >= 250) {
-        lastReport = now;
-        report('uploading');
-      }
-    });
+    const res = await uploadSourceTrees(
+      sources,
+      target,
+      'skip',
+      'merge',
+      (bytes) => {
+        uploaded += 1;
+        doneFiles = uploaded;
+        doneBytes += bytes;
+        const now = Date.now();
+        if (now - lastReport >= 250) {
+          lastReport = now;
+          report('uploading');
+        }
+      },
+      shouldCancel,
+      skipThumbnails,
+    );
     if (shouldCancel()) return cancelledResult();
     if (res.code !== 0) {
       const authDead = looksUnauthenticated(res.stderr + res.stdout);
@@ -388,7 +402,7 @@ export async function runCatalogDelta(
     let ok = false;
     let lastErr = '';
     for (let attempt = 1; attempt <= 4 && !shouldCancel() && !sessionDead; attempt++) {
-      const res = await upload(files.map((x) => x.f.abs), parentDrive, 'merge', 'merge');
+      const res = await upload(files.map((x) => x.f.abs), parentDrive, 'merge', 'merge', undefined, skipThumbnails);
       if (res.code === 0) {
         ok = true;
         break;

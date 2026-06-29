@@ -29,6 +29,8 @@ export interface BackupSet {
   scheduleMinute: number;
   scheduleDow: number;
   excludes: string[];
+  skipThumbnails: boolean;
+  watch: boolean;
   lastRunAt: number | null;
   lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
   lastMessage: string | null;
@@ -112,7 +114,6 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   // actually stops (the backend may take a moment to kill the transfer).
   const [cancelling, setCancelling] = useState<Set<string>>(new Set());
   const [pausing, setPausing] = useState<Set<string>>(new Set());
-  const [pauseChoice, setPauseChoice] = useState<string | null>(null);
   const [verifying, setVerifying] = useState<Set<string>>(new Set());
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
@@ -143,7 +144,6 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
         };
         setCancelling(prune);
         setPausing(prune);
-        setPauseChoice((cur) => (cur && !stillRunning(cur) ? null : cur));
       })
       .finally(() => setLoading(false));
 
@@ -170,9 +170,9 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
     await fetch(`/api/backup-sets/${id}/cancel`, { method: 'POST' });
     load();
   };
-  const pause = async (id: string, force: boolean) => {
+  const pause = async (id: string) => {
     setPausing((prev) => new Set(prev).add(id)); // immediate feedback
-    await fetch(`/api/backup-sets/${id}/pause${force ? '?force=1' : ''}`, { method: 'POST' });
+    await fetch(`/api/backup-sets/${id}/pause`, { method: 'POST' });
     load();
   };
   const verify = async (id: string) => {
@@ -340,6 +340,15 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                     className="w-full resize-y pfield px-2 py-1 text-xs"
                   />
                 )}
+                <label className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--muted)]">
+                  <input
+                    type="checkbox"
+                    checked={!!draft.skipThumbnails}
+                    onChange={(e) => setDraft((d) => ({ ...d, skipThumbnails: e.target.checked }))}
+                    className="accent-[color:var(--accent)]"
+                  />
+                  Skip thumbnails on Drive
+                </label>
                 <div className="flex gap-2">
                   <button onClick={saveEdit} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
                     Save
@@ -454,77 +463,31 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   ) : (
                     <>
                       {s.lastStatus === 'running' ? (
-                        pausing.has(s.id) ? (
-                          // Graceful pause pending: the current upload is finishing.
-                          // Offer an escape hatch to stop it now (discards in-flight).
-                          <span
-                            className="inline-flex items-center gap-1.5 text-xs"
+                        <>
+                          <button
+                            onClick={() => pause(s.id)}
+                            disabled={pausing.has(s.id) || cancelling.has(s.id)}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
                             style={{ color: 'var(--signal-warning)' }}
+                            title="Pause now and resume later (continues from where it left off)"
                           >
-                            <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
-                            Pausing…
-                            <button
-                              onClick={() => pause(s.id, true)}
-                              className="pbtn pbtn--ghost px-2 py-1 text-xs"
-                              title="Stop the current upload immediately (it re-uploads on resume)"
-                            >
-                              Stop now
-                            </button>
-                          </span>
-                        ) : pauseChoice === s.id ? (
-                          // Ask how to pause while a transfer is in flight.
-                          <span className="inline-flex flex-wrap items-center gap-1.5 text-xs">
-                            <span className="text-[color:var(--muted)]">Pause:</span>
-                            <button
-                              onClick={() => {
-                                setPauseChoice(null);
-                                pause(s.id, true);
-                              }}
-                              className="pbtn pbtn--ghost px-2.5 py-1 text-xs"
-                              title="Stop immediately. The file currently uploading restarts on resume."
-                            >
-                              Now
-                            </button>
-                            <button
-                              onClick={() => {
-                                setPauseChoice(null);
-                                pause(s.id, false);
-                              }}
-                              className="pbtn pbtn--ghost px-2.5 py-1 text-xs"
-                              title="Let the current upload finish first, so it isn't re-done"
-                            >
-                              After current file
-                            </button>
-                            <button
-                              onClick={() => setPauseChoice(null)}
-                              className="pbtn pbtn--ghost px-2 py-1 text-xs text-[color:var(--muted)]"
-                            >
-                              ✕
-                            </button>
-                          </span>
-                        ) : (
-                          <>
-                            <button
-                              onClick={() => (s.progress ? setPauseChoice(s.id) : pause(s.id, false))}
-                              className="pbtn pbtn--ghost px-3 py-1.5 text-xs"
-                              style={{ color: 'var(--signal-warning)' }}
-                              title="Pause and resume later (continues from where it left off)"
-                            >
-                              Pause
-                            </button>
-                            <button
-                              onClick={() => cancel(s.id)}
-                              disabled={cancelling.has(s.id)}
-                              className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
-                              style={{ color: 'var(--signal-danger)' }}
-                            >
-                              {cancelling.has(s.id) && (
-                                <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
-                              )}
-                              {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
-                            </button>
-                          </>
-                        )
+                            {pausing.has(s.id) && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
+                            )}
+                            {pausing.has(s.id) ? 'Pausing…' : 'Pause'}
+                          </button>
+                          <button
+                            onClick={() => cancel(s.id)}
+                            disabled={cancelling.has(s.id) || pausing.has(s.id)}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                            style={{ color: 'var(--signal-danger)' }}
+                          >
+                            {cancelling.has(s.id) && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
+                            )}
+                            {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
+                          </button>
+                        </>
                       ) : (
                         <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
                           {s.lastStatus === 'paused' ? 'Resume' : 'Run'}

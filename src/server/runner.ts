@@ -109,7 +109,15 @@ async function doRunBackupSet(id: string): Promise<void> {
       log('Uploading new files…');
       const target = normalizeProtonPath(set.targetPath);
       const sources = set.sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(set.targetSubfolder, abs) }));
-      const res = await uploadSourceTrees(sources, target, 'skip', 'merge');
+      const res = await uploadSourceTrees(
+        sources,
+        target,
+        'skip',
+        'merge',
+        undefined,
+        () => control.isCancelled(id),
+        set.skipThumbnails,
+      );
       const cancelled = control.isCancelled(id);
       ok = res.code === 0 && !cancelled;
       const failMsg = looksUnauthenticated(res.stderr + res.stdout)
@@ -132,6 +140,7 @@ async function doRunBackupSet(id: string): Promise<void> {
         log,
         (p) => progress.set(id, p),
         () => control.isCancelled(id),
+        { skipThumbnails: set.skipThumbnails },
       );
       ok = result.ok;
       const status = result.cancelled ? stopStatus() : ok ? 'success' : 'error';
@@ -170,15 +179,14 @@ async function doRunBackupSet(id: string): Promise<void> {
 }
 
 /**
- * Stop a running set. `reason: 'pause'` marks it resumable (status 'paused'); the
- * default hard-cancels it (status 'cancelled'). `force` (default true) SIGKILLs the
- * active transfer NOW - instant, but a file mid-upload is discarded and re-uploaded
- * on resume (Proton uploads don't survive a kill). `force: false` is a GRACEFUL
- * stop: the current upload finishes (nothing wasted), then the engine stops before
- * the next batch - so no work is thrown away, at the cost of waiting out the
- * in-flight file. Either way the delta engine continues from the catalog next run.
+ * Stop a running set, killing the active transfer immediately. `reason: 'pause'`
+ * marks it resumable (status 'paused'); the default hard-cancels it ('cancelled').
+ * Stopping is instant in every mode (including the recursive first-run/add upload):
+ * a file that was mid-upload is re-uploaded on resume (Proton uploads don't survive
+ * a kill), but the delta engine / `-f skip` skip everything already uploaded, so
+ * resume just continues.
  */
-export function cancelBackupSet(id: string, reason: 'cancel' | 'pause' = 'cancel', force = true) {
+export function cancelBackupSet(id: string, reason: 'cancel' | 'pause' = 'cancel') {
   control.requestCancel(id, reason);
-  if (force) killActiveUpload();
+  killActiveUpload();
 }

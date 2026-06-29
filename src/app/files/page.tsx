@@ -82,6 +82,7 @@ export default function FilesPage() {
   const [minute, setMinute] = useState(0);
   const [dow, setDow] = useState(1);
   const [excludes, setExcludes] = useState('');
+  const [skipThumbnails, setSkipThumbnails] = useState(false);
   const [creating, setCreating] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [estimate, setEstimate] = useState<Estimate>({ bytes: 0, files: 0, folders: 0, counting: false });
@@ -356,6 +357,7 @@ export default function FilesPage() {
           scheduleMinute: minute,
           scheduleDow: dow,
           excludes: allExcludes,
+          skipThumbnails,
         }),
       });
       const d = await res.json();
@@ -364,6 +366,7 @@ export default function FilesPage() {
       setName('');
       setRoots(new Set());
       setExcluded(new Set());
+      setSkipThumbnails(false);
       setRefreshKey((k) => k + 1);
     } catch (e) {
       toast(e instanceof Error ? e.message : String(e), 'error');
@@ -437,8 +440,11 @@ export default function FilesPage() {
         </div>
       ) : (
         <>
-      {/* Dual panes - stacked & tall on mobile, side-by-side filling height on desktop */}
-      <div className="grid grid-cols-1 gap-4 p-4 lg:min-h-0 lg:flex-1 lg:grid-cols-2">
+      {/* Dual panes - stacked & tall on mobile, side-by-side filling height on desktop.
+          lg:grid-rows-[minmax(0,1fr)] gives the single row a definite height so each
+          pane's lg:h-full resolves (without it the panes collapse to 0 at >=lg until a
+          resize forces reflow - GitHub #15). */}
+      <div className="grid grid-cols-1 gap-4 p-4 lg:min-h-0 lg:flex-1 lg:grid-cols-2 lg:grid-rows-[minmax(0,1fr)]">
         <FilePane
           title="Local files"
           badge="Source"
@@ -651,6 +657,15 @@ export default function FilesPage() {
                 </details>
               )}
             </div>
+            <label className="flex cursor-pointer items-center gap-2 pl-[2px] text-xs text-[color:var(--muted)]">
+              <input
+                type="checkbox"
+                checked={skipThumbnails}
+                onChange={(e) => setSkipThumbnails(e.target.checked)}
+                className="accent-[color:var(--accent)]"
+              />
+              Skip thumbnails on Drive (faster uploads, no previews)
+            </label>
             <button onClick={createSet} disabled={creating} className="pbtn pbtn--solid w-full px-4 py-2.5 text-sm">
               {creating ? 'Creating…' : 'Create backup set'}
             </button>

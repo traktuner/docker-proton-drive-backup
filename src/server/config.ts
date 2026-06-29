@@ -35,6 +35,8 @@ export function exportConfig(): string {
     }
     if (s.schedule === 'weekly') item.dayOfWeek = DOW[s.scheduleDow];
     if (s.excludes.length) item.excludes = s.excludes;
+    if (s.skipThumbnails) item.skipThumbnails = true;
+    if (s.watch) item.watch = true;
     return item;
   });
   return YAML.stringify({ version: 1, backupSets: sets });
@@ -97,6 +99,8 @@ export function importConfig(text: string): ImportResult {
       scheduleMinute: Math.min(59, Math.max(0, parseInt(m, 10) || 0)),
       scheduleDow: dowIdx >= 0 ? dowIdx : 1,
       excludes: Array.isArray(raw?.excludes) ? raw.excludes.map(String) : [],
+      skipThumbnails: raw?.skipThumbnails === true,
+      watch: raw?.watch === true,
     };
 
     const dupe = existing.find((e) => e.name === name);

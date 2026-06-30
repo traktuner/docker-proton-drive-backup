@@ -14,7 +14,7 @@ interface Info {
   account: { email: string | null; displayName: string | null };
   quota: { maxSpace: number; usedSpace: number; driveUsed: number } | null;
   productUsed: Record<string, number>;
-  uploads: { thresholdMB: number; concurrency: number };
+  uploads: { concurrency: number };
 }
 interface Updates {
   cli: { current: string; latest: string; updateAvailable: boolean };
@@ -57,10 +57,9 @@ export default function Settings() {
   const [info, setInfo] = useState<Info | null>(null);
   const [updates, setUpdates] = useState<Updates | null>(null);
   const [checking, setChecking] = useState(false);
-  const [uploads, setUploads] = useState<{ thresholdMB: number; concurrency: number } | null>(null);
-  const [thresholdStr, setThresholdStr] = useState('');
+  const [uploads, setUploads] = useState<{ concurrency: number } | null>(null);
 
-  const saveUploads = (patch: { thresholdMB?: number; concurrency?: number }) => {
+  const saveUploads = (patch: { concurrency: number }) => {
     setUploads((u) => (u ? { ...u, ...patch } : u));
     fetch('/api/settings/uploads', {
       method: 'POST',
@@ -70,17 +69,6 @@ export default function Settings() {
       .then((r) => r.json())
       .then(setUploads)
       .catch(() => {});
-  };
-
-  // Parallel-upload size threshold, clamped + persisted on every change.
-  const THRESHOLD_MIN = 1;
-  const THRESHOLD_MAX = 10000;
-  const THRESHOLD_STEP = 5;
-  const thresholdNum = parseInt(thresholdStr, 10) || 20;
-  const commitThreshold = (v: number) => {
-    const c = Math.min(THRESHOLD_MAX, Math.max(THRESHOLD_MIN, v));
-    setThresholdStr(String(c));
-    saveUploads({ thresholdMB: c });
   };
 
   useEffect(() => setMounted(true), []);
@@ -94,7 +82,6 @@ export default function Settings() {
       .then((d) => {
         setInfo(d);
         setUploads(d.uploads);
-        setThresholdStr(String(d.uploads?.thresholdMB ?? 20));
       })
       .catch(() => {});
   }, []);
@@ -140,7 +127,6 @@ export default function Settings() {
       .then((d) => {
         setInfo(d);
         setUploads(d.uploads);
-        setThresholdStr(String(d.uploads?.thresholdMB ?? 20));
       })
       .catch(() => {});
     checkUpdates();
@@ -244,48 +230,11 @@ export default function Settings() {
             {/* Uploads */}
             {uploads && (
               <Section title="Uploads">
-                <Row label="Upload in parallel under">
-                  <span className="inline-flex items-center gap-2">
-                    <span className="pstepper text-sm">
-                      <button
-                        type="button"
-                        aria-label="Decrease threshold"
-                        disabled={thresholdNum <= THRESHOLD_MIN}
-                        onClick={() => commitThreshold(thresholdNum - THRESHOLD_STEP)}
-                        className="pstepper__btn"
-                      >
-                        <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-                          <path d="M3.5 8h9" />
-                        </svg>
-                      </button>
-                      <input
-                        inputMode="numeric"
-                        value={thresholdStr}
-                        onChange={(e) => setThresholdStr(e.target.value.replace(/[^0-9]/g, ''))}
-                        onBlur={() => commitThreshold(thresholdNum)}
-                        className="pstepper__input py-1.5"
-                      />
-                      <button
-                        type="button"
-                        aria-label="Increase threshold"
-                        disabled={thresholdNum >= THRESHOLD_MAX}
-                        onClick={() => commitThreshold(thresholdNum + THRESHOLD_STEP)}
-                        className="pstepper__btn"
-                      >
-                        <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-                          <path d="M8 3.5v9M3.5 8h9" />
-                        </svg>
-                      </button>
-                    </span>
-                    <span className="text-[color:var(--muted)]">MB</span>
-                  </span>
-                </Row>
                 <div className="py-1">
                   <div className="flex items-center justify-between text-sm">
-                    <span className="text-[color:var(--muted)]">Small-file concurrency</span>
+                    <span className="text-[color:var(--muted)]">Parallel uploads</span>
                     <span>
-                      {uploads.concurrency} simultaneous · {uploads.concurrency <= 4 ? 1 : 2} worker
-                      {uploads.concurrency <= 4 ? '' : 's'}
+                      {uploads.concurrency} at once
                     </span>
                   </div>
                   <input
@@ -297,8 +246,9 @@ export default function Settings() {
                     className="prange mt-2 w-full"
                   />
                   <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
-                    Files below the threshold upload in parallel (smallest first); larger files go one at
-                    a time. The CLI runs ~4 streams per worker - 4 = one worker, 8 = two.
+                    How many files upload at the same time, each its own CLI process (~4 streams each).
+                    Higher is faster but heavier on the connection and likelier to hit Proton rate limits.
+                    Takes effect during a running backup, as in-flight uploads finish.
                   </p>
                 </div>
               </Section>

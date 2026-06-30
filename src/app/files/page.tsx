@@ -82,6 +82,7 @@ export default function FilesPage() {
   const [minute, setMinute] = useState(0);
   const [dow, setDow] = useState(1);
   const [excludes, setExcludes] = useState('');
+  const [subfolder, setSubfolder] = useState(''); // optional Drive folder override (else derived from name)
   const [skipThumbnails, setSkipThumbnails] = useState(false);
   const [creating, setCreating] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -358,12 +359,15 @@ export default function FilesPage() {
           scheduleDow: dow,
           excludes: allExcludes,
           skipThumbnails,
+          // Optional Drive folder override; the server sanitises + de-dupes per target.
+          targetFolder: subfolder.trim() || undefined,
         }),
       });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || 'Failed to create backup set');
       toast(`Backup set “${name.trim()}” created`, 'success');
       setName('');
+      setSubfolder('');
       setRoots(new Set());
       setExcluded(new Set());
       setSkipThumbnails(false);
@@ -377,8 +381,9 @@ export default function FilesPage() {
 
   const targetLabel = targetPath === '/' ? 'Drive (root)' : `Drive${targetPath}`;
   // Preview of the set's top-level Drive folder (mirrors server sanitizeSegment).
+  // An explicit subfolder override wins; otherwise it's derived from the set name.
   // eslint-disable-next-line no-control-regex
-  const previewFolder = name.replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
+  const previewFolder = (subfolder.trim() || name).replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
 
   return (
     <div className="flex min-h-screen flex-col lg:h-screen">
@@ -515,7 +520,13 @@ export default function FilesPage() {
                 placeholder="e.g. Photos to Drive"
                 className="w-full pfield px-3 py-2 text-sm"
               />
-              {name.trim() && (
+              <input
+                value={subfolder}
+                onChange={(e) => setSubfolder(e.target.value)}
+                placeholder="Drive folder (optional — defaults to the set name)"
+                className="w-full pfield px-3 py-2 text-sm"
+              />
+              {(name.trim() || subfolder.trim()) && (
                 <p className="truncate text-[11px] text-[color:var(--muted)]">
                   Saved to{' '}
                   <span className="text-[color:var(--accent-2)]">

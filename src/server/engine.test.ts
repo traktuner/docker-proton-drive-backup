@@ -23,7 +23,7 @@ vi.mock('@/server/cli', async (importActual) => {
 
 // Import AFTER the mock is registered. relBaseFor / runCatalogDelta come from the
 // engine; the catalog + LOCAL_ROOT come from the real (DB-backed) modules.
-import { relBaseFor, runCatalogDelta } from '@/server/engine';
+import { relBaseFor, runCatalogDelta, previewDelta } from '@/server/engine';
 import * as cli from '@/server/cli';
 import { catalog } from '@/server/catalog';
 import { LOCAL_ROOT } from '@/server/local';
@@ -309,5 +309,88 @@ describe('runCatalogDelta — excludes', () => {
     expect(res.newCount).toBe(1); // only keep.txt
     expect(catalog.getFile('exset', 'Set/ex1/keep.txt')).toBeDefined();
     expect(catalog.getFile('exset', 'Set/ex1/skip.log')).toBeUndefined();
+  });
+});
+
+describe('previewDelta (dry run — read-only)', () => {
+  it('first run (empty catalog): everything would upload, nothing unchanged/deleted', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pv1');
+    await writeFixture('pv1/a.txt', 'aaa');
+    await writeFixture('pv1/sub/b.txt', 'bbbb');
+
+    const p = await previewDelta('pvset1', [srcDir], 'Set', 'backup');
+
+    expect(p.ok).toBe(true);
+    expect(p.wouldUploadCount).toBe(2);
+    expect(p.wouldUploadBytes).toBe(7); // 'aaa' (3) + 'bbbb' (4)
+    expect(p.unchangedCount).toBe(0);
+    expect(p.wouldDeleteCount).toBe(0);
+    // Read-only: never touches Drive, never seeds the catalog.
+    expect(upload).not.toHaveBeenCalled();
+    expect(createFolder).not.toHaveBeenCalled();
+    expect(catalog.count('pvset1')).toBe(0);
+  });
+
+  it('after a real run with no changes: 0 to upload, all unchanged, catalog untouched', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pv2');
+    await writeFixture('pv2/a.txt', 'aaa');
+    await writeFixture('pv2/b.txt', 'bbbb');
+    await runCatalogDelta('pvset2', [srcDir], '/', 'Set', 'backup'); // seed
+    const before = catalog.count('pvset2');
+    upload.mockClear();
+
+    const p = await previewDelta('pvset2', [srcDir], 'Set', 'backup');
+
+    expect(p.wouldUploadCount).toBe(0);
+    expect(p.unchangedCount).toBe(2);
+    expect(upload).not.toHaveBeenCalled();
+    expect(catalog.count('pvset2')).toBe(before); // unchanged
+  });
+
+  it('mirror: lists Drive items that vanished locally, without trashing anything', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pv3');
+    await writeFixture('pv3/a.txt', 'aaa');
+    await writeFixture('pv3/b.txt', 'bbbb');
+    await runCatalogDelta('pvset3', [srcDir], '/', 'Set', 'mirror'); // seed both
+
+    await fsp.rm(path.join(LOCAL_ROOT, 'pv3/a.txt')); // a.txt gone locally
+    trashDrive.mockClear();
+
+    const p = await previewDelta('pvset3', [srcDir], 'Set', 'mirror');
+
+    expect(p.wouldUploadCount).toBe(0);
+    expect(p.unchangedCount).toBe(1); // b.txt
+    expect(p.wouldDeleteCount).toBe(1);
+    expect(p.wouldDelete).toContain('Set/pv3/a.txt');
+    expect(p.deletionWouldSkip).toBeNull();
+    // Still read-only: never trashes, catalog row for a.txt survives.
+    expect(trashDrive).not.toHaveBeenCalled();
+    expect(catalog.getFile('pvset3', 'Set/pv3/a.txt')).toBeDefined();
+  });
+
+  it('mirror: flags that the real run would SKIP deletion when a source is missing', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pv4');
+    await writeFixture('pv4/a.txt', 'aaa');
+    await writeFixture('pv4/b.txt', 'bbbb');
+    await runCatalogDelta('pvset4', [srcDir], '/', 'Set', 'mirror'); // seed
+
+    await fsp.rm(srcDir, { recursive: true }); // the whole source mount vanished
+
+    const p = await previewDelta('pvset4', [srcDir], 'Set', 'mirror');
+
+    expect(p.deletionWouldSkip).toBeTruthy();
+    expect(p.deletionWouldSkip).toMatch(/source path is missing/i);
+  });
+
+  it('backup mode never reports deletions', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pv5');
+    await writeFixture('pv5/a.txt', 'aaa');
+    await runCatalogDelta('pvset5', [srcDir], '/', 'Set', 'backup');
+    await fsp.rm(path.join(LOCAL_ROOT, 'pv5/a.txt')); // gone locally
+
+    const p = await previewDelta('pvset5', [srcDir], 'Set', 'backup');
+
+    expect(p.wouldDeleteCount).toBe(0);
+    expect(p.deletionWouldSkip).toBeNull();
   });
 });

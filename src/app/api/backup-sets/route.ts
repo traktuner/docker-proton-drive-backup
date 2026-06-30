@@ -39,6 +39,10 @@ export async function POST(req: Request) {
   if (!(typeof name === 'string') || !name.trim()) {
     return Response.json({ error: 'name is required' }, { status: 400 });
   }
+  // Names must be globally unique (the user relies on the name to tell sets apart).
+  if (backupSets.all().some((s) => s.name === name.trim())) {
+    return Response.json({ error: `A backup set named “${name.trim()}” already exists.` }, { status: 409 });
+  }
   if (!Array.isArray(sourcePaths) || sourcePaths.length === 0) {
     return Response.json({ error: 'at least one source path is required' }, { status: 400 });
   }

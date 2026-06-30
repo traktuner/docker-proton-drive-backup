@@ -265,6 +265,26 @@ export const backupSets = {
     return this.get(id);
   },
 
+  /**
+   * Atomically rename a set's Drive subfolder in OUR records after the real Drive
+   * folder rename (CLI) has succeeded: rewrite every catalog rel from the old
+   * top-level prefix to the new one (the bare "<old>" dir row and all "<old>/…"
+   * rows) and set target_subfolder — both in one transaction, so the next run sees
+   * the new keys and re-uploads nothing. LIKE metacharacters in the old name are
+   * escaped so a subfolder containing % or _ can't widen the match.
+   */
+  renameSubfolder(id: string, oldSub: string, newSub: string): void {
+    const db = getDb();
+    const likePattern = oldSub.replace(/[\\%_]/g, '\\$&') + '/%';
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE backup_catalog SET rel = ? || substr(rel, ?)
+         WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
+      ).run(newSub, oldSub.length + 1, id, oldSub, likePattern);
+      db.prepare('UPDATE backup_sets SET target_subfolder = ? WHERE id = ?').run(newSub, id);
+    })();
+  },
+
   delete(id: string): void {
     getDb().prepare('DELETE FROM backup_sets WHERE id = ?').run(id);
   },

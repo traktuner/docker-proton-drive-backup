@@ -625,6 +625,17 @@ export async function trashDrive(targetPath: string) {
 }
 
 /**
+ * Rename a Drive item in place (same parent), via `filesystem rename path newName`.
+ * Used to rename a backup set's top-level folder when the user changes its Drive
+ * subfolder, so the catalog keys can be rewritten instead of re-uploading everything.
+ */
+export async function renameDrive(targetPath: string, newName: string) {
+  const res = await runJson(['filesystem', 'rename', normalizeProtonPath(targetPath), newName]);
+  invalidateListCache();
+  return res;
+}
+
+/**
  * Whether a Drive path exists, checked via `filesystem info` (server truth -
  * unlike `list`, which serves the cached tree). Returns:
  *  - true:  exists

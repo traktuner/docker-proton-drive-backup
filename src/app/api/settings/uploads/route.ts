@@ -8,8 +8,7 @@ export async function GET() {
 
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-  const patch: { thresholdMB?: number; concurrency?: number } = {};
-  if (body.thresholdMB != null) patch.thresholdMB = Number(body.thresholdMB);
+  const patch: { concurrency?: number } = {};
   if (body.concurrency != null) patch.concurrency = Number(body.concurrency);
   return Response.json(setUploadConfig(patch));
 }

@@ -34,6 +34,7 @@ let _stmts: {
   clear: Stmt;
   count: Stmt;
   eachFile: Stmt;
+  eachEntry: Stmt;
 } | null = null;
 
 let ensured = false;
@@ -87,6 +88,7 @@ function stmts() {
     clear: d.prepare('DELETE FROM backup_catalog WHERE set_id = ?'),
     count: d.prepare('SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ?'),
     eachFile: d.prepare("SELECT rel, size, sha1 FROM backup_catalog WHERE set_id = ? AND kind = 'file'"),
+    eachEntry: d.prepare('SELECT rel, kind FROM backup_catalog WHERE set_id = ?'),
   };
   return _stmts;
 }
@@ -158,6 +160,19 @@ export const catalog = {
       sha1: string | null;
     }>) {
       cb(r);
+    }
+  },
+
+  /**
+   * Stream every entry (files AND dirs) as {rel, kind}, awaiting an async callback
+   * per row — used by the read-only mirror preview to stat each entry on disk
+   * without ever materialising the whole catalog in memory. Read-only: the caller
+   * MUST NOT run other catalog statements while this iterator is open (we only
+   * stat the filesystem between rows, never touch the DB).
+   */
+  async eachEntryAsync(setId: string, cb: (e: { rel: string; kind: string }) => Promise<void>): Promise<void> {
+    for (const r of stmts().eachEntry.iterate(setId) as IterableIterator<{ rel: string; kind: string }>) {
+      await cb(r);
     }
   },
 

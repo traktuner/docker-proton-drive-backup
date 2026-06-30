@@ -1,9 +1,9 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createReadStream, promises as fsp } from 'node:fs';
-import { walkSourceStream, relToLocalRoot, type WalkedFile } from './local';
+import { walkSourceStream, relToLocalRoot, LOCAL_ROOT, type WalkedFile } from './local';
 import { catalog, diffFile } from './catalog';
-import { getUploadConfig, resolvePlan } from './upload-config';
+import { getUploadConfig } from './upload-config';
 import {
   createFolder,
   upload,
@@ -18,6 +18,11 @@ import {
 /** Message shown when a run stops because the Proton session expired mid-flight. */
 const SESSION_EXPIRED_MSG =
   'Proton session expired — reconnect to Proton Drive to resume. Nothing was deleted and your backup set is unchanged.';
+
+/** A mirror run that would remove more than this fraction of the catalog skips the
+ *  deletion pass and flags it, rather than trashing a huge swath in one go. Shared
+ *  by the live run and the read-only preview so both agree on what's "too much". */
+const DELETE_SAFETY_PCT = 0.3;
 
 /**
  * Delta backup engine.
@@ -222,9 +227,9 @@ export async function runCatalogDelta(
   log: (msg: string) => void = () => {},
   onProgress: (p: EngineProgress) => void = () => {},
   shouldCancel: () => boolean = () => false,
-  opts: { skipThumbnails?: boolean; dryRun?: boolean } = {},
+  opts: { skipThumbnails?: boolean } = {},
 ): Promise<DeltaResult> {
-  const { skipThumbnails = false, dryRun = false } = opts;
+  const { skipThumbnails = false } = opts;
   const target = normalizeProtonPath(targetPath);
   // Each source is laid out at "<target>/<subfolder>/<source rel to LOCAL_ROOT>",
   // so same-named folders from different paths never collide and the structure is
@@ -238,10 +243,21 @@ export async function runCatalogDelta(
   const isExcluded = (rel: string) => matchExclude(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
   const seenAt = Date.now();
 
-  const cfg = getUploadConfig();
-  const { workers } = resolvePlan(cfg.concurrency);
   const CHUNK = 200; // files per upload call
-  const MAX_INFLIGHT = Math.max(1, workers);
+  // How many upload batches may be in flight at once = the user's configured upload
+  // concurrency, re-read live (cached ~1s) so changing it in Settings takes effect
+  // mid-run: raising it lets more batches start, lowering it makes new batches wait
+  // until the in-flight count drains below the new cap (graceful up/down-scaling).
+  let capCache = 0;
+  let capAt = 0;
+  const maxInflight = (): number => {
+    const now = Date.now();
+    if (now - capAt > 1000) {
+      capCache = Math.max(1, Math.min(8, getUploadConfig().concurrency || 2));
+      capAt = now;
+    }
+    return capCache;
+  };
 
   let newCount = 0;
   let changedCount = 0;
@@ -277,7 +293,7 @@ export async function runCatalogDelta(
   // catalog from a local walk. Structure is preserved via uploadSourceTrees.
   // Excludes can't be honoured by the CLI recursion, so those sets fall through to
   // the per-file path below.
-  if (!dryRun && excludes.length === 0 && catalog.count(setId) === 0) {
+  if (excludes.length === 0 && catalog.count(setId) === 0) {
     log('Initial upload (recursive)…');
     report('initial upload');
     // Verbose upload so we get a per-file [metric] upload line — gives live file
@@ -387,12 +403,14 @@ export async function runCatalogDelta(
     }
   };
 
-  // Bounded-concurrency flush pool.
+  // Bounded-concurrency flush pool. Wait until we're below the (live) cap BEFORE
+  // starting a batch, so lowering the cap mid-run drains the in-flight set down
+  // gracefully instead of overshooting, and raising it starts more at once.
   const inflight = new Set<Promise<void>>();
   const schedule = async (task: () => Promise<void>): Promise<void> => {
+    while (inflight.size >= maxInflight()) await Promise.race(inflight);
     const p = task().finally(() => inflight.delete(p));
     inflight.add(p);
-    if (inflight.size >= MAX_INFLIGHT) await Promise.race(inflight);
   };
 
   // Upload one batch (single parent) with retry, then record it in the catalog.
@@ -591,7 +609,6 @@ export async function runCatalogDelta(
     const stale = catalog.stale(setId, seenAt).filter((s) => managedRoots.has(s.rel.split('/')[0]));
     const totalEntries = catalog.count(setId);
     const pctGone = totalEntries > 0 ? stale.length / totalEntries : 0;
-    const DELETE_SAFETY_PCT = 0.3;
 
     if (!sourcesIntact) {
       deletionSkipped = 'a source path is missing on disk (mount offline?)';
@@ -661,6 +678,150 @@ export async function runCatalogDelta(
     deletedCount,
     failedCount,
     message: cancelled ? `Cancelled - ${parts.join(', ')}` : parts.join(', '),
+  };
+}
+
+export interface PreviewResult {
+  ok: boolean;
+  mode: 'backup' | 'mirror';
+  newCount: number;
+  changedCount: number;
+  unchangedCount: number;
+  wouldUploadCount: number; // new + changed
+  wouldUploadBytes: number;
+  /** Top-most Drive-relative paths a mirror run would trash (capped for the UI). */
+  wouldDelete: string[];
+  wouldDeleteCount: number; // full count (may exceed wouldDelete.length)
+  wouldDeleteTruncated: boolean;
+  /** If set, the live mirror run would SKIP deletion for this safety reason. */
+  deletionWouldSkip: string | null;
+  message: string;
+}
+
+/**
+ * Read-only "what would this run do" preview — never contacts Drive, never writes
+ * the catalog, never uploads or trashes. Mirrors the delta engine's own decisions:
+ * it streams the same local walk and runs the same diffFile() verdicts to count
+ * new/changed/unchanged + bytes, and for mirror mode it reproduces the deletion
+ * pass by checking which catalog entries no longer exist on disk (bounded memory —
+ * it stats each entry instead of marking seen_at) and applies the same safety gates
+ * (missing source mount, >30% wipe). Lets the user see exactly what a backup/mirror
+ * would change — especially which Drive files a mirror would delete — before running.
+ */
+export async function previewDelta(
+  setId: string,
+  sourcePaths: string[],
+  subfolder: string,
+  mode: 'backup' | 'mirror',
+  excludes: string[] = [],
+  shouldCancel: () => boolean = () => false,
+): Promise<PreviewResult> {
+  const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
+  const managedRoots = new Set([subfolder]);
+  const matchExclude = makeExcluder(excludes);
+  const prefix = `${subfolder}/`;
+  const isExcluded = (rel: string) => matchExclude(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
+
+  let newCount = 0;
+  let changedCount = 0;
+  let unchangedCount = 0;
+  let wouldUploadBytes = 0;
+
+  // Same diff the real run does, but it only counts — no upload, no catalog write.
+  for (const s of sources) {
+    for await (const file of walkSourceStream(s.abs, s.relBase)) {
+      if (shouldCancel()) break;
+      if (isExcluded(file.rel)) continue;
+      const cat = catalog.getFile(setId, file.rel);
+      const verdict = diffFile(file, cat);
+      if (verdict === 'unchanged') {
+        unchangedCount++;
+        continue;
+      }
+      if (verdict === 'hash') {
+        const sha1 = await sha1File(file.abs).catch(() => null);
+        if (sha1 !== null && cat && sha1 === cat.sha1) {
+          unchangedCount++; // content identical, only mtime drifted → no upload
+          continue;
+        }
+        changedCount++;
+        wouldUploadBytes += file.size;
+        continue;
+      }
+      if (verdict === 'new') newCount++;
+      else changedCount++;
+      wouldUploadBytes += file.size;
+    }
+  }
+
+  let wouldDelete: string[] = [];
+  let wouldDeleteCount = 0;
+  let wouldDeleteTruncated = false;
+  let deletionWouldSkip: string | null = null;
+
+  if (mode === 'mirror') {
+    // Map a catalog rel ("<subfolder>/<source-rel-to-LOCAL_ROOT>") back to its local
+    // path, so we can tell whether it still exists without re-listing Drive.
+    const localAbs = (rel: string): string => {
+      const sub = rel.startsWith(prefix) ? rel.slice(prefix.length) : rel === subfolder ? '' : rel;
+      return sub ? path.join(LOCAL_ROOT, sub) : LOCAL_ROOT;
+    };
+    const missing: { rel: string; kind: string }[] = [];
+    await catalog.eachEntryAsync(setId, async (e) => {
+      if (shouldCancel()) return;
+      if (!managedRoots.has(e.rel.split('/')[0])) return; // scope to this set's folder
+      try {
+        await fsp.stat(localAbs(e.rel));
+      } catch {
+        missing.push(e); // gone locally → a mirror run would trash its Drive copy
+      }
+    });
+    // Only the top-most items are trashed (a folder removes its children).
+    const tops = missing.filter((s) => !missing.some((o) => o !== s && s.rel.startsWith(`${o.rel}/`)));
+    wouldDeleteCount = tops.length;
+    const CAP = 500;
+    wouldDelete = tops.slice(0, CAP).map((s) => s.rel);
+    wouldDeleteTruncated = tops.length > CAP;
+
+    // Same safety gates the live run applies before deleting (the "an upload failed"
+    // gate can't apply to a read-only preview, so it's omitted here).
+    let sourcesIntact = true;
+    for (const s of sources) {
+      try {
+        await fsp.stat(s.abs);
+      } catch {
+        sourcesIntact = false;
+        break;
+      }
+    }
+    const totalEntries = catalog.count(setId);
+    const pctGone = totalEntries > 0 ? missing.length / totalEntries : 0;
+    if (!sourcesIntact) {
+      deletionWouldSkip = 'a source path is missing on disk (mount offline?)';
+    } else if (pctGone > DELETE_SAFETY_PCT) {
+      deletionWouldSkip = `${missing.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
+    }
+  }
+
+  const wouldUploadCount = newCount + changedCount;
+  const parts = [`${wouldUploadCount} to upload`, `${unchangedCount} unchanged`];
+  if (mode === 'mirror') {
+    if (deletionWouldSkip) parts.push(`deletion skipped for safety (${deletionWouldSkip})`);
+    else parts.push(`${wouldDeleteCount} to remove`);
+  }
+  return {
+    ok: true,
+    mode,
+    newCount,
+    changedCount,
+    unchangedCount,
+    wouldUploadCount,
+    wouldUploadBytes,
+    wouldDelete,
+    wouldDeleteCount,
+    wouldDeleteTruncated,
+    deletionWouldSkip,
+    message: parts.join(' · '),
   };
 }
 

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { backupSets, getDb, healDoubledSourcePaths } from '@/server/db';
+import { catalog } from '@/server/catalog';
 import { LOCAL_ROOT } from '@/server/local';
 
 beforeEach(() => {
@@ -105,5 +106,58 @@ describe('healDoubledSourcePaths (recovery for the edit-route doubling bug)', ()
     const s = backupSets.create({ name: 'Nested', sourcePaths: [realNested], targetPath: '/' });
     healDoubledSourcePaths();
     expect(backupSets.get(s.id)!.sourcePaths).toEqual([realNested]);
+  });
+});
+
+describe('renameSubfolder (#16 — rewrite catalog keys so a folder rename re-uploads nothing)', () => {
+  beforeEach(() => {
+    catalog.count('__warm__'); // ensure the catalog table exists
+    getDb().exec('DELETE FROM backup_catalog');
+  });
+
+  it('rewrites the bare dir row and every "<old>/…" file+dir row, and the stored subfolder', () => {
+    const s = backupSets.create({ name: 'Photos', sourcePaths: ['/x'], targetPath: '/' });
+    const t = 1_000;
+    catalog.upsertDir(s.id, 'Photos', t);
+    catalog.upsertDir(s.id, 'Photos/sub', t);
+    catalog.upsertFile(s.id, 'Photos/a.txt', 3, t, null, t);
+    catalog.upsertFile(s.id, 'Photos/sub/b.txt', 4, t, null, t);
+
+    backupSets.renameSubfolder(s.id, 'Photos', 'Album');
+
+    expect(backupSets.get(s.id)!.targetSubfolder).toBe('Album');
+    expect(catalog.hasDir(s.id, 'Album')).toBe(true);
+    expect(catalog.hasDir(s.id, 'Album/sub')).toBe(true);
+    expect(catalog.getFile(s.id, 'Album/a.txt')).toBeDefined();
+    expect(catalog.getFile(s.id, 'Album/sub/b.txt')).toBeDefined();
+    // Nothing left under the old prefix.
+    expect(catalog.hasDir(s.id, 'Photos')).toBe(false);
+    expect(catalog.getFile(s.id, 'Photos/a.txt')).toBeUndefined();
+  });
+
+  it('does not touch another set sharing the same catalog table', () => {
+    const a = backupSets.create({ name: 'A', sourcePaths: ['/x'], targetPath: '/' });
+    const b = backupSets.create({ name: 'B', sourcePaths: ['/y'], targetPath: '/' });
+    const t = 1_000;
+    catalog.upsertFile(a.id, 'A/f.txt', 1, t, null, t);
+    catalog.upsertFile(b.id, 'A/f.txt', 1, t, null, t); // same rel string, different set
+
+    backupSets.renameSubfolder(a.id, 'A', 'A2');
+
+    expect(catalog.getFile(a.id, 'A2/f.txt')).toBeDefined();
+    expect(catalog.getFile(a.id, 'A/f.txt')).toBeUndefined();
+    expect(catalog.getFile(b.id, 'A/f.txt')).toBeDefined(); // B untouched
+  });
+
+  it('escapes LIKE metacharacters so a "_"/"%" in the old name cannot widen the match', () => {
+    const s = backupSets.create({ name: 'us', sourcePaths: ['/x'], targetPath: '/' });
+    const t = 1_000;
+    catalog.upsertFile(s.id, 'a_b/keep.txt', 1, t, null, t); // belongs to the renamed folder
+    catalog.upsertFile(s.id, 'aXb/other.txt', 1, t, null, t); // '_' as wildcard would wrongly match this
+
+    backupSets.renameSubfolder(s.id, 'a_b', 'a_b-renamed');
+
+    expect(catalog.getFile(s.id, 'a_b-renamed/keep.txt')).toBeDefined();
+    expect(catalog.getFile(s.id, 'aXb/other.txt')).toBeDefined(); // NOT rewritten
   });
 });

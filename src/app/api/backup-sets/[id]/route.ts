@@ -1,8 +1,9 @@
 import path from 'node:path';
 import { backupSets, type BackupMode, type Schedule } from '@/server/db';
-import { resolveLocal, LOCAL_ROOT } from '@/server/local';
+import { resolveLocal, LOCAL_ROOT, sanitizeSegment } from '@/server/local';
 import { catalog } from '@/server/catalog';
 import { runs } from '@/server/runs';
+import { renameDrive, normalizeProtonPath, cleanCliError } from '@/server/cli';
 
 export const dynamic = 'force-dynamic';
 
@@ -65,15 +66,73 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     }
   }
 
+  const targetChanged = patch.targetPath != null && patch.targetPath !== cur.targetPath;
+
+  // --- Validate everything that can be rejected BEFORE mutating anything ---
+
+  // Globally-unique names: reject only when the name is actually CHANGING to one
+  // another set already uses. Pre-existing duplicates are tolerated (we never
+  // retroactively block editing an old set that happens to share a name).
+  if (patch.name && patch.name !== cur.name && backupSets.all().some((s) => s.id !== id && s.name === patch.name)) {
+    return Response.json({ error: `Another backup set is already named “${patch.name}”.` }, { status: 409 });
+  }
+
+  // Drive subfolder change → rename the Drive folder and rewrite catalog keys so
+  // nothing re-uploads. Computed from the (sanitised) requested folder name.
+  const newSub =
+    typeof body.targetSubfolder === 'string' && body.targetSubfolder.trim()
+      ? sanitizeSegment(body.targetSubfolder.trim())
+      : undefined;
+  const subfolderChanging = !!newSub && newSub !== cur.targetSubfolder;
+
+  if (subfolderChanging) {
+    if (cur.lastStatus === 'running') {
+      return Response.json({ error: 'Stop the backup before renaming its Drive folder.' }, { status: 409 });
+    }
+    if (targetChanged) {
+      return Response.json(
+        { error: 'Change the target and the Drive folder in separate steps.' },
+        { status: 400 },
+      );
+    }
+    if (backupSets.all().some((s) => s.id !== id && s.targetPath === cur.targetPath && s.targetSubfolder === newSub)) {
+      return Response.json(
+        { error: `Another set already uses the Drive folder “${newSub}” under this target.` },
+        { status: 409 },
+      );
+    }
+  }
+
+  // --- Mutations (validation passed) ---
+
+  if (subfolderChanging) {
+    // Rename the actual Drive folder first. If it fails for any reason other than
+    // "it isn't there yet" (set never ran), abort WITHOUT touching the DB/catalog —
+    // so a failed rename never desyncs our keys into a full re-upload.
+    const target = normalizeProtonPath(cur.targetPath);
+    const res = await renameDrive(`${target}/${cur.targetSubfolder}`, newSub!);
+    const errText = (res.ok ? '' : (res.error || '') + ((res as { raw?: string }).raw || '')).toLowerCase();
+    const notThere = /not found|no such|does not exist|cannot be found/.test(errText);
+    if (!res.ok && !notThere) {
+      return Response.json(
+        { error: `Could not rename the Drive folder: ${cleanCliError(errText)}` },
+        { status: 502 },
+      );
+    }
+    // Drive folder renamed (or wasn't there yet) → rewrite our catalog keys + the
+    // stored subfolder atomically. Next run reuses everything; no re-upload.
+    backupSets.renameSubfolder(id, cur.targetSubfolder, newSub!);
+  }
+
   // Reset the upload catalog ONLY when the sources or target ACTUALLY change (its
   // rel paths / Drive target would otherwise no longer line up). A no-op edit —
   // renaming the set, toggling a flag, re-saving the same sources — must NOT clear
-  // it, or every edit would force a needless full re-seed on the next run.
+  // it, or every edit would force a needless full re-seed on the next run. (A
+  // subfolder rename is handled above by rewriting keys, NOT clearing.)
   const sourcesChanged =
     !!patch.sourcePaths &&
     (patch.sourcePaths.length !== cur.sourcePaths.length ||
       patch.sourcePaths.some((p, i) => p !== cur.sourcePaths[i]));
-  const targetChanged = patch.targetPath != null && patch.targetPath !== cur.targetPath;
   if (sourcesChanged || targetChanged) catalog.clear(id);
 
   const updated = backupSets.update(id, patch);

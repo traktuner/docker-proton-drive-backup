@@ -47,6 +47,18 @@ export interface BackupSet {
   } | null;
 }
 
+interface PreviewResult {
+  mode: 'backup' | 'mirror';
+  wouldUploadCount: number;
+  wouldUploadBytes: number;
+  unchangedCount: number;
+  wouldDelete: string[];
+  wouldDeleteCount: number;
+  wouldDeleteTruncated: boolean;
+  deletionWouldSkip: string | null;
+  message: string;
+}
+
 function fmtWhen(ts: number): string {
   const d = new Date(ts);
   const now = new Date();
@@ -103,6 +115,12 @@ function scheduleLabel(s: BackupSet): string {
 }
 const targetLabel = (p: string) => (p === '/' ? 'Drive (root)' : `Drive${p}`);
 
+/** Live preview of the Drive folder name — mirrors the server's sanitizeSegment. */
+function sanitizePreview(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  return (name || '').replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
+}
+
 export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   const { toast } = useToast();
   const { reportAuthError } = useAuth();
@@ -115,6 +133,8 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   const [cancelling, setCancelling] = useState<Set<string>>(new Set());
   const [pausing, setPausing] = useState<Set<string>>(new Set());
   const [verifying, setVerifying] = useState<Set<string>>(new Set());
+  const [previewing, setPreviewing] = useState<Set<string>>(new Set());
+  const [previews, setPreviews] = useState<Record<string, PreviewResult>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
   const load = () =>
@@ -161,6 +181,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
     const cur = sets.find((s) => s.id === id);
     const verb = cur?.lastStatus === 'paused' ? 'Resuming' : 'Running';
     setSets((prev) => prev.map((s) => (s.id === id ? { ...s, lastStatus: 'running' } : s)));
+    closePreview(id); // a fresh run makes any open preview stale
     toast(`${verb}${cur?.name ? ` “${cur.name}”` : ''}…`, 'info');
     await fetch(`/api/backup-sets/${id}/run`, { method: 'POST' });
     load();
@@ -202,6 +223,32 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
       load();
     }
   };
+  const closePreview = (id: string) =>
+    setPreviews((prev) => {
+      if (!prev[id]) return prev;
+      const n = { ...prev };
+      delete n[id];
+      return n;
+    });
+  const preview = async (id: string) => {
+    setPreviewing((prev) => new Set(prev).add(id));
+    try {
+      const res = await fetch(`/api/backup-sets/${id}/dry-run`, { method: 'POST' });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || 'Preview failed');
+      setPreviews((prev) => ({ ...prev, [id]: d as PreviewResult }));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast(msg, 'error');
+      reportAuthError(msg); // a dead session surfaces here too
+    } finally {
+      setPreviewing((prev) => {
+        const n = new Set(prev);
+        n.delete(id);
+        return n;
+      });
+    }
+  };
   const remove = async (id: string) => {
     const name = sets.find((s) => s.id === id)?.name;
     await fetch(`/api/backup-sets/${id}`, { method: 'DELETE' });
@@ -229,6 +276,8 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
       excludes: draft.excludes,
       skipThumbnails: draft.skipThumbnails,
       watch: draft.watch,
+      // Changing this renames the Drive folder + rewrites catalog keys server-side.
+      targetSubfolder: draft.targetSubfolder,
     };
     const res = await fetch(`/api/backup-sets/${editId}`, {
       method: 'PATCH',
@@ -280,6 +329,26 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
                   className="w-full pfield px-2 py-1 text-sm"
                 />
+                <div className="space-y-1">
+                  <label className="block text-[10px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+                    Drive folder
+                  </label>
+                  <input
+                    value={draft.targetSubfolder ?? ''}
+                    onChange={(e) => setDraft((d) => ({ ...d, targetSubfolder: e.target.value }))}
+                    placeholder="Drive subfolder"
+                    className="w-full pfield px-2 py-1 text-sm"
+                  />
+                  <p className="truncate text-[11px] text-[color:var(--muted)]">
+                    Files go to{' '}
+                    <span className="text-[color:var(--accent-2)]">
+                      {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizePreview(draft.targetSubfolder ?? '')}/…
+                    </span>
+                    {sanitizePreview(draft.targetSubfolder ?? '') !== s.targetSubfolder && (
+                      <span className="text-[color:var(--signal-warning)]"> · renames the Drive folder on save</span>
+                    )}
+                  </p>
+                </div>
                 <div className="flex flex-wrap items-center gap-2 text-xs">
                   <select
                     value={draft.mode}
@@ -380,6 +449,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                 </div>
               </div>
             ) : (
+              <>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
                 <div className="min-w-0">
                   <div className="flex min-w-0 items-center gap-2">
@@ -523,6 +593,16 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                       </button>
                       {s.mode !== 'add' && (
                         <button
+                          onClick={() => preview(s.id)}
+                          disabled={s.lastStatus === 'running' || previewing.has(s.id)}
+                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                          title="Dry run — show what the next backup would upload, and (mirror) which Drive files it would delete, without changing anything"
+                        >
+                          {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
+                        </button>
+                      )}
+                      {s.mode !== 'add' && (
+                        <button
                           onClick={() => verify(s.id)}
                           disabled={s.lastStatus === 'running' || verifying.has(s.id)}
                           className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
@@ -542,6 +622,57 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   )}
                 </div>
               </div>
+              {previews[s.id] &&
+                (() => {
+                  const p = previews[s.id];
+                  return (
+                    <div className="mt-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium text-[color:var(--text)]">Preview · nothing was changed</span>
+                        <button
+                          onClick={() => closePreview(s.id)}
+                          className="text-[color:var(--muted)] hover:text-[color:var(--text)]"
+                          aria-label="Close preview"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                      <p className="tnum mt-1 text-[color:var(--muted)]">
+                        <strong className="text-[color:var(--text)]">{p.wouldUploadCount.toLocaleString()}</strong> to
+                        upload ({formatBytes(p.wouldUploadBytes)}) ·{' '}
+                        {p.unchangedCount.toLocaleString()} unchanged
+                      </p>
+                      {p.mode === 'mirror' &&
+                        (p.deletionWouldSkip ? (
+                          <p className="mt-1" style={{ color: 'var(--signal-warning)' }}>
+                            Deletion would be skipped for safety: {p.deletionWouldSkip}
+                          </p>
+                        ) : p.wouldDeleteCount > 0 ? (
+                          <div className="mt-1.5">
+                            <p style={{ color: 'var(--signal-danger)' }}>
+                              {p.wouldDeleteCount.toLocaleString()} item{p.wouldDeleteCount === 1 ? '' : 's'} on Drive
+                              would be deleted (gone locally):
+                            </p>
+                            <ul className="mt-1 max-h-32 space-y-0.5 overflow-auto pr-1 font-mono text-[11px] text-[color:var(--muted)]">
+                              {p.wouldDelete.map((r) => (
+                                <li key={r} className="truncate" title={r}>
+                                  {r}
+                                </li>
+                              ))}
+                              {p.wouldDeleteTruncated && (
+                                <li className="text-[color:var(--muted)]">
+                                  … and {(p.wouldDeleteCount - p.wouldDelete.length).toLocaleString()} more
+                                </li>
+                              )}
+                            </ul>
+                          </div>
+                        ) : (
+                          <p className="mt-1 text-[color:var(--muted)]">Nothing on Drive would be deleted.</p>
+                        ))}
+                    </div>
+                  );
+                })()}
+              </>
             )}
           </li>
         );

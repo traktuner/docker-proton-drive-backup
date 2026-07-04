@@ -134,6 +134,24 @@ source path is missing on disk, if any upload failed during the run, or if more
 than ~30% of the catalog would be removed at once. Re-run after fixing the cause
 to apply pending deletions.
 
+## What gets skipped (a backup is never stopped by one bad file)
+
+A backup **never pauses or aborts** because of an individual file. If a single
+file can't be backed up, it is **skipped** and the rest of the run continues; the
+skipped files are listed per run in the set's **"N files skipped"** panel (with the
+reason), so nothing is ever lost silently. A file is skipped when:
+
+- **Its name is unsupported by Proton Drive.** Proton limits each file/folder name
+  to **255 characters**. In practice a local file can't exceed this (Linux caps a
+  name at 255 bytes), and names with special characters (e.g. `Movie [1080p].mkv`)
+  are handled automatically — but if the CLI ever rejects a name, that one file is
+  skipped, not the whole backup.
+- **It can't be read** (permission or I/O error). It's counted and named as skipped
+  instead of vanishing silently — and in Mirror mode this also prevents an
+  unreadable-but-present file from being mistaken for "deleted".
+- **It's hidden** (a dotfile like `.env`/`.config`) and the set's **"Include hidden
+  files"** option is off (the default).
+
 ## Scheduling
 
 Each set can run **off** (manual only), **hourly**, **daily**, or **weekly**.
@@ -161,10 +179,92 @@ still sign in interactively once. See the volume `(3)` comment in
 | `PROTON_DRIVE_CACHE_DIR` | `/data/proton` | Session + cache + logs (persist this) |
 | `PROTON_DRIVE_UNSAFE_SECRETS` | `1` | File-based secret store (required in Docker) |
 | `PROTON_DRIVE_LOG_LEVEL` | `ERROR` | CLI log verbosity |
+| `HOME` | `/data/proton` | HOME for the app + CLI, kept on the writable `/data` volume so a read-only root and a non-root user both work |
 | `GITHUB_REPO` | `traktuner/docker-proton-drive-backup` | Repo for the in-app update check |
 
 The CLI version is pinned via the `PROTON_CLI_VERSION` build arg in the Dockerfile
 and bumped automatically (see "Notable changes").
+
+## Hardening
+
+The [`docker-compose.yml`](docker-compose.yml) ships safe defaults (`no-new-privileges`,
+`cap_drop: ALL`) and documents two stronger, opt-in modes. Both are booted on every
+release by the deployment smoke matrix ([`test/deployment/smoke.sh`](test/deployment/smoke.sh)),
+so an advertised mode can't ship broken.
+
+**Read-only root filesystem.** The only path the app must write is the `/data`
+volume (DB, Proton session, cache). Enable it with the two tmpfs mounts the
+Next.js runtime needs:
+
+```yaml
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache
+```
+
+`/config` (declarative import) is read-only input — omit it or mount it `:ro`; it is
+never written.
+
+**Run as a non-root user.** Two supported ways:
+
+*(a) `user:` — you run the container as that UID.* The image runs as any UID; the
+only requirement is that the **host** directory bound to `/data` is already writable
+by it (the app writes the DB and session there); `/sources` stays read-only:
+
+```bash
+sudo chown -R 1000:1000 ./data
+```
+
+```yaml
+    user: "1000:1000"
+```
+
+`HOME` lives on `/data`, so this composes with `read_only: true`.
+
+*(b) `PUID`/`PGID` — the container fixes ownership for you.* Handy when you can't
+chown the bind mount yourself: the container starts as root, `chown`s `/data` to the
+given IDs, then drops to that unprivileged user (via `setpriv`) before running the
+app. Do **not** combine it with `user:` or `read_only` (it must start privileged to
+chown and drop):
+
+```yaml
+    environment:
+      - PUID=1000
+      - PGID=1000
+```
+
+| Var | Default | Purpose |
+|---|---|---|
+| `PUID` | *(unset)* | If set (as root), chown `/data` and drop to this user id |
+| `PGID` | *(unset)* | Group id paired with `PUID` |
+
+(Note: some hosts with NFSv4 ACLs can hit a Docker-daemon `chmod … operation not
+permitted` error when creating the bind-mount *source* — that is a host/daemon
+interaction, not the container; pre-create the mount directories with the right
+ownership.)
+
+## Limit upload speed
+
+The Proton Drive CLI has **no** bandwidth flag, and the app doesn't own its byte
+stream, so the only reliable way to cap upload speed is to shape traffic in the
+kernel with `tc` — which needs the **`NET_ADMIN`** capability. It's therefore
+opt-in and a deliberate, documented exception to `cap_drop: ALL`:
+
+```yaml
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]   # only for "Limit upload speed"
+```
+
+Then set the limit in **Settings → Uploads → Limit upload speed** (KB/s). Without
+`NET_ADMIN` the control shows as unavailable rather than silently doing nothing.
+
+Notes: the cap is approximate, shared across all parallel uploads, applied to the
+whole container's egress **only while a backup runs** (removed afterwards so
+browsing isn't throttled), and takes effect on the next run. A minimum of 50 KB/s
+is enforced so the shaper can't starve the CLI's own API calls. `trickle` was
+evaluated and rejected — its `LD_PRELOAD` interception is unreliable against the
+CLI's bundled runtime and can silently fail to limit anything.
 
 ## API
 
@@ -188,7 +288,17 @@ All routes are unauthenticated (see [Security](#security)).
 npm install      # needs Node 24 (better-sqlite3 native build)
 npm run dev      # http://localhost:3000
 npm run build    # production build (standalone output)
+npm run typecheck # tsc --noEmit
+npm test         # vitest — server logic + deployment static guards
+npm run test:smoke # build the image and boot every advertised deployment mode
 ```
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the typecheck and
+vitest suite on every push/PR, then the Docker deployment smoke matrix
+([`test/deployment/smoke.sh`](test/deployment/smoke.sh)) — it starts the container in
+every advertised mode (default, hardened, read-only, non-root, read-only + non-root)
+and fails if any mode doesn't start and initialise. That is the guard that makes an
+"advertised but doesn't start" deployment impossible to merge.
 
 ## Project structure
 

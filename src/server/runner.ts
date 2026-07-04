@@ -6,11 +6,14 @@ import {
   setBackupRunning,
   isAuthenticated,
   looksUnauthenticated,
+  describeUploadError,
 } from './cli';
 import { runCatalogDelta, uploadSourceTrees, relBaseFor } from './engine';
 import { progress } from './progress';
 import { control } from './control';
 import { runs } from './runs';
+import { getUploadConfig } from './upload-config';
+import { applyUploadLimit } from './traffic';
 
 /**
  * Runs a backup set. Fire-and-forget - the UI polls status.
@@ -68,6 +71,13 @@ async function doRunBackupSet(id: string): Promise<void> {
   backupSets.updateStatus(id, 'running', 'Starting…', true);
   const log = (msg: string) => backupSets.updateStatus(id, 'running', msg, false);
   let ok = false;
+  // Upload speed cap (KB/s, 0 = off) applied for THIS run only and cleared in the
+  // finally, so the tc qdisc doesn't throttle the UI/API between runs.
+  let speedCap = 0;
+  // Files skipped this run (name unsupported / unreadable) — persisted with the run
+  // record so the UI can list them in a panel. Backup/mirror only ('add' can't
+  // enumerate per-file skips).
+  let skipped: { rel: string; reason: string }[] = [];
 
   // A stop can be a hard cancel or a pause (resumes later via the delta engine).
   // Both stop the transfer; only the resulting status/label differ.
@@ -86,6 +96,14 @@ async function doRunBackupSet(id: string): Promise<void> {
     if (set.sourcePaths.length === 0) {
       backupSets.updateStatus(id, 'error', 'No source paths configured', true);
       return;
+    }
+
+    // Apply the configured upload speed cap for the duration of this run (best-effort;
+    // a no-op without NET_ADMIN — see traffic.ts). Cleared in the finally below.
+    speedCap = getUploadConfig().limitKBps;
+    if (speedCap > 0) {
+      const shaped = await applyUploadLimit(speedCap);
+      log(shaped.applied ? `Upload speed limited to ${speedCap} KB/s` : `Speed limit not applied: ${shaped.reason}`);
     }
 
     // Failsafe: verify the target still exists on Drive (it may have been deleted
@@ -117,12 +135,13 @@ async function doRunBackupSet(id: string): Promise<void> {
         undefined,
         () => control.isCancelled(id),
         set.skipThumbnails,
+        set.includeHidden,
       );
       const cancelled = control.isCancelled(id);
       ok = res.code === 0 && !cancelled;
       const failMsg = looksUnauthenticated(res.stderr + res.stdout)
         ? 'Proton session expired — reconnect to Proton Drive to resume backups. Your backup set is unchanged.'
-        : (res.stderr.trim() || res.stdout.trim() || `CLI exited with code ${res.code}`).slice(0, 1000);
+        : `Upload failed — ${describeUploadError(res.stderr || res.stdout)}`;
       backupSets.updateStatus(
         id,
         cancelled ? stopStatus() : ok ? 'success' : 'error',
@@ -140,9 +159,10 @@ async function doRunBackupSet(id: string): Promise<void> {
         log,
         (p) => progress.set(id, p),
         () => control.isCancelled(id),
-        { skipThumbnails: set.skipThumbnails },
+        { skipThumbnails: set.skipThumbnails, includeHidden: set.includeHidden },
       );
       ok = result.ok;
+      skipped = result.failedFiles;
       const status = result.cancelled ? stopStatus() : ok ? 'success' : 'error';
       // The engine labels a stopped run "Cancelled - …"; relabel for a pause.
       const message =
@@ -170,11 +190,14 @@ async function doRunBackupSet(id: string): Promise<void> {
         message: fin.lastMessage,
         files: p?.doneFiles ?? 0,
         bytes: p?.doneBytes ?? 0,
+        skipped,
       });
     }
     progress.clear(id);
     control.clear(id);
     setBackupRunning(false);
+    // Remove the tc qdisc so browsing/API isn't throttled between runs (best-effort).
+    if (speedCap > 0) await applyUploadLimit(0).catch(() => {});
   }
 }
 

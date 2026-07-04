@@ -11,6 +11,9 @@ process.env.LOCAL_ROOT = path.join(dir, 'sources');
 process.env.CONFIG_DIR = path.join(dir, 'config');
 process.env.PROTON_DRIVE_CACHE_DIR = path.join(dir, 'proton');
 process.env.TZ = 'UTC';
+// Near-zero upload-retry backoff so failure-path tests (batch isolation / bisection)
+// don't wait out the real multi-second exponential backoff.
+process.env.PDB_UPLOAD_RETRY_BASE_MS = '1';
 fs.mkdirSync(process.env.LOCAL_ROOT, { recursive: true });
 
 // Expose the temp root for tests that need to create fixture files.

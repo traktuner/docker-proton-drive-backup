@@ -36,6 +36,7 @@ export function exportConfig(): string {
     if (s.schedule === 'weekly') item.dayOfWeek = DOW[s.scheduleDow];
     if (s.excludes.length) item.excludes = s.excludes;
     if (s.skipThumbnails) item.skipThumbnails = true;
+    if (s.includeHidden) item.includeHidden = true;
     if (s.watch) item.watch = true;
     return item;
   });
@@ -100,6 +101,7 @@ export function importConfig(text: string): ImportResult {
       scheduleDow: dowIdx >= 0 ? dowIdx : 1,
       excludes: Array.isArray(raw?.excludes) ? raw.excludes.map(String) : [],
       skipThumbnails: raw?.skipThumbnails === true,
+      includeHidden: raw?.includeHidden === true,
       watch: raw?.watch === true,
     };
 

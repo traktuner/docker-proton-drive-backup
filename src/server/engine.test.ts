@@ -394,3 +394,102 @@ describe('previewDelta (dry run — read-only)', () => {
     expect(p.deletionWouldSkip).toBeNull();
   });
 });
+
+describe('runCatalogDelta — per-file failure isolation (issue #22)', () => {
+  it('isolates one poison file so its batch-mates still sync and only it fails', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'iso1');
+    await writeFixture('iso1/good1.txt', 'a');
+    await writeFixture('iso1/good2.txt', 'b');
+    await writeFixture('iso1/bad [1080p].mkv', 'c');
+
+    // Fail any upload whose batch includes the bracketed file; succeed otherwise.
+    // (upload is mocked, so the real escapeGlobPath never runs here — this test
+    // exercises the engine's ISOLATION independently of the cli.ts escaping fix.)
+    upload.mockImplementation(async (absList: string[]) => {
+      if (absList.some((p) => p.includes('bad ['))) return { code: 1, stdout: '', stderr: 'No paths matched' };
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    // excludes.length > 0 forces the per-file path (skips the recursive seed), so
+    // every file flows through flush()/bisection. The pattern matches nothing real.
+    const res = await runCatalogDelta('iso1set', [srcDir], '/', 'Set', 'backup', ['__none__']);
+
+    expect(res.failedCount).toBe(1);
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain('1 failed');
+    // The summary NAMES the offending file and gives a human reason, not just a count.
+    expect(res.message).toContain('bad [1080p].mkv');
+    expect(res.message).toMatch(/characters the Drive CLI cannot handle/);
+    // …and the structured failedFiles list (persisted for the UI's skip panel) carries it.
+    expect(res.failedFiles).toContainEqual({
+      rel: 'Set/iso1/bad [1080p].mkv',
+      reason: 'the name has characters the Drive CLI cannot handle',
+    });
+    // The two good files synced and are cataloged; the poison file is not.
+    expect(catalog.getFile('iso1set', 'Set/iso1/good1.txt')).toBeDefined();
+    expect(catalog.getFile('iso1set', 'Set/iso1/good2.txt')).toBeDefined();
+    expect(catalog.getFile('iso1set', 'Set/iso1/bad [1080p].mkv')).toBeUndefined();
+    // Bisection actually happened → more than one upload attempt.
+    expect(upload.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('a fully-good batch still uploads in ONE call (no bisection on the happy path)', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'iso2');
+    await writeFixture('iso2/a.txt', 'aaa');
+    await writeFixture('iso2/b.txt', 'bbb');
+
+    const res = await runCatalogDelta('iso2set', [srcDir], '/', 'Set', 'backup', ['__none__']);
+
+    expect(res.failedCount).toBe(0);
+    expect(res.ok).toBe(true);
+    // One bucket, one successful upload — no per-file slowdown when nothing fails.
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it('includeHidden: dotfiles are skipped by default but backed up when the flag is set', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'hid');
+    await writeFixture('hid/visible.txt', 'a');
+    await writeFixture('hid/.secret', 'b');
+    await writeFixture('hid/.config/app.conf', 'c');
+
+    // Default (seed path): dotfiles and dot-directories are skipped.
+    await runCatalogDelta('hidOff', [srcDir], '/', 'Set', 'backup');
+    expect(catalog.getFile('hidOff', 'Set/hid/visible.txt')).toBeDefined();
+    expect(catalog.getFile('hidOff', 'Set/hid/.secret')).toBeUndefined();
+    expect(catalog.getFile('hidOff', 'Set/hid/.config/app.conf')).toBeUndefined();
+
+    // includeHidden: the dotfile AND the file under the dot-directory are backed up.
+    await runCatalogDelta('hidOn', [srcDir], '/', 'Set', 'backup', [], undefined, undefined, undefined, {
+      includeHidden: true,
+    });
+    expect(catalog.getFile('hidOn', 'Set/hid/visible.txt')).toBeDefined();
+    expect(catalog.getFile('hidOn', 'Set/hid/.secret')).toBeDefined();
+    expect(catalog.getFile('hidOn', 'Set/hid/.config/app.conf')).toBeDefined();
+  });
+
+  it('mirror: a poison file keeps failedCount>0 so the deletion pass is skipped', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'iso3');
+    for (let i = 0; i < 10; i++) await writeFixture(`iso3/f${i}.txt`, `data-${i}`);
+    await runCatalogDelta('iso3set', [srcDir], '/', 'Set', 'backup'); // seed (all ok)
+    upload.mockClear();
+    trashDrive.mockClear();
+
+    // f0 changes AND its upload fails; f1 vanishes locally (would be "stale").
+    await writeFixture('iso3/f0.txt', 'grown-content-that-differs-in-size');
+    await fsp.rm(path.join(srcDir, 'f1.txt'));
+    upload.mockImplementation(async (absList: string[]) => {
+      if (absList.some((p) => p.endsWith('f0.txt'))) return { code: 1, stdout: '', stderr: 'boom' };
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    const res = await runCatalogDelta('iso3set', [srcDir], '/', 'Set', 'mirror');
+
+    expect(res.failedCount).toBe(1);
+    // Safety gate #2 (an upload failed) → deletion skipped, nothing trashed.
+    expect(trashDrive).not.toHaveBeenCalled();
+    expect(res.deletedCount).toBe(0);
+    expect(res.message).toMatch(/failed to upload|deletion skipped/i);
+    // The vanished file's catalog entry survives (never trashed/dropped).
+    expect(catalog.getFile('iso3set', 'Set/iso3/f1.txt')).toBeDefined();
+  });
+});

@@ -3,7 +3,12 @@ import {
   normalizeProtonPath,
   looksUnauthenticated,
   cleanCliError,
+  describeUploadError,
   parseJson,
+  cliEnv,
+  CACHE_DIR,
+  escapeGlobPath,
+  buildUploadArgs,
   PROTON_ROOT,
 } from '@/server/cli';
 
@@ -182,5 +187,127 @@ describe('parseJson', () => {
     expect(parseJson('42')).toBe(42);
     expect(parseJson('true')).toBe(true);
     expect(parseJson('"hello"')).toBe('hello');
+  });
+});
+
+// Regression guard for issue #19 (read-only start) + running as a non-root `user:`.
+// The CLI env is the ONE place HOME is chosen for every spawned proton-drive process;
+// the old `/home/app` fallback was a nonexistent dir on the read-only root. HOME must
+// fall back to the writable cache dir instead, and must NEVER be /home/app again.
+describe('cliEnv – HOME & secret store (issue #19 / non-root)', () => {
+  const withHome = (value: string | undefined, fn: () => void) => {
+    const saved = process.env.HOME;
+    try {
+      if (value === undefined) delete process.env.HOME;
+      else process.env.HOME = value;
+      fn();
+    } finally {
+      if (saved === undefined) delete process.env.HOME;
+      else process.env.HOME = saved;
+    }
+  };
+
+  it('falls back to the writable CACHE_DIR when HOME is unset — never /home/app', () => {
+    withHome(undefined, () => {
+      const env = cliEnv();
+      expect(env.HOME).toBe(CACHE_DIR);
+      expect(env.HOME).not.toBe('/home/app');
+    });
+  });
+
+  it('honours an operator-supplied HOME', () => {
+    withHome('/custom/home', () => {
+      expect(cliEnv().HOME).toBe('/custom/home');
+    });
+  });
+
+  it('always uses the file-based secret store pointed at the cache dir (headless-safe)', () => {
+    // Guards the headless-Docker contract: no libsecret/keyring, session under CACHE_DIR.
+    const env = cliEnv();
+    expect(env.PROTON_DRIVE_UNSAFE_SECRETS).toBe('1');
+    expect(env.PROTON_DRIVE_CACHE_DIR).toBe(CACHE_DIR);
+  });
+});
+
+// Regression guard for issue #22: the proton-drive CLI globs positional local paths
+// containing * ? [ or {, so a real file named `Movie [1080p].mkv` fails the whole
+// upload with "No paths matched". escapeGlobPath neutralises the metacharacters so
+// glob() matches the literal file; buildUploadArgs applies it to every source path.
+// Per-file upload errors surfaced to the UI (run summary / status toast). The user
+// must see WHY a file failed, not a raw CLI dump or a bare count.
+describe('describeUploadError (issue #22 — human upload errors)', () => {
+  it('maps a globbed-name failure to a human reason', () => {
+    expect(describeUploadError('ValidationError: No paths matched: /sources/x')).toMatch(
+      /characters the Drive CLI cannot handle/,
+    );
+  });
+
+  it('maps an over-255 filename to a length reason', () => {
+    expect(describeUploadError('Error: name too long')).toMatch(/255 characters/);
+    expect(describeUploadError('name exceeds maximum length')).toMatch(/255 characters/);
+  });
+
+  it('maps auth, quota and network failures', () => {
+    expect(describeUploadError('Error: no session found')).toMatch(/session expired/i);
+    expect(describeUploadError('storage is full')).toMatch(/storage is full/i);
+    expect(describeUploadError('ECONNRESET while uploading')).toMatch(/network/i);
+  });
+
+  it('falls back to the first line of an unknown error and is never empty', () => {
+    expect(describeUploadError('weird thing happened\nstack trace…')).toBe('weird thing happened');
+    expect(describeUploadError('')).toBe('upload failed');
+    expect(describeUploadError(null)).toBe('upload failed');
+  });
+});
+
+describe('escapeGlobPath (issue #22)', () => {
+  it('wraps a bracket in a literal char-class so glob matches the literal name', () => {
+    expect(escapeGlobPath('Movie [1080p].mkv')).toBe('Movie [[]1080p].mkv');
+  });
+
+  it('escapes each opening metacharacter * ? { individually', () => {
+    expect(escapeGlobPath('a*b')).toBe('a[*]b');
+    expect(escapeGlobPath('a?b')).toBe('a[?]b');
+    expect(escapeGlobPath('a{b,c}d')).toBe('a[{]b,c}d');
+  });
+
+  it('leaves a plain path and path separators untouched', () => {
+    expect(escapeGlobPath('/sources/folder/file.txt')).toBe('/sources/folder/file.txt');
+  });
+
+  it('escapes multiple metacharacters without double-escaping the introduced [', () => {
+    // `[` and `*` both present: each original metachar wrapped exactly once.
+    expect(escapeGlobPath('x[y]*z')).toBe('x[[]y][*]z');
+    // Two brackets → two independent char-classes, no runaway escaping.
+    expect(escapeGlobPath('[a][b]')).toBe('[[]a][[]b]');
+  });
+
+  it('is idempotent on separators and empty input', () => {
+    expect(escapeGlobPath('')).toBe('');
+    expect(escapeGlobPath('/')).toBe('/');
+  });
+});
+
+describe('buildUploadArgs (issue #22)', () => {
+  const opts = { fileStrategy: 'merge' as const, folderStrategy: 'merge' as const };
+
+  it('glob-escapes every local source path but NOT the Drive target', () => {
+    const args = buildUploadArgs(['/sources/Movie [1080p].mkv', '/sources/plain.txt'], '/Backups', opts);
+    expect(args).toContain('/sources/Movie [[]1080p].mkv'); // escaped source
+    expect(args).toContain('/sources/plain.txt'); // untouched plain source
+    expect(args).toContain('/my-files/Backups'); // normalised target, never escaped
+    expect(args.slice(0, 6)).toEqual(['filesystem', 'upload', '-f', 'merge', '-d', 'merge']);
+  });
+
+  it('adds -t only when skipThumbnails and -v only when verbose, with -v after the target', () => {
+    const plain = buildUploadArgs(['/sources/a.txt'], '/T', opts);
+    expect(plain).not.toContain('-t');
+    expect(plain).not.toContain('-v');
+
+    const full = buildUploadArgs(['/sources/a.txt'], '/T', { ...opts, skipThumbnails: true, verbose: true });
+    expect(full).toContain('-t');
+    // -v is the last arg (a global flag accepted after the positionals).
+    expect(full[full.length - 1]).toBe('-v');
+    expect(full.indexOf('-v')).toBeGreaterThan(full.indexOf('/my-files/T'));
   });
 });

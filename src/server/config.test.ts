@@ -1,11 +1,63 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import YAML from 'yaml';
-import { exportConfig, importConfig } from '@/server/config';
+import { exportConfig, importConfig, autoImportFromConfigDir } from '@/server/config';
 import { backupSets, getDb } from '@/server/db';
 import { resolveLocal, LOCAL_ROOT } from '@/server/local';
 
 beforeEach(() => {
   getDb().exec('DELETE FROM backup_sets');
+});
+
+// Regression guard for issue #19: the declarative /config volume is OPTIONAL and
+// read-only. A fresh/hardened container often has no /config at all — auto-import
+// must degrade to a no-op, never throw, so startup can't be aborted by its absence.
+// (The entrypoint no longer even creates /config; this proves the code tolerates that.)
+describe('autoImportFromConfigDir – tolerates a missing/empty CONFIG_DIR (issue #19)', () => {
+  const withConfigDir = (value: string | undefined, fn: () => void) => {
+    const saved = process.env.CONFIG_DIR;
+    try {
+      if (value === undefined) delete process.env.CONFIG_DIR;
+      else process.env.CONFIG_DIR = value;
+      fn();
+    } finally {
+      if (saved === undefined) delete process.env.CONFIG_DIR;
+      else process.env.CONFIG_DIR = saved;
+    }
+  };
+
+  it('does not throw and imports nothing when CONFIG_DIR does not exist', () => {
+    withConfigDir(path.join(os.tmpdir(), 'pdb-nonexistent-config-xyz'), () => {
+      expect(() => autoImportFromConfigDir()).not.toThrow();
+      expect(backupSets.all()).toHaveLength(0);
+    });
+  });
+
+  it('does not throw when CONFIG_DIR exists but has no backup-sets file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdb-empty-config-'));
+    withConfigDir(dir, () => {
+      expect(() => autoImportFromConfigDir()).not.toThrow();
+      expect(backupSets.all()).toHaveLength(0);
+    });
+  });
+
+  it('imports sets when a backup-sets.yaml IS present in CONFIG_DIR', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pdb-config-'));
+    const yaml = YAML.stringify({
+      version: 1,
+      backupSets: [
+        { name: 'FromConfig', sources: ['photos'], target: '/Backups', mode: 'backup', schedule: 'off' },
+      ],
+    });
+    fs.writeFileSync(path.join(dir, 'backup-sets.yaml'), yaml);
+    withConfigDir(dir, () => {
+      expect(() => autoImportFromConfigDir()).not.toThrow();
+      const names = backupSets.all().map((s) => s.name);
+      expect(names).toContain('FromConfig');
+    });
+  });
 });
 
 describe('exportConfig / importConfig round-trip', () => {
@@ -28,6 +80,7 @@ describe('exportConfig / importConfig round-trip', () => {
       scheduleDow: 3, // Wed
       excludes: ['*.tmp', 'node_modules'],
       skipThumbnails: true,
+      includeHidden: true,
       watch: false,
     });
 
@@ -69,6 +122,7 @@ describe('exportConfig / importConfig round-trip', () => {
     expect(gotWeekly.targetPath).toBe('/Backups');
     expect(gotWeekly.excludes).toEqual(['*.tmp', 'node_modules']);
     expect(gotWeekly.skipThumbnails).toBe(true);
+    expect(gotWeekly.includeHidden).toBe(true);
     expect(gotWeekly.watch).toBe(false);
 
     const gotHourly = all.find((s) => s.name === 'Documents')!;
@@ -79,6 +133,7 @@ describe('exportConfig / importConfig round-trip', () => {
     expect(gotHourly.targetPath).toBe('/');
     expect(gotHourly.excludes).toEqual([]);
     expect(gotHourly.skipThumbnails).toBe(false);
+    expect(gotHourly.includeHidden).toBe(false); // not set → default off, not emitted
     expect(gotHourly.watch).toBe(true);
     // hourly emits no time/dow -> import uses the defaults
     expect(gotHourly.scheduleHour).toBe(3);

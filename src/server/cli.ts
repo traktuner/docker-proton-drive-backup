@@ -20,13 +20,16 @@ export const CLI_PATH = process.env.PROTON_DRIVE_CLI || '/usr/local/bin/proton-d
 export const CACHE_DIR = process.env.PROTON_DRIVE_CACHE_DIR || '/data/proton';
 export const PROTON_ROOT = '/my-files';
 
-function cliEnv(): NodeJS.ProcessEnv {
+export function cliEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
     PROTON_DRIVE_UNSAFE_SECRETS: '1',
     PROTON_DRIVE_CACHE_DIR: CACHE_DIR,
     PROTON_DRIVE_LOG_LEVEL: process.env.PROTON_DRIVE_LOG_LEVEL || 'ERROR',
-    HOME: process.env.HOME || '/home/app',
+    // Fall back to the writable cache dir (not a nonexistent /home/app on a
+    // read-only root) if HOME is unset, so a stray dotfile write can't hit a
+    // read-only fs. The session lives in CACHE_DIR regardless of HOME.
+    HOME: process.env.HOME || CACHE_DIR,
   };
 }
 
@@ -534,6 +537,31 @@ export function cleanCliError(text: string | undefined | null): string {
   return 'The Drive operation failed.';
 }
 
+/**
+ * Turn a raw per-file UPLOAD error into a short, human reason for the run summary and
+ * status toast. Covers the #22-adjacent cases — a name the CLI globs (`No paths
+ * matched`, should be gone after glob-escaping but kept as a safety net) and a name
+ * over Proton Drive's 255-character limit (rejected server-side, since the CLI does
+ * not validate file-name length client-side) — and falls back to the raw error's
+ * first line so nothing is ever swallowed. Unlike cleanCliError this keeps a bit more
+ * detail because it describes a single file's failure inside a trusted (already
+ * authenticated) backup run, not an arbitrary client API response.
+ */
+export function describeUploadError(text: string | undefined | null): string {
+  const raw = (text || '').trim();
+  const t = raw.toLowerCase();
+  if (!t) return 'upload failed';
+  if (looksUnauthenticated(t)) return 'Proton session expired';
+  if (/no paths matched|glob/.test(t)) return 'the name has characters the Drive CLI cannot handle';
+  if (/too long|max(imum)?.{0,12}255|255.{0,12}char|name.{0,12}length|exceeds|name too/.test(t))
+    return 'name too long (Proton Drive allows at most 255 characters)';
+  if (/already exists|duplicate|conflict/.test(t)) return 'a conflicting item already exists on Drive';
+  if (/permission|forbidden|denied|unauthor/.test(t)) return 'permission denied by Drive';
+  if (/quota|storage.{0,12}full|insufficient.{0,12}space|out of space/.test(t)) return 'Drive storage is full';
+  if (/network|connection|econn|socket|dns|getaddrinfo|timed out|timeout/.test(t)) return 'network error talking to Proton';
+  return raw.split('\n')[0].slice(0, 120) || 'upload failed';
+}
+
 /* ------------------------------------------------------------------ */
 /* High-level operations                                               */
 /* ------------------------------------------------------------------ */
@@ -677,6 +705,46 @@ function parseUploadMetric(line: string): number | null {
   }
 }
 
+/**
+ * Escape glob metacharacters in a LOCAL path so the proton-drive CLI matches the
+ * literal file. The CLI treats any positional local path containing `* ? [ {` as a
+ * glob (its `LOCAL_PATH_LOOKS_GLOBBED = /[*?[{]/` → Node `fs/promises` glob()), so a
+ * real file named e.g. `Movie [1080p].mkv` is read as a character class, matches
+ * nothing, and the whole `filesystem upload` invocation aborts with
+ * `No paths matched: …` BEFORE any byte transfers — taking every other file in the
+ * same call down with it (issue #22). Wrapping each opening metachar in a literal
+ * char-class (`[` → `[[]`, `*` → `[*]`, `?` → `[?]`, `{` → `[{]`) forces glob() to
+ * match the literal path. One regex pass, so the `[` we introduce is never re-hit.
+ * Path separators and the closing `]`/`}` are left untouched (glob only specials the
+ * openers). A path with no metacharacters is returned byte-for-byte unchanged.
+ */
+export function escapeGlobPath(p: string): string {
+  return p.replace(/[*?[{]/g, (c) => `[${c}]`);
+}
+
+/**
+ * Build the argv for `filesystem upload`. Pure and exported so the argument
+ * assembly — including the glob-escaping of every LOCAL source path — is unit
+ * testable without spawning the binary. The Drive TARGET is not a local path and is
+ * never escaped (it is normalised instead).
+ */
+export function buildUploadArgs(
+  localPaths: string[],
+  targetPath: string,
+  opts: {
+    fileStrategy: FileStrategy;
+    folderStrategy: FileStrategy;
+    skipThumbnails?: boolean;
+    verbose?: boolean;
+  },
+): string[] {
+  const args = ['filesystem', 'upload', '-f', opts.fileStrategy, '-d', opts.folderStrategy];
+  if (opts.skipThumbnails) args.push('-t');
+  args.push(...localPaths.map(escapeGlobPath), normalizeProtonPath(targetPath));
+  if (opts.verbose) args.push('-v'); // emit per-file [metric] upload lines
+  return args;
+}
+
 export async function upload(
   localPaths: string[],
   targetPath: string,
@@ -688,10 +756,12 @@ export async function upload(
   /** Skip generating Drive thumbnails (CLI `-t`). Faster, no previews on Drive. */
   skipThumbnails = false,
 ): Promise<RunResult> {
-  const args = ['filesystem', 'upload', '-f', fileStrategy, '-d', folderStrategy];
-  if (skipThumbnails) args.push('-t');
-  args.push(...localPaths, normalizeProtonPath(targetPath));
-  if (onUploadedFile) args.push('-v'); // emit per-file [metric] upload lines
+  const args = buildUploadArgs(localPaths, targetPath, {
+    fileStrategy,
+    folderStrategy,
+    skipThumbnails,
+    verbose: !!onUploadedFile,
+  });
   // Concurrency is managed by the engine's worker pool (and one backup set runs
   // at a time via the runner). No timeout - large files can upload for hours.
   // retryOnLock: a SQLITE_BUSY only hits during the CLI's startup cache init

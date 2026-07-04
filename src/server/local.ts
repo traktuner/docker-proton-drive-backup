@@ -59,6 +59,24 @@ export interface WalkedFile {
   mtimeMs: number;
 }
 
+export interface WalkOptions {
+  /** Include hidden dotfiles/dotfolders (default: skip them, as the browser does). */
+  includeHidden?: boolean;
+  /**
+   * Called for an entry the walk had to skip because it could not be READ — a
+   * permission/IO error on a file's stat or a folder's readdir. NOT called for
+   * intentionally-skipped dotfiles. Lets the engine surface unreadable files as
+   * failures instead of losing them silently (and, in mirror mode, this keeps the
+   * deletion pass from mistaking an unreadable-but-present file for "gone").
+   */
+  onSkip?: (rel: string, reason: string) => void;
+}
+
+/** The errno code of a filesystem error (EACCES/EPERM/EIO…), for a readable reason. */
+function skipReason(e: unknown): string {
+  return (e as NodeJS.ErrnoException)?.code || 'unreadable';
+}
+
 /**
  * Streaming walk of all files under an absolute source path: yields one file at
  * a time instead of building the full array. Each file's `rel` is `relBase` plus
@@ -66,19 +84,24 @@ export interface WalkedFile {
  * caller controls `relBase` (e.g. "<set-folder>/<source-rel-to-LOCAL_ROOT>") so
  * the destination structure is preserved and same-named folders never collide;
  * it defaults to the source basename for backward compatibility. Hidden dotfiles
- * are skipped (consistent with the browser). This is what keeps the catalog
- * engine's memory bounded — a 4-million-file source never materialises as a
+ * are skipped unless `opts.includeHidden` is set; unreadable entries are reported
+ * via `opts.onSkip` instead of being dropped silently. This is what keeps the
+ * catalog engine's memory bounded — a 4-million-file source never materialises as a
  * 4-million-element array/Map. Directories are not yielded; the engine derives
  * needed parent folders from each file's rel path.
  */
 export async function* walkSourceStream(
   absPath: string,
   relBase: string = path.basename(absPath),
+  opts: WalkOptions = {},
 ): AsyncGenerator<WalkedFile> {
+  const { includeHidden = false, onSkip } = opts;
   let st;
   try {
     st = await fs.stat(absPath);
   } catch {
+    // The SOURCE ROOT itself is missing/unreadable — handled at a higher level
+    // (missing-source mirror gate / runner checks), so stay silent here.
     return;
   }
   if (st.isFile()) {
@@ -91,11 +114,12 @@ export async function* walkSourceStream(
     let ents;
     try {
       ents = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
+    } catch (e) {
+      onSkip?.(relPrefix, `folder not readable (${skipReason(e)})`);
       return;
     }
     for (const e of ents) {
-      if (e.name.startsWith('.')) continue;
+      if (!includeHidden && e.name.startsWith('.')) continue;
       const childAbs = path.join(dir, e.name);
       const childRel = `${relPrefix}/${e.name}`;
       if (e.isDirectory()) {
@@ -104,8 +128,9 @@ export async function* walkSourceStream(
         let s;
         try {
           s = await fs.stat(childAbs);
-        } catch {
-          continue; // unreadable file - skip
+        } catch (err) {
+          onSkip?.(childRel, `not readable (${skipReason(err)})`); // surface, don't drop silently
+          continue;
         }
         yield { abs: childAbs, rel: childRel, size: s.size, mtimeMs: s.mtimeMs };
       }

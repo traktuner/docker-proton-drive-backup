@@ -11,6 +11,7 @@ import {
   listDrive,
   normalizeProtonPath,
   looksUnauthenticated,
+  describeUploadError,
   type FileStrategy,
   type RunResult,
 } from './cli';
@@ -23,6 +24,10 @@ const SESSION_EXPIRED_MSG =
  *  deletion pass and flags it, rather than trashing a huge swath in one go. Shared
  *  by the live run and the read-only preview so both agree on what's "too much". */
 const DELETE_SAFETY_PCT = 0.3;
+
+/** Base backoff between the transient upload retries (exponential: base, 2×, 4×).
+ *  Overridable via env so the test suite doesn't wait out real seconds. */
+const RETRY_BASE_MS = Number(process.env.PDB_UPLOAD_RETRY_BASE_MS) || 5000;
 
 /**
  * Delta backup engine.
@@ -39,6 +44,13 @@ const DELETE_SAFETY_PCT = 0.3;
  *    (scoped to the source subtrees, so unrelated Drive content is never touched).
  */
 
+export interface SkippedFile {
+  /** Catalog-style rel path ("<subfolder>/…") of the file that was skipped. */
+  rel: string;
+  /** Human reason (e.g. "name too long…", "not readable (EACCES)"). */
+  reason: string;
+}
+
 export interface DeltaResult {
   ok: boolean;
   cancelled: boolean;
@@ -47,8 +59,14 @@ export interface DeltaResult {
   unchangedCount: number;
   deletedCount: number;
   failedCount: number;
+  /** A bounded sample of the files skipped this run (rel + reason), for the UI panel.
+   *  `failedCount` is the true total; this list is capped at FAILED_SAMPLE_CAP. */
+  failedFiles: SkippedFile[];
   message: string;
 }
+
+/** How many skipped files we keep the details of (bounded memory; count is exact). */
+const FAILED_SAMPLE_CAP = 100;
 
 /** Minimal glob → RegExp ( * within a segment, ** across, ? one char ). */
 function globToRegExp(glob: string): RegExp {
@@ -132,6 +150,7 @@ export async function uploadSourceTrees(
   onUploadedFile?: (bytes: number) => void,
   shouldCancel: () => boolean = () => false,
   skipThumbnails = false,
+  includeHidden = false,
 ): Promise<RunResult> {
   // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
   const ensured = new Set<string>();
@@ -195,7 +214,9 @@ export async function uploadSourceTrees(
     } catch {
       continue;
     }
-    const children = ents.filter((e) => !e.name.startsWith('.')).map((e) => path.join(s.abs, e.name));
+    const children = ents
+      .filter((e) => includeHidden || !e.name.startsWith('.'))
+      .map((e) => path.join(s.abs, e.name));
     if (!(await run(children, `${target}/${s.relBase}`))) return last;
   }
 
@@ -227,9 +248,9 @@ export async function runCatalogDelta(
   log: (msg: string) => void = () => {},
   onProgress: (p: EngineProgress) => void = () => {},
   shouldCancel: () => boolean = () => false,
-  opts: { skipThumbnails?: boolean } = {},
+  opts: { skipThumbnails?: boolean; includeHidden?: boolean } = {},
 ): Promise<DeltaResult> {
-  const { skipThumbnails = false } = opts;
+  const { skipThumbnails = false, includeHidden = false } = opts;
   const target = normalizeProtonPath(targetPath);
   // Each source is laid out at "<target>/<subfolder>/<source rel to LOCAL_ROOT>",
   // so same-named folders from different paths never collide and the structure is
@@ -263,6 +284,17 @@ export async function runCatalogDelta(
   let changedCount = 0;
   let unchangedCount = 0;
   let failedCount = 0;
+  // A bounded sample of skipped files (rel + human reason): one is named in the run
+  // summary, and the whole list is persisted for the UI's "Skipped files" panel.
+  const failedFiles: SkippedFile[] = [];
+  // Surface an unreadable file/folder as a failure instead of dropping it silently.
+  // In mirror mode this also trips the failedCount>0 deletion gate, so an
+  // unreadable-but-present file can never be mistaken for "gone" and trashed.
+  const noteUnreadable = (rel: string, reason: string) => {
+    failedCount += 1;
+    if (failedFiles.length < FAILED_SAMPLE_CAP) failedFiles.push({ rel, reason });
+    log(`  skipped: ${rel} — ${reason}`);
+  };
   let deletedCount = 0;
   let doneFiles = 0;
   let doneBytes = 0;
@@ -284,6 +316,7 @@ export async function runCatalogDelta(
     unchangedCount,
     deletedCount: 0,
     failedCount,
+    failedFiles,
     message: `Cancelled - ${doneFiles} uploaded`,
   });
 
@@ -317,6 +350,7 @@ export async function runCatalogDelta(
       },
       shouldCancel,
       skipThumbnails,
+      includeHidden,
     );
     if (shouldCancel()) return cancelledResult();
     if (res.code !== 0) {
@@ -329,9 +363,10 @@ export async function runCatalogDelta(
         unchangedCount: 0,
         deletedCount: 0,
         failedCount: 1,
+        failedFiles,
         message: authDead
           ? SESSION_EXPIRED_MSG
-          : (res.stderr || res.stdout).trim().slice(0, 500) || `CLI exited with code ${res.code}`,
+          : `Initial upload failed — ${describeUploadError(res.stderr || res.stdout)}`,
       };
     }
 
@@ -361,7 +396,7 @@ export async function runCatalogDelta(
       buf = [];
     };
     for (const s of sources) {
-      for await (const f of walkSourceStream(s.abs, s.relBase)) {
+      for await (const f of walkSourceStream(s.abs, s.relBase, { includeHidden, onSkip: noteUnreadable })) {
         if (shouldCancel()) return cancelledResult();
         buf.push(f);
         if (buf.length >= 1000) {
@@ -372,14 +407,19 @@ export async function runCatalogDelta(
     }
     if (buf.length) flushSeed();
     return {
-      ok: true,
+      ok: failedCount === 0,
       cancelled: false,
       newCount: seeded,
       changedCount: 0,
       unchangedCount: 0,
       deletedCount: 0,
-      failedCount: 0,
-      message: `${seeded} uploaded`,
+      failedCount,
+      failedFiles,
+      message:
+        failedCount === 0
+          ? `${seeded} uploaded`
+          : `${seeded} uploaded, ${failedCount} skipped` +
+            (failedFiles[0] ? ` (e.g. “${path.basename(failedFiles[0].rel)}” — ${failedFiles[0].reason})` : ''),
     };
   }
 
@@ -413,42 +453,92 @@ export async function runCatalogDelta(
     inflight.add(p);
   };
 
-  // Upload one batch (single parent) with retry, then record it in the catalog.
+  // Upload one (sub)batch ONCE. With `retry`, applies the 4× transient-retry loop
+  // (exponential backoff); without it, a single attempt. Returns whether it
+  // succeeded, the last error, and whether the failure was an auth/expired-session
+  // one — a dead session won't recover by retrying, so one expired token can't turn
+  // into a multi-hour zombie run holding the global run mutex.
+  const uploadBatchOnce = async (
+    parentDrive: string,
+    absList: string[],
+    retry: boolean,
+  ): Promise<{ ok: boolean; err: string; auth: boolean }> => {
+    const maxAttempts = retry ? 4 : 1;
+    let lastErr = '';
+    for (let attempt = 1; attempt <= maxAttempts && !shouldCancel() && !sessionDead; attempt++) {
+      const res = await upload(absList, parentDrive, 'merge', 'merge', undefined, skipThumbnails);
+      if (res.code === 0) return { ok: true, err: '', auth: false };
+      lastErr = (res.stderr || res.stdout).trim().slice(0, 200);
+      if (looksUnauthenticated(res.stderr + res.stdout)) return { ok: false, err: lastErr, auth: true };
+      if (attempt < maxAttempts) {
+        const waitMs = RETRY_BASE_MS * 2 ** (attempt - 1);
+        log(`  batch failed (try ${attempt}/${maxAttempts}), retrying in ${waitMs / 1000}s: ${lastErr}`);
+        // Sleep in ≤500ms steps so a cancel is honoured promptly, but never longer
+        // than the wait itself (keeps the failure-path tests near-instant).
+        const step = Math.min(500, waitMs);
+        for (let w = 0; w < waitMs && !shouldCancel() && !sessionDead; w += step) await new Promise((r) => setTimeout(r, step));
+      }
+    }
+    return { ok: false, err: lastErr, auth: false };
+  };
+
+  const recordUploaded = (files: { f: WalkedFile; sha1: string | null }[]) => {
+    catalog.batch(() => {
+      for (const { f, sha1 } of files) catalog.upsertFile(setId, f.rel, f.size, f.mtimeMs, sha1, seenAt);
+    });
+    doneFiles += files.length;
+    doneBytes += files.reduce((s, x) => s + x.f.size, 0);
+  };
+
+  // Upload a batch and ISOLATE failures: if the whole batch fails (after its
+  // transient retries), split it in half and retry each half with a single attempt,
+  // recursing down to a single file. Good files still sync; only the truly-bad
+  // file(s) are counted as failed and logged BY PATH. This bounds the blast radius
+  // of one unuploadable file (issue #22: a name the CLI can't handle, a corrupt or
+  // over-limit file) to itself instead of its ≤199 batch-mates. Crucially it still
+  // increments failedCount for a real failure, so the mirror deletion pass's
+  // `failedCount > 0` safety gate keeps skipping deletion (never trash a present-
+  // but-failed file's Drive copy).
+  const flushChunk = async (
+    parentDrive: string,
+    files: { f: WalkedFile; sha1: string | null }[],
+    retry: boolean,
+  ): Promise<void> => {
+    if (shouldCancel() || sessionDead || files.length === 0) return;
+    const r = await uploadBatchOnce(
+      parentDrive,
+      files.map((x) => x.f.abs),
+      retry,
+    );
+    if (r.auth) {
+      sessionDead = true;
+      log('Proton session expired — stopping this run. Reconnect to resume.');
+      return;
+    }
+    if (r.ok) {
+      recordUploaded(files);
+      return;
+    }
+    if (shouldCancel() || sessionDead) return;
+    if (files.length === 1) {
+      failedCount += 1;
+      const reason = describeUploadError(r.err);
+      if (failedFiles.length < FAILED_SAMPLE_CAP) failedFiles.push({ rel: files[0].f.rel, reason });
+      log(`  upload failed (skipping this file): ${files[0].f.rel} — ${reason}`);
+      return;
+    }
+    // Bisect. Transients were already retried at the top level, so the sub-batches
+    // use a single attempt each — one poison file can't amplify into 4× per level.
+    const mid = Math.floor(files.length / 2);
+    await flushChunk(parentDrive, files.slice(0, mid), false);
+    await flushChunk(parentDrive, files.slice(mid), false);
+  };
+
+  // Upload one batch (single parent), isolating any bad file, then record it.
   const flush = async (parentDrive: string, files: { f: WalkedFile; sha1: string | null }[]): Promise<void> => {
     if (shouldCancel() || sessionDead || files.length === 0) return;
     report(parentDrive.replace('/my-files', '') || '/');
-    let ok = false;
-    let lastErr = '';
-    for (let attempt = 1; attempt <= 4 && !shouldCancel() && !sessionDead; attempt++) {
-      const res = await upload(files.map((x) => x.f.abs), parentDrive, 'merge', 'merge', undefined, skipThumbnails);
-      if (res.code === 0) {
-        ok = true;
-        break;
-      }
-      lastErr = (res.stderr || res.stdout).trim().slice(0, 200);
-      // A dead session won't recover by retrying — stop now so one expired token
-      // can't turn into a multi-hour zombie run holding the global run mutex.
-      if (looksUnauthenticated(res.stderr + res.stdout)) {
-        sessionDead = true;
-        log('Proton session expired — stopping this run. Reconnect to resume.');
-        return;
-      }
-      if (attempt < 4) {
-        const waitMs = 5000 * 2 ** (attempt - 1);
-        log(`  batch failed (try ${attempt}/4), retrying in ${waitMs / 1000}s: ${lastErr}`);
-        for (let w = 0; w < waitMs && !shouldCancel() && !sessionDead; w += 500) await new Promise((r) => setTimeout(r, 500));
-      }
-    }
-    if (ok) {
-      catalog.batch(() => {
-        for (const { f, sha1 } of files) catalog.upsertFile(setId, f.rel, f.size, f.mtimeMs, sha1, seenAt);
-      });
-      doneFiles += files.length;
-      doneBytes += files.reduce((s, x) => s + x.f.size, 0);
-    } else if (!shouldCancel() && !sessionDead) {
-      failedCount += files.length;
-      log(`  upload failed after 4 tries: ${lastErr}`);
-    }
+    await flushChunk(parentDrive, files, true);
     report(parentDrive.replace('/my-files', '') || '/');
   };
 
@@ -495,7 +585,7 @@ export async function runCatalogDelta(
 
   log('Comparing against catalog…');
   for (const s of sources) {
-    for await (const file of walkSourceStream(s.abs, s.relBase)) {
+    for await (const file of walkSourceStream(s.abs, s.relBase, { includeHidden, onSkip: noteUnreadable })) {
       if (shouldCancel()) {
         cancelled = true;
         break;
@@ -580,6 +670,7 @@ export async function runCatalogDelta(
       unchangedCount,
       deletedCount: 0,
       failedCount,
+      failedFiles,
       message: SESSION_EXPIRED_MSG,
     };
   }
@@ -661,6 +752,7 @@ export async function runCatalogDelta(
       unchangedCount,
       deletedCount,
       failedCount,
+      failedFiles,
       message: SESSION_EXPIRED_MSG,
     };
   }
@@ -668,7 +760,11 @@ export async function runCatalogDelta(
   const parts = [`${doneFiles} uploaded`, `${unchangedCount} unchanged`];
   if (mode === 'mirror' && !cancelled && !deletionSkipped) parts.push(`${deletedCount} removed`);
   if (deletionSkipped) parts.push(`deletion skipped for safety (${deletionSkipped})`);
-  if (failedCount) parts.push(`${failedCount} failed`);
+  if (failedCount) {
+    // Name one failed file + its reason so the summary is actionable, not just a count.
+    const ex = failedFiles[0];
+    parts.push(ex ? `${failedCount} failed (e.g. “${path.basename(ex.rel)}” — ${ex.reason})` : `${failedCount} failed`);
+  }
   return {
     ok: failedCount === 0 && !cancelled && !deletionSkipped,
     cancelled,
@@ -677,6 +773,7 @@ export async function runCatalogDelta(
     unchangedCount,
     deletedCount,
     failedCount,
+    failedFiles,
     message: cancelled ? `Cancelled - ${parts.join(', ')}` : parts.join(', '),
   };
 }
@@ -715,6 +812,7 @@ export async function previewDelta(
   mode: 'backup' | 'mirror',
   excludes: string[] = [],
   shouldCancel: () => boolean = () => false,
+  includeHidden = false,
 ): Promise<PreviewResult> {
   const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
   const managedRoots = new Set([subfolder]);
@@ -729,7 +827,7 @@ export async function previewDelta(
 
   // Same diff the real run does, but it only counts — no upload, no catalog write.
   for (const s of sources) {
-    for await (const file of walkSourceStream(s.abs, s.relBase)) {
+    for await (const file of walkSourceStream(s.abs, s.relBase, { includeHidden })) {
       if (shouldCancel()) break;
       if (isExcluded(file.rel)) continue;
       const cat = catalog.getFile(setId, file.rel);

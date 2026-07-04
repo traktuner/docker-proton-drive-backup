@@ -274,4 +274,42 @@ describe('walkSourceStream', () => {
     const files = await collect(walkSourceStream(base));
     expect(files).toEqual([]);
   });
+
+  it('includeHidden: also yields dotfiles and files under dot-directories', async () => {
+    const base = await makeTree('walk-hidden');
+    const rels = (await collect(walkSourceStream(base, 'walk-hidden', { includeHidden: true })))
+      .map((f) => f.rel)
+      .sort();
+    expect(rels).toEqual([
+      'walk-hidden/.dotfile',
+      'walk-hidden/.hiddenDir/nope.txt',
+      'walk-hidden/a.txt',
+      'walk-hidden/b.txt',
+      'walk-hidden/sub/c.txt',
+    ]);
+  });
+
+  it('onSkip: reports an unreadable folder instead of dropping it silently', async () => {
+    // stat/read perms don't apply to root, so skip there (CI often runs as root).
+    if (process.getuid?.() === 0) return;
+    const base = path.join(ROOT, 'walk-locked');
+    const locked = path.join(base, 'locked');
+    await fs.mkdir(locked, { recursive: true });
+    await fs.writeFile(path.join(base, 'ok.txt'), 'ok');
+    await fs.writeFile(path.join(locked, 'secret.txt'), 's');
+    await fs.chmod(locked, 0o000); // remove read+exec so readdir(locked) fails
+
+    const skips: { rel: string; reason: string }[] = [];
+    let files: WalkedFile[] = [];
+    try {
+      files = await collect(walkSourceStream(base, 'walk-locked', { onSkip: (rel, reason) => skips.push({ rel, reason }) }));
+    } finally {
+      await fs.chmod(locked, 0o755); // restore so the test dir can be cleaned up
+    }
+
+    // The readable file still comes through; the locked folder is surfaced, not lost.
+    expect(files.map((f) => f.rel)).toContain('walk-locked/ok.txt');
+    expect(skips.some((s) => s.rel.includes('locked'))).toBe(true);
+    expect(skips.find((s) => s.rel.includes('locked'))!.reason).toMatch(/folder not readable/);
+  });
 });

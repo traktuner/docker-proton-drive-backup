@@ -70,6 +70,9 @@ export async function POST(req: Request) {
     scheduleMinute: clampInt((body as any).scheduleMinute, 0, 59, 0),
     scheduleDow: clampInt((body as any).scheduleDow, 0, 6, 1),
     excludes: excludesOf((body as any).excludes),
+    // Honour the create-form toggles (previously only settable via edit).
+    skipThumbnails: (body as any).skipThumbnails === true,
+    includeHidden: (body as any).includeHidden === true,
   });
   return Response.json({ backupSet: created }, { status: 201 });
 }

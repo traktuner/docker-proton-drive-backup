@@ -32,6 +32,8 @@ export interface BackupSet {
   excludes: string[]; // glob patterns to skip (backup/mirror modes)
   /** Skip generating Drive thumbnails for uploaded files (CLI `-t`). Faster, no previews. */
   skipThumbnails: boolean;
+  /** Include hidden dotfiles/dotfolders in the backup (default off — they're skipped). */
+  includeHidden: boolean;
   /** Auto-run on local file changes (debounced) instead of only on schedule. */
   watch: boolean;
   lastRunAt: number | null;
@@ -54,6 +56,7 @@ interface Row {
   excludes: string | null;
   ping_url: string | null;
   skip_thumbnails: number | null;
+  include_hidden: number | null;
   watch: number | null;
   last_run_at: number | null;
   last_status: BackupSet['lastStatus'];
@@ -120,6 +123,7 @@ function ensureColumns(db: Database.Database) {
   add('ping_url', 'ping_url TEXT');
   add('target_subfolder', 'target_subfolder TEXT');
   add('skip_thumbnails', 'skip_thumbnails INTEGER NOT NULL DEFAULT 0');
+  add('include_hidden', 'include_hidden INTEGER NOT NULL DEFAULT 0');
   add('watch', 'watch INTEGER NOT NULL DEFAULT 0');
 }
 
@@ -138,6 +142,7 @@ function rowToSet(r: Row): BackupSet {
     scheduleDow: r.schedule_dow ?? 1,
     excludes: JSON.parse(r.excludes || '[]'),
     skipThumbnails: !!r.skip_thumbnails,
+    includeHidden: !!r.include_hidden,
     watch: !!r.watch,
     lastRunAt: r.last_run_at,
     lastStatus: r.last_status,
@@ -159,6 +164,7 @@ export interface CreateBackupSet {
   scheduleDow?: number;
   excludes?: string[];
   skipThumbnails?: boolean;
+  includeHidden?: boolean;
   watch?: boolean;
 }
 
@@ -202,8 +208,8 @@ export const backupSets = {
     getDb()
       .prepare(
         `INSERT INTO backup_sets
-           (id, name, source_paths, target_path, target_subfolder, mode, schedule, schedule_hour, schedule_minute, schedule_dow, excludes, skip_thumbnails, watch, last_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'never', ?)`,
+           (id, name, source_paths, target_path, target_subfolder, mode, schedule, schedule_hour, schedule_minute, schedule_dow, excludes, skip_thumbnails, include_hidden, watch, last_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'never', ?)`,
       )
       .run(
         id,
@@ -218,6 +224,7 @@ export const backupSets = {
         input.scheduleDow ?? 1,
         JSON.stringify(input.excludes ?? []),
         input.skipThumbnails ? 1 : 0,
+        input.includeHidden ? 1 : 0,
         input.watch ? 1 : 0,
         Date.now(),
       );
@@ -238,6 +245,7 @@ export const backupSets = {
       scheduleDow: patch.scheduleDow ?? cur.scheduleDow,
       excludes: patch.excludes ?? cur.excludes,
       skipThumbnails: patch.skipThumbnails ?? cur.skipThumbnails,
+      includeHidden: patch.includeHidden ?? cur.includeHidden,
       watch: patch.watch ?? cur.watch,
     };
     getDb()
@@ -245,7 +253,7 @@ export const backupSets = {
         `UPDATE backup_sets SET
            name = ?, source_paths = ?, target_path = ?, mode = ?,
            schedule = ?, schedule_hour = ?, schedule_minute = ?, schedule_dow = ?, excludes = ?,
-           skip_thumbnails = ?, watch = ?
+           skip_thumbnails = ?, include_hidden = ?, watch = ?
          WHERE id = ?`,
       )
       .run(
@@ -259,6 +267,7 @@ export const backupSets = {
         next.scheduleDow,
         JSON.stringify(next.excludes),
         next.skipThumbnails ? 1 : 0,
+        next.includeHidden ? 1 : 0,
         next.watch ? 1 : 0,
         id,
       );

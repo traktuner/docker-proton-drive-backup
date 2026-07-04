@@ -23,9 +23,20 @@ function db(): ReturnType<typeof getDb> {
       );
       CREATE INDEX IF NOT EXISTS idx_runs_set ON backup_runs (set_id, started_at DESC);
     `);
+    // Additive migration for existing DBs: the per-run list of skipped files
+    // (JSON). Nullable so old rows read back as an empty list.
+    const cols = new Set(
+      (d.prepare('PRAGMA table_info(backup_runs)').all() as { name: string }[]).map((c) => c.name),
+    );
+    if (!cols.has('skipped')) d.exec('ALTER TABLE backup_runs ADD COLUMN skipped TEXT');
     ensured = true;
   }
   return d;
+}
+
+export interface SkippedFile {
+  rel: string;
+  reason: string;
 }
 
 export interface RunRow {
@@ -36,15 +47,27 @@ export interface RunRow {
   message: string | null;
   files: number;
   bytes: number;
+  /** Files skipped this run (name unsupported / unreadable). A bounded sample. */
+  skipped: SkippedFile[];
+}
+
+function parseSkipped(raw: string | null): SkippedFile[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? (v as SkippedFile[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 export const runs = {
   record(setId: string, r: Omit<RunRow, 'id'>): void {
     const d = db();
     d.prepare(
-      `INSERT INTO backup_runs (set_id, started_at, finished_at, status, message, files, bytes)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(setId, r.startedAt, r.finishedAt, r.status, r.message, r.files, r.bytes);
+      `INSERT INTO backup_runs (set_id, started_at, finished_at, status, message, files, bytes, skipped)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(setId, r.startedAt, r.finishedAt, r.status, r.message, r.files, r.bytes, JSON.stringify(r.skipped ?? []));
     d.prepare(
       `DELETE FROM backup_runs WHERE set_id = ? AND id NOT IN (
          SELECT id FROM backup_runs WHERE set_id = ? ORDER BY started_at DESC LIMIT 50)`,
@@ -52,12 +75,13 @@ export const runs = {
   },
 
   recent(setId: string, limit = 8): RunRow[] {
-    return db()
+    const rows = db()
       .prepare(
-        `SELECT id, started_at AS startedAt, finished_at AS finishedAt, status, message, files, bytes
+        `SELECT id, started_at AS startedAt, finished_at AS finishedAt, status, message, files, bytes, skipped
          FROM backup_runs WHERE set_id = ? ORDER BY started_at DESC LIMIT ?`,
       )
-      .all(setId, limit) as RunRow[];
+      .all(setId, limit) as (Omit<RunRow, 'skipped'> & { skipped: string | null })[];
+    return rows.map((r) => ({ ...r, skipped: parseSkipped(r.skipped) }));
   },
 
   lastSuccessAt(setId: string): number | null {

@@ -7,8 +7,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "node .next/standalone/server.js",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:smoke": "test/deployment/smoke.sh"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

@@ -58,10 +58,12 @@ ENV APP_VERSION=$APP_VERSION
 ARG IMAGE_TAG=dev
 ENV IMAGE_TAG=$IMAGE_TAG
 
-# libsecret is linked by the CLI but never used (we force the file-based
-# secret store); ca-certificates for TLS, wget for the healthcheck.
+# libsecret is linked by the CLI but never used (we force the file-based secret
+# store); ca-certificates for TLS; wget for the healthcheck; util-linux for
+# `setpriv` (PUID/PGID drop — issue #20); iproute2 for `tc`/`ip` (opt-in upload
+# speed limit — issue #23, only active with cap_add: NET_ADMIN).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libsecret-1-0 wget \
+    ca-certificates libsecret-1-0 wget util-linux iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Next.js standalone server + static assets
@@ -78,6 +80,11 @@ COPY --from=cli /usr/local/bin/proton-drive /usr/local/bin/proton-drive
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
+# HOME is pinned to the writable, persistent /data volume (NOT the nonexistent
+# /home/app): so a read-only root filesystem AND a non-root `user:` both work — any
+# stray dotfile the CLI/deps write stays off the read-only root. The Proton session
+# lives in PROTON_DRIVE_CACHE_DIR (same dir), so this only relocates incidental
+# HOME writes; it is not the session store.
 ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
@@ -87,7 +94,8 @@ ENV NODE_ENV=production \
     PROTON_DRIVE_CACHE_DIR=/data/proton \
     PROTON_DRIVE_UNSAFE_SECRETS=1 \
     PROTON_DRIVE_LOG_LEVEL=ERROR \
-    CONFIG_DIR=/config
+    CONFIG_DIR=/config \
+    HOME=/data/proton
 
 # Only /data is a managed volume. /sources is always supplied by the operator as
 # (read-only) bind mounts; declaring it VOLUME would spawn a stray writable

@@ -29,7 +29,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   }
   g.__pdPreviewing = true;
   try {
-    const res = await previewDelta(id, set.sourcePaths, set.targetSubfolder, set.mode, set.excludes);
+    const res = await previewDelta(id, set.sourcePaths, set.targetSubfolder, set.mode, set.excludes, undefined, set.includeHidden);
     return Response.json(res);
   } finally {
     g.__pdPreviewing = false;

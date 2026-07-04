@@ -84,6 +84,7 @@ export default function FilesPage() {
   const [excludes, setExcludes] = useState('');
   const [subfolder, setSubfolder] = useState(''); // optional Drive folder override (else derived from name)
   const [skipThumbnails, setSkipThumbnails] = useState(false);
+  const [includeHidden, setIncludeHidden] = useState(false);
   const [creating, setCreating] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
   const [estimate, setEstimate] = useState<Estimate>({ bytes: 0, files: 0, folders: 0, counting: false });
@@ -359,6 +360,7 @@ export default function FilesPage() {
           scheduleDow: dow,
           excludes: allExcludes,
           skipThumbnails,
+          includeHidden,
           // Optional Drive folder override; the server sanitises + de-dupes per target.
           targetFolder: subfolder.trim() || undefined,
         }),
@@ -676,6 +678,15 @@ export default function FilesPage() {
                 className="accent-[color:var(--accent)]"
               />
               Skip thumbnails on Drive (faster uploads, no previews)
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 pl-[2px] text-xs text-[color:var(--muted)]">
+              <input
+                type="checkbox"
+                checked={includeHidden}
+                onChange={(e) => setIncludeHidden(e.target.checked)}
+                className="accent-[color:var(--accent)]"
+              />
+              Include hidden files (dotfiles like .env, .config)
             </label>
             <button onClick={createSet} disabled={creating} className="pbtn pbtn--solid w-full px-4 py-2.5 text-sm">
               {creating ? 'Creating…' : 'Create backup set'}

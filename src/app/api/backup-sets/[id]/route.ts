@@ -52,6 +52,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
   if (body.scheduleMinute != null) patch.scheduleMinute = Math.min(59, Math.max(0, +body.scheduleMinute || 0));
   if (body.scheduleDow != null) patch.scheduleDow = Math.min(6, Math.max(0, +body.scheduleDow || 0));
   if (typeof body.skipThumbnails === 'boolean') patch.skipThumbnails = body.skipThumbnails;
+  if (typeof body.includeHidden === 'boolean') patch.includeHidden = body.includeHidden;
   if (typeof body.watch === 'boolean') patch.watch = body.watch;
   if (Array.isArray(body.excludes)) {
     patch.excludes = (body.excludes as unknown[]).map((s) => String(s).trim()).filter(Boolean);

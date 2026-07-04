@@ -15,10 +15,38 @@ describe('backupSets store', () => {
     expect(s.mode).toBe('add');
     expect(s.schedule).toBe('off');
     expect(s.skipThumbnails).toBe(false);
+    expect(s.includeHidden).toBe(false);
     expect(s.watch).toBe(false);
     expect(s.targetSubfolder).toBe('Photos');
     expect(s.lastStatus).toBe('never');
     expect(backupSets.get(s.id)?.name).toBe('Photos');
+  });
+
+  it('persists includeHidden through create + update', () => {
+    const s = backupSets.create({ name: 'Hid', sourcePaths: ['/x'], targetPath: '/', includeHidden: true });
+    expect(s.includeHidden).toBe(true);
+    backupSets.update(s.id, { includeHidden: false });
+    expect(backupSets.get(s.id)!.includeHidden).toBe(false);
+  });
+
+  // Regression: an existing user's row predates the include_hidden column. The
+  // NOT NULL DEFAULT 0 migration must let it read back unchanged (hidden off), so
+  // existing backups behave EXACTLY as before — nothing suddenly starts/stops.
+  it('a legacy row written without the new columns reads includeHidden=false (migration-safe)', () => {
+    getDb()
+      .prepare(
+        `INSERT INTO backup_sets (id, name, source_paths, target_path, mode, schedule, last_status, created_at)
+         VALUES ('legacy1', 'Legacy', '["/sources/x"]', '/', 'backup', 'daily', 'success', 1)`,
+      )
+      .run();
+    const s = backupSets.get('legacy1')!;
+    expect(s).toBeDefined();
+    expect(s.name).toBe('Legacy');
+    expect(s.mode).toBe('backup');
+    expect(s.schedule).toBe('daily');
+    expect(s.includeHidden).toBe(false); // old behaviour preserved: dotfiles still skipped
+    expect(s.skipThumbnails).toBe(false);
+    expect(s.sourcePaths).toEqual(['/sources/x']);
   });
 
   it('makes the subfolder unique per target', () => {

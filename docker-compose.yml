@@ -92,16 +92,44 @@ services:
     # ---------------------------------------------------------------------------
     # HARDENING (safe defaults — the app needs no extra Linux capabilities)
     # ---------------------------------------------------------------------------
+    # Every option below is validated by the deployment smoke matrix
+    # (test/deployment/smoke.sh) on each release, so an advertised mode can't ship
+    # broken. See README → "Hardening".
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Optional, stronger: read-only root filesystem. Needs writable tmpfs for the
-    # Next.js cache and /tmp, so it's opt-in. Uncomment together:
+    # Optional: enable the "Limit upload speed" setting. It shapes traffic with the
+    # kernel's `tc` (the only reliable way — the Proton CLI has no bandwidth flag),
+    # which needs NET_ADMIN back. This is a deliberate, documented exception to
+    # cap_drop: ALL; leave it out and the speed-limit control shows as unavailable.
+    # cap_add:
+    #   - NET_ADMIN
+
+    # Optional, stronger: read-only root filesystem. The ONLY writable path the app
+    # needs is the /data volume above (DB, Proton session, cache); everything else
+    # is served read-only. Add the two tmpfs mounts for the Next.js cache and /tmp,
+    # and uncomment together. /config (declarative import) may be omitted entirely
+    # or mounted :ro — it is never written.
     # read_only: true
     # tmpfs:
     #   - /tmp
     #   - /app/.next/cache
+
+    # Optional: run as a non-root user instead of root. Two ways:
+    #
+    # (a) `user:` — you run the container AS that UID. The image supports any UID, but
+    #     the HOST directory bound to /data must already be writable by it
+    #     (e.g. `sudo chown -R 1000:1000 ./data`). /sources stays read-only. HOME
+    #     lives on /data, so this composes with read_only: true above.
+    # user: "1000:1000"
+    #
+    # (b) PUID/PGID — the container starts as root, chowns /data for you, then drops
+    #     to that user itself (handy when you can't chown the bind mount yourself).
+    #     Do NOT combine with `user:` or read_only (it needs to start privileged).
+    # environment:
+    #   - PUID=1000
+    #   - PGID=1000
     #
     # The app has NO built-in authentication (see README → Security). If the host
     # is not fully trusted, bind the published port to localhost and put an

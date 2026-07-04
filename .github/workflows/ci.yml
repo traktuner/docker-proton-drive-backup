@@ -1,0 +1,64 @@
+name: CI
+
+# Regression gate for every change. Two layers:
+#   1. `checks`         — typecheck + the vitest suite (fast, no Docker). Includes
+#      the static deployment guards (test/deployment/*.test.ts) that assert the
+#      entrypoint / Dockerfile / compose invariants behind #19 and #20.
+#   2. `deployment-smoke` — builds the image and BOOTS the container in every
+#      advertised mode (default, hardened, read-only, non-root, read-only+non-root),
+#      asserting it starts and really initialises. This is what makes an
+#      "advertised but doesn't start" deployment mode impossible to merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Typecheck & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests (vitest)
+        run: npm test
+
+  deployment-smoke:
+    name: Deployment smoke matrix (Docker)
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t proton-drive-backup:smoke .
+
+      - name: Boot every advertised deployment mode
+        # sudo so the non-root modes can chown the data dir to uid 1000 (GitHub
+        # runners are not root by default); without it those modes self-skip.
+        # `env` reliably forwards the wait knob through sudo.
+        run: sudo env SMOKE_WAIT=120 ./test/deployment/smoke.sh proton-drive-backup:smoke

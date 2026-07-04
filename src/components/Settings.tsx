@@ -14,7 +14,16 @@ interface Info {
   account: { email: string | null; displayName: string | null };
   quota: { maxSpace: number; usedSpace: number; driveUsed: number } | null;
   productUsed: Record<string, number>;
-  uploads: { concurrency: number };
+  uploads: UploadsCfg;
+}
+interface UploadsCfg {
+  concurrency: number;
+  /** Upload speed cap in KB/s; 0 = off. */
+  limitKBps: number;
+  /** Whether the container can actually enforce a limit (has NET_ADMIN). */
+  canShape: boolean;
+  /** Why it can't, when it can't — shown in the UI. */
+  shapeReason: string;
 }
 interface Updates {
   cli: { current: string; latest: string; updateAvailable: boolean };
@@ -57,9 +66,9 @@ export default function Settings() {
   const [info, setInfo] = useState<Info | null>(null);
   const [updates, setUpdates] = useState<Updates | null>(null);
   const [checking, setChecking] = useState(false);
-  const [uploads, setUploads] = useState<{ concurrency: number } | null>(null);
+  const [uploads, setUploads] = useState<UploadsCfg | null>(null);
 
-  const saveUploads = (patch: { concurrency: number }) => {
+  const saveUploads = (patch: Partial<UploadsCfg>) => {
     setUploads((u) => (u ? { ...u, ...patch } : u));
     fetch('/api/settings/uploads', {
       method: 'POST',
@@ -250,6 +259,47 @@ export default function Settings() {
                     Higher is faster but heavier on the connection and likelier to hit Proton rate limits.
                     Takes effect during a running backup, as in-flight uploads finish.
                   </p>
+                </div>
+
+                <div className="mt-3 border-t border-white/[0.05] py-1 pt-3">
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="text-[color:var(--muted)]">Limit upload speed</span>
+                    <div className="flex items-center gap-2">
+                      {uploads.canShape && uploads.limitKBps > 0 && (
+                        <>
+                          <input
+                            type="number"
+                            min={50}
+                            step={50}
+                            value={uploads.limitKBps}
+                            onChange={(e) => saveUploads({ limitKBps: Math.max(50, Math.round(+e.target.value) || 50) })}
+                            className="w-24 rounded bg-white/[0.06] px-2 py-1 text-right text-sm tabular-nums outline-none focus:bg-white/[0.09]"
+                            aria-label="Upload speed limit in KB/s"
+                          />
+                          <span className="text-xs text-[color:var(--muted)]">KB/s</span>
+                        </>
+                      )}
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4"
+                        checked={uploads.limitKBps > 0}
+                        disabled={!uploads.canShape}
+                        onChange={(e) => saveUploads({ limitKBps: e.target.checked ? 1024 : 0 })}
+                        aria-label="Enable upload speed limit"
+                      />
+                    </div>
+                  </div>
+                  {uploads.canShape ? (
+                    <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
+                      Caps outbound bandwidth in the kernel (tc/TBF). Approximate, shared across all parallel
+                      uploads, and applied to the whole container&apos;s traffic while a backup runs. Takes
+                      effect on the next run.
+                    </p>
+                  ) : (
+                    <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
+                      Unavailable — {uploads.shapeReason} See “Hardening” in the README.
+                    </p>
+                  )}
                 </div>
               </Section>
             )}

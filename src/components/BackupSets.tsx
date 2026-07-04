@@ -7,6 +7,10 @@ import { useAuth } from './AuthProvider';
 import { formatBytes } from '@/lib/format';
 import { DOW, DOW_ORDER, pad } from '@/lib/schedule';
 
+export interface SkippedFile {
+  rel: string;
+  reason: string;
+}
 export interface RunRow {
   id: number;
   startedAt: number;
@@ -15,6 +19,7 @@ export interface RunRow {
   message: string | null;
   files: number;
   bytes: number;
+  skipped?: SkippedFile[];
 }
 
 export interface BackupSet {
@@ -30,6 +35,7 @@ export interface BackupSet {
   scheduleDow: number;
   excludes: string[];
   skipThumbnails: boolean;
+  includeHidden: boolean;
   watch: boolean;
   lastRunAt: number | null;
   lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
@@ -135,6 +141,8 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   const [verifying, setVerifying] = useState<Set<string>>(new Set());
   const [previewing, setPreviewing] = useState<Set<string>>(new Set());
   const [previews, setPreviews] = useState<Record<string, PreviewResult>>({});
+  // Which sets have their "skipped files" panel expanded.
+  const [openSkips, setOpenSkips] = useState<Record<string, boolean>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
 
   const load = () =>
@@ -275,6 +283,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
       scheduleDow: draft.scheduleDow,
       excludes: draft.excludes,
       skipThumbnails: draft.skipThumbnails,
+      includeHidden: draft.includeHidden,
       watch: draft.watch,
       // Changing this renames the Drive folder + rewrites catalog keys server-side.
       targetSubfolder: draft.targetSubfolder,
@@ -439,6 +448,15 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                   />
                   Skip thumbnails on Drive
                 </label>
+                <label className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--muted)]">
+                  <input
+                    type="checkbox"
+                    checked={!!draft.includeHidden}
+                    onChange={(e) => setDraft((d) => ({ ...d, includeHidden: e.target.checked }))}
+                    className="accent-[color:var(--accent)]"
+                  />
+                  Include hidden files (dotfiles)
+                </label>
                 <div className="flex gap-2">
                   <button onClick={saveEdit} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
                     Save
@@ -532,6 +550,51 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                       </p>
                     )
                   )}
+
+                  {/* Skipped-files panel: files the last run couldn't back up (name
+                      unsupported / unreadable). Skipping is never fatal — the rest
+                      still uploads — so this is informational, tucked behind a toggle.
+                      Paths wrap (not truncate) so they're fully readable on any device. */}
+                  {(() => {
+                    if (s.lastStatus === 'running') return null;
+                    const sk = s.recentRuns?.[0]?.skipped ?? [];
+                    if (sk.length === 0) return null;
+                    const open = !!openSkips[s.id];
+                    const more = sk.length >= 100; // the engine caps the sample at 100
+                    return (
+                      <div className="mt-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setOpenSkips((o) => ({ ...o, [s.id]: !o[s.id] }))}
+                          className="inline-flex items-center gap-1 text-[11px] hover:underline"
+                          style={{ color: 'var(--signal-warning)' }}
+                          aria-expanded={open}
+                        >
+                          <span aria-hidden>{open ? '▾' : '▸'}</span>
+                          {sk.length}
+                          {more ? '+' : ''} file{sk.length === 1 ? '' : 's'} skipped
+                        </button>
+                        {open && (
+                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-[11px]">
+                            <p className="text-[color:var(--muted)]">
+                              Skipped — everything else was backed up, and a backup is never paused or stopped for these:
+                            </p>
+                            <ul className="mt-1.5 max-h-40 space-y-1.5 overflow-y-auto pr-1">
+                              {sk.map((f) => (
+                                <li key={f.rel} className="min-w-0">
+                                  <div className="break-all font-mono text-[color:var(--text)]">{f.rel}</div>
+                                  <div className="break-all text-[color:var(--muted)]">{f.reason}</div>
+                                </li>
+                              ))}
+                              {more && (
+                                <li className="text-[color:var(--muted)]">… and more (showing the first {sk.length})</li>
+                              )}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
                   {confirmDel === s.id ? (

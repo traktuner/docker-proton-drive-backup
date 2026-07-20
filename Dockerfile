@@ -25,9 +25,9 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS cli
 # Keep these in sync via .github/workflows/check-cli-update.yml
-ARG PROTON_CLI_VERSION=0.5.0
-ARG PROTON_CLI_SHA512_X64=d85edbc57412c92a9705b70a8d3a5c66ad933331554d6b922b912d6df29b4e5e9b0d7a940a594927dd4788e1f8db86d5e9a23f084f07dbd5327f7a9e51d61272
-ARG PROTON_CLI_SHA512_ARM64=a679e1e09d29413452a6ac24664dbd249bcafa1fb208e24b9c04133cd97488bf686d350cfcd2522742ac69de428142ac65cb56eb11f25260d3b4ffaa57d39054
+ARG PROTON_CLI_VERSION=0.6.0
+ARG PROTON_CLI_SHA512_X64=e77f5b27a51a81063c23c15ac0a9f07e0ec5c868e78670f34b45b3c3c2e679ed769e6225796b900d0d02735a0c52a21eba72356f3ad617de076c405532e698dc
+ARG PROTON_CLI_SHA512_ARM64=4651d7b23d111a940d5a0d308a62aaf7d39f0d6a8ceba4c6faa2bcd69624557e0eb19f5a528e8d759fb1fcd96c9e094777fabdd218372dee563c6712bd13cdde
 WORKDIR /tmp
 RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*

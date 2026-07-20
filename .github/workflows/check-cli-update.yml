@@ -15,7 +15,10 @@ permissions:
   packages: write
 
 env:
-  BASE_URL: https://proton.me/download/drive/cli/index.html
+  # Base URL for the proton-drive CLI downloads.
+  # Note: GET on /cli returns 404 (no directory listing), but file paths like
+  # /cli/<version>/<arch>/proton-drive return 200 and are used below.
+  BASE_URL: https://proton.me/download/drive/cli
   REGISTRY: ghcr.io
 
 jobs:

@@ -15,7 +15,7 @@ permissions:
   packages: write
 
 env:
-  BASE_URL: https://proton.me/download/drive/cli
+  BASE_URL: https://proton.me/download/drive/cli/index.html
   REGISTRY: ghcr.io
 
 jobs:

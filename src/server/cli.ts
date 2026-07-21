@@ -8,9 +8,10 @@ import nodePath from 'node:path';
  * Design notes (see memory/proton-drive-cli-internals):
  *  - Every operation except login runs as a ONE-SHOT process: spawn, read JSON,
  *    exit. No fragile REPL/prompt parsing.
- *  - Secrets use the file-based store (PROTON_DRIVE_UNSAFE_SECRETS=1) so the CLI
- *    never touches libsecret/gnome-keyring/D-Bus. This is the only thing that
- *    works headless in Docker.
+ *  - Secrets use the file-based store (PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file,
+ *    introduced in CLI 0.6.0 and replacing the removed PROTON_DRIVE_UNSAFE_SECRETS=1)
+ *    so the CLI never touches libsecret/gnome-keyring/D-Bus. This is the only thing
+ *    that works headless in Docker.
  *  - PROTON_DRIVE_CACHE_DIR points session + cache + logs at one persistent dir.
  *  - Login is a long-lived polling process: it prints {"signInUrl":...} then
  *    polls Proton until the browser sign-in completes, then exits 0.
@@ -20,10 +21,28 @@ export const CLI_PATH = process.env.PROTON_DRIVE_CLI || '/usr/local/bin/proton-d
 export const CACHE_DIR = process.env.PROTON_DRIVE_CACHE_DIR || '/data/proton';
 export const PROTON_ROOT = '/my-files';
 
+// One-time migration nudge: CLI 0.6.0 removed PROTON_DRIVE_UNSAFE_SECRETS and
+// replaced it with PROTON_DRIVE_CREDENTIALS_STORE. Warn (not throw) so an
+// upgrading operator who still carries the old var notices, but the container
+// still starts and works (we default the new var to unsafe_file ourselves).
+if (process.env.PROTON_DRIVE_UNSAFE_SECRETS !== undefined && !('PROTON_DRIVE_CREDENTIALS_STORE' in process.env)) {
+  console.warn(
+    '[proton-drive] PROTON_DRIVE_UNSAFE_SECRETS is ignored by CLI 0.6.0+; ' +
+      'using PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file (the file-based store). ' +
+      'Set PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file and drop PROTON_DRIVE_UNSAFE_SECRETS.'
+  );
+}
+
 export function cliEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    PROTON_DRIVE_UNSAFE_SECRETS: '1',
+    // CLI 0.6.0 renamed/replaced PROTON_DRIVE_UNSAFE_SECRETS=1 with an explicit
+    // store selector; "unsafe_file" is the file-based store (the only thing that
+    // works headless in Docker, avoiding libsecret/D-Bus/machine-id). Default to
+    // it so a missing env var can never fall back to "keychain" (the upstream
+    // default), which fails with "Cannot spawn a message bus without a machine-id"
+    // (issue #34) — but still respect an operator who explicitly chooses "pass".
+    PROTON_DRIVE_CREDENTIALS_STORE: process.env.PROTON_DRIVE_CREDENTIALS_STORE || 'unsafe_file',
     PROTON_DRIVE_CACHE_DIR: CACHE_DIR,
     PROTON_DRIVE_LOG_LEVEL: process.env.PROTON_DRIVE_LOG_LEVEL || 'ERROR',
     // Fall back to the writable cache dir (not a nonexistent /home/app on a

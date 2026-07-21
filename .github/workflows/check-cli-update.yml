@@ -87,7 +87,7 @@ jobs:
         if: steps.detect.outputs.update == 'true'
         env:
           V: ${{ steps.detect.outputs.latest }}
-          PROTON_DRIVE_UNSAFE_SECRETS: '1'
+          PROTON_DRIVE_CREDENTIALS_STORE: 'unsafe_file'
         run: |
           set -euo pipefail
           curl -fsSL "$BASE_URL/$V/linux-x64/proton-drive"   -o pd-x64

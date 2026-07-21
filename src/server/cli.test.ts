@@ -223,9 +223,35 @@ describe('cliEnv – HOME & secret store (issue #19 / non-root)', () => {
 
   it('always uses the file-based secret store pointed at the cache dir (headless-safe)', () => {
     // Guards the headless-Docker contract: no libsecret/keyring, session under CACHE_DIR.
+    // CLI 0.6.0 replaced PROTON_DRIVE_UNSAFE_SECRETS=1 with PROTON_DRIVE_CREDENTIALS_STORE
+    // (values: keychain | unsafe_file | pass). We must pin "unsafe_file" explicitly —
+    // the upstream default is "keychain", which fails with a D-Bus/machine-id error in
+    // a container (issue #34).
     const env = cliEnv();
-    expect(env.PROTON_DRIVE_UNSAFE_SECRETS).toBe('1');
+    expect(env.PROTON_DRIVE_CREDENTIALS_STORE).toBe('unsafe_file');
     expect(env.PROTON_DRIVE_CACHE_DIR).toBe(CACHE_DIR);
+  });
+
+  it('respects an operator-supplied PROTON_DRIVE_CREDENTIALS_STORE (e.g. "pass")', () => {
+    const withCredsStore = (value: string | undefined, fn: () => void) => {
+      const saved = process.env.PROTON_DRIVE_CREDENTIALS_STORE;
+      try {
+        if (value === undefined) delete process.env.PROTON_DRIVE_CREDENTIALS_STORE;
+        else process.env.PROTON_DRIVE_CREDENTIALS_STORE = value;
+        fn();
+      } finally {
+        if (saved === undefined) delete process.env.PROTON_DRIVE_CREDENTIALS_STORE;
+        else process.env.PROTON_DRIVE_CREDENTIALS_STORE = saved;
+      }
+    };
+
+    withCredsStore('pass', () => {
+      expect(cliEnv().PROTON_DRIVE_CREDENTIALS_STORE).toBe('pass');
+    });
+
+    withCredsStore('keychain', () => {
+      expect(cliEnv().PROTON_DRIVE_CREDENTIALS_STORE).toBe('keychain');
+    });
   });
 });
 

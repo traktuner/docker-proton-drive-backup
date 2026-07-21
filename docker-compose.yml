@@ -74,8 +74,9 @@ services:
       # - PROTON_DRIVE_CACHE_DIR=/data/proton
 
       # Required inside a container (file-based session store; the OS keyring is
-      # unavailable). Do not disable.
-      # - PROTON_DRIVE_UNSAFE_SECRETS=1
+      # unavailable). Do not disable. (CLI 0.6.0+ renamed it from the old
+      # PROTON_DRIVE_UNSAFE_SECRETS=1.)
+      # - PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file
 
       # CLI log verbosity: ERROR | WARN | INFO | DEBUG. Default ERROR.
       # - PROTON_DRIVE_LOG_LEVEL=ERROR

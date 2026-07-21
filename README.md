@@ -27,9 +27,10 @@ gets the SDK's capabilities for free.
 - **Login** spawns `proton-drive auth login`, captures the printed sign-in URL,
   shows it in the UI, and polls until you finish signing in any browser. No
   localhost callback needed, so it works for a remote/headless server.
-- **Secrets** use the CLI's file-based store via `PROTON_DRIVE_UNSAFE_SECRETS=1`,
-  so the container never needs libsecret/gnome-keyring/D-Bus. The session is
-  written under `PROTON_DRIVE_CACHE_DIR` (`/data/proton`) and survives restarts.
+- **Secrets** use the CLI's file-based store via `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`
+  (CLI 0.6.0+, replacing the removed `PROTON_DRIVE_UNSAFE_SECRETS=1`), so the container
+  never needs libsecret/gnome-keyring/D-Bus. The session is written under
+  `PROTON_DRIVE_CACHE_DIR` (`/data/proton`) and survives restarts.
 - Backup sets are stored in SQLite (`/data/backup.db`).
 - An in-process scheduler runs scheduled sets on the container's local time.
 
@@ -50,8 +51,9 @@ interface (e.g. `127.0.0.1:3005:3000`) when in doubt.
 ### Session at rest
 
 The proton-drive CLI can only store its session two ways: the OS keyring
-(libsecret - unavailable/unreliable in a container) or a **plaintext file**
-(`PROTON_DRIVE_UNSAFE_SECRETS=1`). It has no built-in encryption option. So the
+(libsecret - unavailable/unreliable in a container), `pass` (requires GPG/pass
+setup), or a **plaintext file** (`PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`,
+the default in this image). It has no built-in encryption option. So the
 session token lives unencrypted in `/data/proton/auth-session.json`.
 
 Because the app must start and use the session unattended, it can't meaningfully
@@ -177,7 +179,7 @@ still sign in interactively once. See the volume `(3)` comment in
 | `CONFIG_DIR` | `/config` | Directory scanned for declarative `backup-sets.*` |
 | `PROTON_DRIVE_CLI` | `/usr/local/bin/proton-drive` | CLI binary path |
 | `PROTON_DRIVE_CACHE_DIR` | `/data/proton` | Session + cache + logs (persist this) |
-| `PROTON_DRIVE_UNSAFE_SECRETS` | `1` | File-based secret store (required in Docker) |
+| `PROTON_DRIVE_CREDENTIALS_STORE` | `unsafe_file` | File-based secret store (required in Docker; CLI 0.6.0+) |
 | `PROTON_DRIVE_LOG_LEVEL` | `ERROR` | CLI log verbosity |
 | `HOME` | `/data/proton` | HOME for the app + CLI, kept on the writable `/data` volume so a read-only root and a non-root user both work |
 | `GITHUB_REPO` | `traktuner/docker-proton-drive-backup` | Repo for the in-app update check |
@@ -341,9 +343,12 @@ Newest first. Image tags follow the bundled `proton-drive` CLI version
 
 ## Troubleshooting
 
-- **Login shows no URL / `ERR_SECRETS_PLATFORM_ERROR`** - ensure
-  `PROTON_DRIVE_UNSAFE_SECRETS=1` is set (it is by default in the image). This is
-  what avoids the keyring/D-Bus requirement.
+- **Login shows no URL / `ERR_SECRETS_PLATFORM_ERROR` / "Cannot spawn a message bus
+  without a machine-id"** - ensure `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file` is
+  set (it is by default in the image). This avoids the keyring/D-Bus requirement.
+  (On CLI 0.6.0+ the old `PROTON_DRIVE_UNSAFE_SECRETS=1` was removed and replaced
+  by `PROTON_DRIVE_CREDENTIALS_STORE` with values `keychain` (default) /
+  `unsafe_file` / `pass`.)
 - **Left pane empty** - mount your folders into `/sources`.
 - **Check the CLI works:** `docker exec -it proton-drive-backup proton-drive version`
 

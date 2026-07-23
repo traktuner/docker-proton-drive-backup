@@ -13,7 +13,7 @@
     "test:smoke": "test/deployment/smoke.sh"
   },
   "dependencies": {
-    "better-sqlite3": "^12.10.0",
+    "better-sqlite3": "^13.0.0",
     "geist": "^1.7.2",
     "nanoid": "^6.0.0",
     "next": "^16.2.9",

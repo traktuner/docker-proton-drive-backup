@@ -129,7 +129,8 @@ generic arm64 Linux servers.
 
 A changed file in **Backup**/**Mirror** mode is written as a **new revision** in
 Proton Drive (so the previous version stays in your Drive version history and is
-restorable), not re-uploaded as a brand-new file. This needs CLI ≥ 0.4.6.
+restorable), not re-uploaded as a brand-new file. This uses the CLI 0.8.0
+`create-new-revision` file conflict strategy.
 
 **Mirror safety:** the deletion pass is skipped (and flagged) if a configured
 source path is missing on disk, if any upload failed during the run, or if more
@@ -335,8 +336,8 @@ Newest first. Image tags follow the bundled `proton-drive` CLI version
   Backup runs stop cleanly with a clear message if the session dies mid-run.
 - **Mirror deletion safety** - the deletion pass is skipped when any upload failed
   in the run, so a changed-but-failed file's Drive copy is never trashed.
-- **CLI 0.4.6: file merge restored** - changed files are written as new Drive
-  revisions (version history) again; the old re-upload workaround was removed.
+- **CLI 0.8.0 conflict strategies** - changed files use the explicit
+  `create-new-revision` strategy, while folder conflicts continue to use `merge`.
 - **Delta backup engine** - streams the source tree, uploads only new/changed
   files, scales to millions of files; structure-preserving Drive layout; mirror
   deletion guards and a Drive verify/reconcile pass.

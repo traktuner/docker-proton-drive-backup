@@ -315,14 +315,14 @@ describe('escapeGlobPath (issue #22)', () => {
 });
 
 describe('buildUploadArgs (issue #22)', () => {
-  const opts = { fileStrategy: 'merge' as const, folderStrategy: 'merge' as const };
+  const opts = { fileStrategy: 'create-new-revision' as const, folderStrategy: 'merge' as const };
 
   it('glob-escapes every local source path but NOT the Drive target', () => {
     const args = buildUploadArgs(['/sources/Movie [1080p].mkv', '/sources/plain.txt'], '/Backups', opts);
     expect(args).toContain('/sources/Movie [[]1080p].mkv'); // escaped source
     expect(args).toContain('/sources/plain.txt'); // untouched plain source
     expect(args).toContain('/my-files/Backups'); // normalised target, never escaped
-    expect(args.slice(0, 6)).toEqual(['filesystem', 'upload', '-f', 'merge', '-d', 'merge']);
+    expect(args.slice(0, 6)).toEqual(['filesystem', 'upload', '-f', 'create-new-revision', '-d', 'merge']);
   });
 
   it('adds -t only when skipThumbnails and -v only when verbose, with -v after the target', () => {

@@ -709,7 +709,10 @@ export async function drivePathExists(p: string): Promise<boolean | null> {
   return null;
 }
 
-export type FileStrategy = 'merge' | 'keep-both' | 'replace' | 'skip';
+// CLI 0.8.0 split file and folder conflict strategies. Files use
+// `create-new-revision` where older CLI versions called the same behavior `merge`.
+export type FileStrategy = 'create-new-revision' | 'rename' | 'replace' | 'skip';
+export type FolderStrategy = 'merge' | 'rename' | 'replace' | 'skip';
 
 /** Parse one verbose stderr line for a per-file upload metric (bytes uploaded). */
 function parseUploadMetric(line: string): number | null {
@@ -752,7 +755,7 @@ export function buildUploadArgs(
   targetPath: string,
   opts: {
     fileStrategy: FileStrategy;
-    folderStrategy: FileStrategy;
+    folderStrategy: FolderStrategy;
     skipThumbnails?: boolean;
     verbose?: boolean;
   },
@@ -768,7 +771,7 @@ export async function upload(
   localPaths: string[],
   targetPath: string,
   fileStrategy: FileStrategy = 'skip',
-  folderStrategy: FileStrategy = 'merge',
+  folderStrategy: FolderStrategy = 'merge',
   /** If set, the CLI runs verbose and this is called with each file's byte size
       as it completes — used to show live progress/speed during the recursive seed. */
   onUploadedFile?: (bytes: number) => void,

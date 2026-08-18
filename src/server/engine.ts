@@ -13,6 +13,7 @@ import {
   looksUnauthenticated,
   describeUploadError,
   type FileStrategy,
+  type FolderStrategy,
   type RunResult,
 } from './cli';
 
@@ -146,7 +147,7 @@ export async function uploadSourceTrees(
   sources: { abs: string; relBase: string }[],
   target: string,
   fileStrategy: FileStrategy,
-  folderStrategy: FileStrategy,
+  folderStrategy: FolderStrategy,
   onUploadedFile?: (bytes: number) => void,
   shouldCancel: () => boolean = () => false,
   skipThumbnails = false,
@@ -466,7 +467,7 @@ export async function runCatalogDelta(
     const maxAttempts = retry ? 4 : 1;
     let lastErr = '';
     for (let attempt = 1; attempt <= maxAttempts && !shouldCancel() && !sessionDead; attempt++) {
-      const res = await upload(absList, parentDrive, 'merge', 'merge', undefined, skipThumbnails);
+      const res = await upload(absList, parentDrive, 'create-new-revision', 'merge', undefined, skipThumbnails);
       if (res.code === 0) return { ok: true, err: '', auth: false };
       lastErr = (res.stderr || res.stdout).trim().slice(0, 200);
       if (looksUnauthenticated(res.stderr + res.stdout)) return { ok: false, err: lastErr, auth: true };

@@ -5,6 +5,13 @@ import { backupSets, type BackupMode, type Schedule } from './db';
 import { catalog } from './catalog';
 import { LOCAL_ROOT, resolveLocal, sanitizeSegment } from './local';
 import { DOW, pad } from '@/lib/schedule';
+import { isBackupSetBusy } from './backup-lock';
+import {
+  classifySourceListChange,
+  planSourceAdditions,
+  SourceValidationError,
+  verifySourceAdditionsSync,
+} from './source-paths';
 
 /**
  * Backup sets as portable, version-controllable YAML. Source paths are exported
@@ -107,14 +114,40 @@ export function importConfig(text: string): ImportResult {
 
     const dupe = existing.find((e) => e.name === name);
     if (dupe) {
-      // Only reset the catalog if the paths actually moved — otherwise a routine
-      // re-import (e.g. on every container start) would force a full re-upload.
-      const pathsChanged =
-        dupe.targetPath !== payload.targetPath ||
-        dupe.sourcePaths.length !== payload.sourcePaths.length ||
-        dupe.sourcePaths.some((p, i) => p !== payload.sourcePaths[i]);
+      if (dupe.lastStatus === 'running' || isBackupSetBusy(dupe.id)) {
+        res.errors.push(`"${name}": stop the backup before importing changes`);
+        continue;
+      }
+
+      // Existing source roots are immutable. A config may append disjoint roots,
+      // but removal or replacement requires an explicit future detach workflow.
+      // This prevents an import from invalidating the delta catalog or turning a
+      // removed Mirror root into an implicit Drive deletion.
+      const sourceChange = classifySourceListChange(dupe.sourcePaths, payload.sourcePaths);
+      if (sourceChange.kind === 'destructive') {
+        res.errors.push(`"${name}": source removal or replacement is not allowed; add separate sources only`);
+        continue;
+      }
+      try {
+        if (sourceChange.kind === 'additive') {
+          const additions = planSourceAdditions(dupe.sourcePaths, sourceChange.additions);
+          verifySourceAdditionsSync(additions);
+          payload.sourcePaths = [...dupe.sourcePaths, ...additions];
+        } else {
+          payload.sourcePaths = dupe.sourcePaths;
+        }
+      } catch (error) {
+        res.errors.push(
+          `"${name}": ${error instanceof SourceValidationError ? error.message : 'invalid source change'}`,
+        );
+        continue;
+      }
+
+      // A source addition keeps every retained catalog key valid. Only moving the
+      // Drive target invalidates the catalog and still requires a rebuild.
+      const targetChanged = dupe.targetPath !== payload.targetPath;
       backupSets.update(dupe.id, payload);
-      if (pathsChanged) catalog.clear(dupe.id);
+      if (targetChanged) catalog.clear(dupe.id);
       res.updated++;
     } else {
       backupSets.create(payload);

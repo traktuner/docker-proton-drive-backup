@@ -275,6 +275,28 @@ export const backupSets = {
   },
 
   /**
+   * Append source roots while the set is stopped.
+   *
+   * This updates source_paths and optional selection-derived excludes in one SQL
+   * statement. It deliberately does not touch backup_catalog: existing rel keys
+   * remain valid, so the next delta run uploads only files from the new roots.
+   */
+  appendSourcesIfStopped(id: string, additions: string[], additionalExcludes: string[] = []): BackupSet | null {
+    const cur = this.get(id);
+    if (!cur || cur.lastStatus === 'running') return null;
+    const sourcePaths = [...cur.sourcePaths, ...additions];
+    const excludes = [...new Set([...cur.excludes, ...additionalExcludes])];
+    const result = getDb()
+      .prepare(
+        `UPDATE backup_sets
+         SET source_paths = ?, excludes = ?
+         WHERE id = ? AND COALESCE(last_status, 'never') <> 'running'`,
+      )
+      .run(JSON.stringify(sourcePaths), JSON.stringify(excludes), id);
+    return result.changes === 1 ? this.get(id) : null;
+  },
+
+  /**
    * Atomically rename a set's Drive subfolder in OUR records after the real Drive
    * folder rename (CLI) has succeeded: rewrite every catalog rel from the old
    * top-level prefix to the new one (the bare "<old>" dir row and all "<old>/…"

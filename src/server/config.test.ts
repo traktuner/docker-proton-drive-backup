@@ -6,6 +6,7 @@ import YAML from 'yaml';
 import { exportConfig, importConfig, autoImportFromConfigDir } from '@/server/config';
 import { backupSets, getDb } from '@/server/db';
 import { resolveLocal, LOCAL_ROOT } from '@/server/local';
+import { catalog } from '@/server/catalog';
 
 beforeEach(() => {
   getDb().exec('DELETE FROM backup_sets');
@@ -363,5 +364,97 @@ describe('importConfig upsert by name', () => {
     expect(got.schedule).toBe('daily');
     expect(got.scheduleHour).toBe(6);
     expect(got.scheduleMinute).toBe(30);
+  });
+
+  it('appends imported sources without clearing the existing catalog', () => {
+    fs.mkdirSync(resolveLocal('/new'), { recursive: true });
+    importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'SafeImport', sources: ['/old'], target: '/', mode: 'backup' }],
+      }),
+    );
+    const set = backupSets.all()[0];
+    catalog.upsertFile(set.id, 'SafeImport/old/keep.txt', 4, 1, 'sha', 1);
+
+    const res = importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'SafeImport', sources: ['/old', '/new'], target: '/', mode: 'backup' }],
+      }),
+    );
+
+    expect(res.errors).toEqual([]);
+    expect(res.updated).toBe(1);
+    expect(backupSets.get(set.id)!.sourcePaths).toEqual([resolveLocal('/old'), resolveLocal('/new')]);
+    expect(catalog.getFile(set.id, 'SafeImport/old/keep.txt')).toEqual({ size: 4, mtimeMs: 1, sha1: 'sha' });
+  });
+
+  it('rejects a missing imported source addition without changing the set', () => {
+    importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'MissingAddition', sources: ['/old'], target: '/', mode: 'backup' }],
+      }),
+    );
+    const set = backupSets.all()[0];
+
+    const res = importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'MissingAddition', sources: ['/old', '/does-not-exist'], target: '/', mode: 'backup' }],
+      }),
+    );
+
+    expect(res.updated).toBe(0);
+    expect(res.errors[0]).toMatch(/missing or not readable/);
+    expect(backupSets.get(set.id)!.sourcePaths).toEqual([resolveLocal('/old')]);
+  });
+
+  it('rejects imported source removal and leaves the set and catalog unchanged', () => {
+    importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'NoRemoval', sources: ['/one', '/two'], target: '/', mode: 'mirror' }],
+      }),
+    );
+    const set = backupSets.all()[0];
+    catalog.upsertFile(set.id, 'NoRemoval/two/keep.txt', 4, 1, null, 1);
+
+    const res = importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'NoRemoval', sources: ['/one'], target: '/', mode: 'mirror' }],
+      }),
+    );
+
+    expect(res.updated).toBe(0);
+    expect(res.errors[0]).toMatch(/source removal or replacement is not allowed/);
+    expect(backupSets.get(set.id)!.sourcePaths).toEqual([resolveLocal('/one'), resolveLocal('/two')]);
+    expect(catalog.getFile(set.id, 'NoRemoval/two/keep.txt')).toBeDefined();
+  });
+
+  it('rejects config changes while a set is running', () => {
+    importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'RunningImport', sources: ['/one'], target: '/', mode: 'backup' }],
+      }),
+    );
+    const set = backupSets.all()[0];
+    backupSets.updateStatus(set.id, 'running', 'Uploading', true);
+
+    const res = importConfig(
+      YAML.stringify({
+        version: 1,
+        backupSets: [{ name: 'RunningImport', sources: ['/one', '/two'], target: '/', mode: 'mirror' }],
+      }),
+    );
+
+    expect(res.updated).toBe(0);
+    expect(res.errors[0]).toMatch(/stop the backup/);
+    const current = backupSets.get(set.id)!;
+    expect(current.sourcePaths).toEqual([resolveLocal('/one')]);
+    expect(current.mode).toBe('backup');
   });
 });

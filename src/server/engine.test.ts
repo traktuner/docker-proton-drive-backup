@@ -158,6 +158,64 @@ describe('runCatalogDelta — second run with no changes', () => {
   });
 });
 
+describe('runCatalogDelta — source addition without catalog reset (issue #51)', () => {
+  it('uploads only the added source and never re-uploads unchanged existing files', async () => {
+    const original = path.join(LOCAL_ROOT, 'source-add-old');
+    const added = path.join(LOCAL_ROOT, 'source-add-new');
+    await writeFixture('source-add-old/keep.txt', 'old-data');
+    await runCatalogDelta('source-add-set', [original], '/', 'Set', 'backup');
+    await writeFixture('source-add-new/new.txt', 'new-data');
+    upload.mockClear();
+
+    const res = await runCatalogDelta('source-add-set', [original, added], '/', 'Set', 'backup');
+
+    expect(res.newCount).toBe(1);
+    expect(res.changedCount).toBe(0);
+    expect(res.unchangedCount).toBe(1);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0][0]).toEqual([path.join(added, 'new.txt')]);
+    expect(catalog.getFile('source-add-set', 'Set/source-add-old/keep.txt')).toBeDefined();
+    expect(catalog.getFile('source-add-set', 'Set/source-add-new/new.txt')).toBeDefined();
+  });
+
+  it('still uploads a changed existing file while also adding the new source', async () => {
+    const original = path.join(LOCAL_ROOT, 'source-change-old');
+    const added = path.join(LOCAL_ROOT, 'source-change-new');
+    await writeFixture('source-change-old/changed.txt', 'old');
+    await runCatalogDelta('source-change-set', [original], '/', 'Set', 'backup');
+    await writeFixture('source-change-old/changed.txt', 'longer-current-data');
+    await writeFixture('source-change-new/new.txt', 'new');
+    upload.mockClear();
+
+    const res = await runCatalogDelta('source-change-set', [original, added], '/', 'Set', 'backup');
+    const uploaded = upload.mock.calls.flatMap(([files]) => files).sort();
+
+    expect(res.newCount).toBe(1);
+    expect(res.changedCount).toBe(1);
+    expect(uploaded).toEqual([
+      path.join(original, 'changed.txt'),
+      path.join(added, 'new.txt'),
+    ].sort());
+  });
+
+  it('does not classify retained Mirror files as stale after adding a source', async () => {
+    const original = path.join(LOCAL_ROOT, 'source-mirror-old');
+    const added = path.join(LOCAL_ROOT, 'source-mirror-new');
+    for (let i = 0; i < 10; i++) await writeFixture(`source-mirror-old/f${i}.txt`, `old-${i}`);
+    await runCatalogDelta('source-mirror-set', [original], '/', 'Set', 'mirror');
+    await writeFixture('source-mirror-new/new.txt', 'new');
+    upload.mockClear();
+    trashDrive.mockClear();
+
+    const res = await runCatalogDelta('source-mirror-set', [original, added], '/', 'Set', 'mirror');
+
+    expect(res.newCount).toBe(1);
+    expect(res.unchangedCount).toBe(10);
+    expect(res.deletedCount).toBe(0);
+    expect(trashDrive).not.toHaveBeenCalled();
+  });
+});
+
 describe('runCatalogDelta — mirror deletion + safety gates', () => {
   // Seed a catalog without going through the recursive seed path's stat/readdir
   // (so the deletion-pass tests start from a known catalog independent of disk).

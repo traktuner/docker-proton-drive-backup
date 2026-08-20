@@ -14,6 +14,7 @@ import { control } from './control';
 import { runs } from './runs';
 import { getUploadConfig } from './upload-config';
 import { applyUploadLimit } from './traffic';
+import { claimBackupSet, releaseBackupSet } from './backup-lock';
 
 /**
  * Runs a backup set. Fire-and-forget - the UI polls status.
@@ -30,6 +31,9 @@ import { applyUploadLimit } from './traffic';
 let runChain: Promise<unknown> = Promise.resolve();
 
 export async function runBackupSet(id: string): Promise<void> {
+  // Claim synchronously, before the first await. A queued set is not editable,
+  // even while another set still owns the serialized run queue.
+  if (!claimBackupSet(id)) return;
   const prev = runChain;
   let release!: () => void;
   runChain = new Promise<void>((r) => (release = r));
@@ -38,6 +42,7 @@ export async function runBackupSet(id: string): Promise<void> {
     await doRunBackupSet(id);
   } finally {
     release();
+    releaseBackupSet(id);
   }
 }
 

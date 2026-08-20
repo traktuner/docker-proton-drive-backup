@@ -283,6 +283,7 @@ All routes are unauthenticated (see [Security](#security)).
 | POST | `/api/drive/folder` | create a Drive folder |
 | GET/POST | `/api/backup-sets` | list / create backup sets |
 | PATCH/DELETE | `/api/backup-sets/:id` | update / delete a set |
+| POST | `/api/backup-sets/:id/source-paths` | safely add source roots to a stopped set |
 | POST | `/api/backup-sets/:id/run` · `/cancel` · `/verify` | run / cancel / verify a set |
 
 ## Development
@@ -330,6 +331,11 @@ Dockerfile · docker-compose.yml · docker-entrypoint.sh
 Newest first. Image tags follow the bundled `proton-drive` CLI version
 (`<cliVersion>-<revision>`); these are app-level highlights, not per-tag notes.
 
+- **Safe source additions for existing sets** - select extra local folders, open
+  the stopped set's editor, and add them without resetting its upload catalog.
+  Existing sources cannot be removed from this workflow, overlapping roots are
+  rejected, and queued/running sets remain locked, so unchanged files never
+  re-upload and Mirror cannot interpret an edit as a deletion (issue #51).
 - **Multi-arch image** - now built for `linux/arm64` as well as `linux/amd64`.
 - **Session reconnect UX** - a persistent banner and live status indicator when
   the Proton session expires; reconnect happens in place without losing your work.

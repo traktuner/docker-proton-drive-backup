@@ -65,6 +65,10 @@ export default function FilesPage() {
   const [roots, setRoots] = useState<Set<string>>(new Set());
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
   const sources = useMemo(() => [...roots], [roots]);
+  const selectedSourceExcludes = useMemo(
+    () => derivedExcludes([...roots], [...excluded]),
+    [roots, excluded],
+  );
   // Excluded (unticked) descendants that actually fall under a ticked root and
   // aren't themselves nested under another exclusion - these get subtracted from
   // the size estimate so it reflects what will really be backed up.
@@ -87,6 +91,7 @@ export default function FilesPage() {
   const [includeHidden, setIncludeHidden] = useState(false);
   const [creating, setCreating] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [localRoot, setLocalRoot] = useState('/sources');
   const [estimate, setEstimate] = useState<Estimate>({ bytes: 0, files: 0, folders: 0, counting: false });
 
   useEffect(() => {
@@ -99,6 +104,7 @@ export default function FilesPage() {
   const loadLocal = useCallback(async (path: string) => {
     const d = await fetch(`/api/local/list?path=${encodeURIComponent(path)}`).then((r) => r.json());
     if (d.error) throw new Error(d.error);
+    if (typeof d.root === 'string' && d.root) setLocalRoot(d.root);
     const entries: PaneEntry[] = (d.entries ?? []).map((e: any) => ({
       name: e.name,
       type: e.type,
@@ -106,6 +112,12 @@ export default function FilesPage() {
       id: e.path,
     }));
     return { entries };
+  }, []);
+
+  const consumeSelectedSources = useCallback((consumed: string[]) => {
+    const covers = (root: string, value: string) => root === '/' || value === root || value.startsWith(`${root}/`);
+    setRoots((prev) => new Set([...prev].filter((value) => !consumed.includes(value))));
+    setExcluded((prev) => new Set([...prev].filter((value) => !consumed.some((root) => covers(root, value)))));
   }, []);
 
   const loadDrive = useCallback(
@@ -712,8 +724,14 @@ export default function FilesPage() {
               </label>
             </div>
           </div>
-          <div className="max-h-72 overflow-auto pr-1">
-            <BackupSets refreshKey={refreshKey} />
+          <div className="max-h-[38rem] overflow-auto pr-1">
+            <BackupSets
+              refreshKey={refreshKey}
+              selectedSources={sources}
+              selectedSourceExcludes={selectedSourceExcludes}
+              localRoot={localRoot}
+              onSourcesAdded={consumeSelectedSources}
+            />
           </div>
         </div>
       </div>

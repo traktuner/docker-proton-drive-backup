@@ -121,13 +121,57 @@ function scheduleLabel(s: BackupSet): string {
 }
 const targetLabel = (p: string) => (p === '/' ? 'Drive (root)' : `Drive${p}`);
 
+function cleanPath(value: string): string {
+  const clean = value.replace(/\/+/g, '/').replace(/\/$/, '');
+  return clean || '/';
+}
+
+function selectedAbsolute(value: string, localRoot: string): string {
+  const root = cleanPath(localRoot);
+  const selected = cleanPath(value);
+  if (selected === root || selected.startsWith(`${root}/`)) return selected;
+  return selected === '/' ? root : `${root}${selected.startsWith('/') ? '' : '/'}${selected}`;
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  const left = cleanPath(a);
+  const right = cleanPath(b);
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
+}
+
+function sourceLabel(value: string, localRoot: string): string {
+  const source = cleanPath(value);
+  const root = cleanPath(localRoot);
+  if (source === root) return '/';
+  return source.startsWith(`${root}/`) ? source.slice(root.length) : source;
+}
+
+function excludesForSources(excludes: string[], sources: string[]): string[] {
+  const prefixes = sources.map((source) => cleanPath(source).replace(/^\//, ''));
+  return excludes.filter((pattern) =>
+    prefixes.some((prefix) => prefix === '' || pattern === prefix || pattern.startsWith(`${prefix}/`)),
+  );
+}
+
 /** Live preview of the Drive folder name — mirrors the server's sanitizeSegment. */
 function sanitizePreview(name: string): string {
   // eslint-disable-next-line no-control-regex
   return (name || '').replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
 }
 
-export default function BackupSets({ refreshKey }: { refreshKey: number }) {
+export default function BackupSets({
+  refreshKey,
+  selectedSources,
+  selectedSourceExcludes,
+  localRoot,
+  onSourcesAdded,
+}: {
+  refreshKey: number;
+  selectedSources: string[];
+  selectedSourceExcludes: string[];
+  localRoot: string;
+  onSourcesAdded: (sources: string[]) => void;
+}) {
   const { toast } = useToast();
   const { reportAuthError } = useAuth();
   const [sets, setSets] = useState<BackupSet[]>([]);
@@ -144,6 +188,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   // Which sets have their "skipped files" panel expanded.
   const [openSkips, setOpenSkips] = useState<Record<string, boolean>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
+  const [addingSources, setAddingSources] = useState(false);
 
   const load = () =>
     fetch('/api/backup-sets')
@@ -259,7 +304,13 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
   };
   const remove = async (id: string) => {
     const name = sets.find((s) => s.id === id)?.name;
-    await fetch(`/api/backup-sets/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/backup-sets/${id}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      toast(data.error || 'Failed to delete backup set', 'error');
+      load();
+      return;
+    }
     toast(`Backup set${name ? ` “${name}”` : ''} deleted`, 'info');
     load();
   };
@@ -267,13 +318,36 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
     setEditId(s.id);
     setDraft({ ...s });
   };
+  const addSources = async (set: BackupSet, additions: string[], extraExcludes: string[]) => {
+    if (additions.length === 0 || addingSources) return;
+    setAddingSources(true);
+    try {
+      const res = await fetch(`/api/backup-sets/${set.id}/source-paths`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sourcePaths: additions, excludes: extraExcludes }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Failed to add sources');
+      const updated = data.backupSet as BackupSet;
+      setSets((prev) => prev.map((item) => (item.id === set.id ? { ...item, ...updated } : item)));
+      setDraft((prev) => ({ ...prev, sourcePaths: updated.sourcePaths, excludes: updated.excludes }));
+      onSourcesAdded(additions);
+      toast(
+        `${data.added} source${data.added === 1 ? '' : 's'} added — existing backup data was unchanged`,
+        'success',
+      );
+    } catch (error) {
+      toast(error instanceof Error ? error.message : String(error), 'error');
+      load();
+    } finally {
+      setAddingSources(false);
+    }
+  };
   const saveEdit = async () => {
     if (!editId) return;
-    // Send ONLY the fields the edit form actually changes. Never round-trip
-    // sourcePaths/targetPath: they're stored as absolute in-container paths and the
-    // API would re-resolve them under LOCAL_ROOT (doubling the prefix), and sending
-    // them would needlessly reset the upload catalog. The edit form has no source/
-    // target pickers, so they can't change here anyway.
+    // Send only the ordinary editable fields. Sources use the additive endpoint
+    // above, which cannot replace roots and never clears the upload catalog.
     const payload = {
       name: draft.name,
       mode: draft.mode,
@@ -358,6 +432,67 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                     )}
                   </p>
                 </div>
+                {(() => {
+                  const existing = draft.sourcePaths ?? s.sourcePaths;
+                  const additions = selectedSources.filter((candidate) => {
+                    const absolute = selectedAbsolute(candidate, localRoot);
+                    return !existing.some((source) => pathsOverlap(source, absolute));
+                  });
+                  const blocked = selectedSources.length - additions.length;
+                  const extraExcludes = excludesForSources(selectedSourceExcludes, additions);
+                  return (
+                    <div className="space-y-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="text-[10px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+                          Sources
+                        </label>
+                        <span className="text-[10px] text-[color:var(--signal-success)]">no existing re-uploads</span>
+                      </div>
+                      <ul className="max-h-24 space-y-1 overflow-y-auto font-mono text-[11px] text-[color:var(--text)]">
+                        {existing.map((source) => (
+                          <li key={source} className="break-all rounded bg-black/10 px-2 py-1">
+                            {sourceLabel(source, localRoot)}
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="text-[11px] leading-relaxed text-[color:var(--muted)]">
+                        Existing sources stay attached and cannot be removed here. Select separate folders in Local files,
+                        then add them below. Unchanged files will not be re-uploaded.
+                      </p>
+                      {selectedSources.length === 0 ? (
+                        <p className="text-[11px] text-[color:var(--muted)]">No new source selected in Local files.</p>
+                      ) : (
+                        <div className="space-y-1.5">
+                          <p className="text-[11px] text-[color:var(--muted)]">
+                            {additions.length} new source{additions.length === 1 ? '' : 's'} selected
+                            {extraExcludes.length > 0 ? ` · ${extraExcludes.length} exclusion patterns` : ''}
+                          </p>
+                          {blocked > 0 && (
+                            <p className="text-[11px]" style={{ color: 'var(--signal-warning)' }}>
+                              {blocked} selection{blocked === 1 ? '' : 's'} already belong to or overlap this set.
+                            </p>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => addSources(s, additions, extraExcludes)}
+                            disabled={addingSources || additions.length === 0}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                          >
+                            {addingSources && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--accent)]" />
+                            )}
+                            {addingSources
+                              ? 'Checking sources…'
+                              : `Add ${additions.length || ''} selected source${additions.length === 1 ? '' : 's'} now`}
+                          </button>
+                          <p className="text-[10px] leading-relaxed text-[color:var(--muted)]">
+                            This action applies immediately. Cancel below only discards the other form changes.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
                 <div className="flex flex-wrap items-center gap-2 text-xs">
                   <select
                     value={draft.mode}
@@ -651,6 +786,7 @@ export default function BackupSets({ refreshKey }: { refreshKey: number }) {
                         onClick={() => startEdit(s)}
                         disabled={s.lastStatus === 'running'}
                         className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                        title={s.lastStatus === 'running' ? 'Pause or cancel this backup before editing it' : 'Edit backup set'}
                       >
                         Edit
                       </button>

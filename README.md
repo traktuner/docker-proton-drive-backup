@@ -134,8 +134,11 @@ restorable), not re-uploaded as a brand-new file. This uses the CLI 0.8.0
 
 **Mirror safety:** the deletion pass is skipped (and flagged) if a configured
 source path is missing on disk, if any upload failed during the run, or if more
-than ~30% of the catalog would be removed at once. Re-run after fixing the cause
-to apply pending deletions.
+than the configured share of the catalog would be removed at once. The global
+threshold defaults to 30% and can be changed or disabled under **Settings → Mirror
+safety**. Disabling it affects only the percentage gate; missing sources and upload
+failures always prevent deletion. Re-run after fixing a protected failure to apply
+pending deletions.
 
 ## What gets skipped (a backup is never stopped by one bad file)
 
@@ -285,6 +288,7 @@ All routes are unauthenticated (see [Security](#security)).
 | PATCH/DELETE | `/api/backup-sets/:id` | update / delete a set |
 | POST | `/api/backup-sets/:id/source-paths` | safely add source roots to a stopped set |
 | POST | `/api/backup-sets/:id/run` · `/cancel` · `/verify` | run / cancel / verify a set |
+| GET/POST | `/api/settings/mirror-safety` | read / update the global Mirror deletion threshold |
 
 ## Development
 
@@ -331,6 +335,9 @@ Dockerfile · docker-compose.yml · docker-entrypoint.sh
 Newest first. Image tags follow the bundled `proton-drive` CLI version
 (`<cliVersion>-<revision>`); these are app-level highlights, not per-tag notes.
 
+- **Configurable Mirror deletion threshold** - the global 30% safety gate can be
+  changed or disabled in Settings, while missing-source and upload-failure gates
+  remain mandatory (issue #56).
 - **Safe source additions for existing sets** - select extra local folders, open
   the stopped set's editor, and add them without resetting its upload catalog.
   Existing sources cannot be removed from this workflow, overlapping roots are

@@ -15,6 +15,7 @@ interface Info {
   quota: { maxSpace: number; usedSpace: number; driveUsed: number } | null;
   productUsed: Record<string, number>;
   uploads: UploadsCfg;
+  mirrorSafety: MirrorSafetyCfg;
 }
 interface UploadsCfg {
   concurrency: number;
@@ -24,6 +25,12 @@ interface UploadsCfg {
   canShape: boolean;
   /** Why it can't, when it can't — shown in the UI. */
   shapeReason: string;
+}
+interface MirrorSafetyCfg {
+  /** Percentage gate only; missing sources and upload failures always block deletion. */
+  enabled: boolean;
+  /** Fraction in the range 0.01-0.99. */
+  deleteSafetyPct: number;
 }
 interface Updates {
   cli: { current: string; latest: string; updateAvailable: boolean };
@@ -67,6 +74,8 @@ export default function Settings() {
   const [updates, setUpdates] = useState<Updates | null>(null);
   const [checking, setChecking] = useState(false);
   const [uploads, setUploads] = useState<UploadsCfg | null>(null);
+  const [mirrorSafety, setMirrorSafety] = useState<MirrorSafetyCfg | null>(null);
+  const [mirrorSafetyError, setMirrorSafetyError] = useState<string | null>(null);
 
   const saveUploads = (patch: Partial<UploadsCfg>) => {
     setUploads((u) => (u ? { ...u, ...patch } : u));
@@ -80,6 +89,32 @@ export default function Settings() {
       .catch(() => {});
   };
 
+  const saveMirrorSafety = (patch: Partial<MirrorSafetyCfg>) => {
+    if (!mirrorSafety) return;
+    setMirrorSafety({ ...mirrorSafety, ...patch });
+    setMirrorSafetyError(null);
+    fetch('/api/settings/mirror-safety', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    })
+      .then(async (response) => {
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || 'Could not save Mirror safety settings.');
+        return body as MirrorSafetyCfg;
+      })
+      .then(setMirrorSafety)
+      .catch((error) => {
+        setMirrorSafetyError(error instanceof Error ? error.message : 'Could not save Mirror safety settings.');
+        // Re-read the last persisted value. This also correctly rolls back an
+        // unsaved number-field edit, whose optimistic state is already rendered.
+        fetch('/api/settings/mirror-safety')
+          .then((response) => response.json())
+          .then(setMirrorSafety)
+          .catch(() => {});
+      });
+  };
+
   useEffect(() => setMounted(true), []);
 
   // Prefetch settings on mount so the first open renders at its full size instead
@@ -91,6 +126,7 @@ export default function Settings() {
       .then((d) => {
         setInfo(d);
         setUploads(d.uploads);
+        setMirrorSafety(d.mirrorSafety);
       })
       .catch(() => {});
   }, []);
@@ -136,6 +172,8 @@ export default function Settings() {
       .then((d) => {
         setInfo(d);
         setUploads(d.uploads);
+        setMirrorSafety(d.mirrorSafety);
+        setMirrorSafetyError(null);
       })
       .catch(() => {});
     checkUpdates();
@@ -298,6 +336,68 @@ export default function Settings() {
                   ) : (
                     <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
                       Unavailable — {uploads.shapeReason} See “Hardening” in the README.
+                    </p>
+                  )}
+                </div>
+              </Section>
+            )}
+
+            {/* Mirror deletion safety */}
+            {mirrorSafety && (
+              <Section title="Mirror safety">
+                <div className="py-1">
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="text-[color:var(--muted)]">Prevent large deletions</span>
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4"
+                      checked={mirrorSafety.enabled}
+                      onChange={(e) => saveMirrorSafety({ enabled: e.target.checked })}
+                      aria-label="Enable large Mirror deletion protection"
+                    />
+                  </div>
+
+                  {mirrorSafety.enabled ? (
+                    <div className="mt-2 flex items-center justify-between gap-3 text-sm">
+                      <span className="text-[color:var(--muted)]">Maximum catalog deletion</span>
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={1}
+                          max={99}
+                          step={1}
+                          value={Math.round(mirrorSafety.deleteSafetyPct * 100)}
+                          onChange={(e) => {
+                            const percentage = Math.min(99, Math.max(1, Math.round(+e.target.value) || 1));
+                            setMirrorSafety((current) =>
+                              current ? { ...current, deleteSafetyPct: percentage / 100 } : current,
+                            );
+                          }}
+                          onBlur={(e) => {
+                            const percentage = Math.min(99, Math.max(1, Math.round(+e.target.value) || 1));
+                            saveMirrorSafety({ deleteSafetyPct: percentage / 100 });
+                          }}
+                          onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+                          className="w-20 rounded bg-white/[0.06] px-2 py-1 text-right text-sm tabular-nums outline-none focus:bg-white/[0.09]"
+                          aria-label="Maximum Mirror deletion percentage"
+                        />
+                        <span className="text-xs text-[color:var(--muted)]">%</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-2 text-[11px] leading-relaxed text-amber-400/80">
+                      The percentage guard is disabled. Intentional large Mirror deletions can proceed.
+                    </p>
+                  )}
+
+                  <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
+                    A Mirror run skips deletion when more than this share of its catalog disappears. The default is
+                    30%. Missing sources and failed uploads always block deletion. Changes apply to the next run and
+                    its preview.
+                  </p>
+                  {mirrorSafetyError && (
+                    <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--signal-danger)]">
+                      {mirrorSafetyError}
                     </p>
                   )}
                 </div>

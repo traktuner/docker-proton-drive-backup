@@ -4,6 +4,7 @@ import { createReadStream, promises as fsp } from 'node:fs';
 import { walkSourceStream, relToLocalRoot, LOCAL_ROOT, type WalkedFile } from './local';
 import { catalog, diffFile } from './catalog';
 import { getUploadConfig } from './upload-config';
+import { getMirrorSafetyConfig } from './mirror-safety';
 import {
   createFolder,
   upload,
@@ -21,10 +22,12 @@ import {
 const SESSION_EXPIRED_MSG =
   'Proton session expired — reconnect to Proton Drive to resume. Nothing was deleted and your backup set is unchanged.';
 
-/** A mirror run that would remove more than this fraction of the catalog skips the
- *  deletion pass and flags it, rather than trashing a huge swath in one go. Shared
- *  by the live run and the read-only preview so both agree on what's "too much". */
-const DELETE_SAFETY_PCT = 0.3;
+/** Snapshot the global percentage gate at the start of a run or preview. `null`
+ *  disables only this gate; missing-source and failed-upload gates stay active. */
+function configuredDeleteSafetyPct(): number | null {
+  const config = getMirrorSafetyConfig();
+  return config.enabled ? config.deleteSafetyPct : null;
+}
 
 /** Base backoff between the transient upload retries (exponential: base, 2×, 4×).
  *  Overridable via env so the test suite doesn't wait out real seconds. */
@@ -251,6 +254,9 @@ export async function runCatalogDelta(
   shouldCancel: () => boolean = () => false,
   opts: { skipThumbnails?: boolean; includeHidden?: boolean } = {},
 ): Promise<DeltaResult> {
+  // Keep one stable value for the whole run. Existing installations with no
+  // settings file resolve to the historical 30% default.
+  const DELETE_SAFETY_PCT = configuredDeleteSafetyPct();
   const { skipThumbnails = false, includeHidden = false } = opts;
   const target = normalizeProtonPath(targetPath);
   // Each source is laid out at "<target>/<subfolder>/<source rel to LOCAL_ROOT>",
@@ -684,8 +690,8 @@ export async function runCatalogDelta(
   //   (2) if ANY upload failed this run (a changed file that didn't make it to
   //       Drive keeps its old catalog timestamp and would look "stale"), skip
   //       deletion — we must not trash a present-but-failed file's Drive copy.
-  //   (3) if a run would remove more than DELETE_SAFETY_PCT of the catalog, skip
-  //       deletion and flag it rather than trash a huge swath in one go.
+  //   (3) if the configurable percentage gate is enabled and a run would remove
+  //       more than DELETE_SAFETY_PCT of the catalog, skip deletion and flag it.
   let deletionSkipped: string | null = null;
   if (mode === 'mirror' && !cancelled) {
     let sourcesIntact = true;
@@ -706,7 +712,7 @@ export async function runCatalogDelta(
       deletionSkipped = 'a source path is missing on disk (mount offline?)';
     } else if (failedCount > 0) {
       deletionSkipped = `${failedCount} file(s) failed to upload — "gone locally" can't be trusted until uploads succeed`;
-    } else if (pctGone > DELETE_SAFETY_PCT) {
+    } else if (DELETE_SAFETY_PCT !== null && pctGone > DELETE_SAFETY_PCT) {
       deletionSkipped = `${stale.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
     }
 
@@ -803,8 +809,9 @@ export interface PreviewResult {
  * new/changed/unchanged + bytes, and for mirror mode it reproduces the deletion
  * pass by checking which catalog entries no longer exist on disk (bounded memory —
  * it stats each entry instead of marking seen_at) and applies the same safety gates
- * (missing source mount, >30% wipe). Lets the user see exactly what a backup/mirror
- * would change — especially which Drive files a mirror would delete — before running.
+ * (missing source mount, configured percentage gate). Lets the user see exactly
+ * what a backup/mirror would change — especially which Drive files a mirror would
+ * delete — before running.
  */
 export async function previewDelta(
   setId: string,
@@ -815,6 +822,9 @@ export async function previewDelta(
   shouldCancel: () => boolean = () => false,
   includeHidden = false,
 ): Promise<PreviewResult> {
+  // Snapshot the same global value as a live run so the preview and execution
+  // agree even if the user changes Settings while this local walk is in progress.
+  const DELETE_SAFETY_PCT = configuredDeleteSafetyPct();
   const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
   const managedRoots = new Set([subfolder]);
   const matchExclude = makeExcluder(excludes);
@@ -897,7 +907,7 @@ export async function previewDelta(
     const pctGone = totalEntries > 0 ? missing.length / totalEntries : 0;
     if (!sourcesIntact) {
       deletionWouldSkip = 'a source path is missing on disk (mount offline?)';
-    } else if (pctGone > DELETE_SAFETY_PCT) {
+    } else if (DELETE_SAFETY_PCT !== null && pctGone > DELETE_SAFETY_PCT) {
       deletionWouldSkip = `${missing.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
     }
   }

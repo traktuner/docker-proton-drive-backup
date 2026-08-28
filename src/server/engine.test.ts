@@ -28,6 +28,7 @@ import * as cli from '@/server/cli';
 import { catalog } from '@/server/catalog';
 import { LOCAL_ROOT } from '@/server/local';
 import { getDb } from '@/server/db';
+import { setMirrorSafetyConfig } from '@/server/mirror-safety';
 
 const upload = vi.mocked(cli.upload);
 const createFolder = vi.mocked(cli.createFolder);
@@ -50,6 +51,8 @@ beforeEach(() => {
   upload.mockClear();
   createFolder.mockClear();
   trashDrive.mockClear();
+  // Every test starts with the historical behavior used by existing installs.
+  setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.3 });
   // Reset to the default happy-path implementations (tests may override).
   upload.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
   createFolder.mockResolvedValue({ ok: true, data: {} } as any);
@@ -246,7 +249,7 @@ describe('runCatalogDelta — mirror deletion + safety gates', () => {
     expect(catalog.getFile('m1set', 'Set/m1/f3.txt')).toBeUndefined();
   });
 
-  it('safety gate: skips deletion entirely when a source path is missing on disk', async () => {
+  it('hard safety gate: skips deletion when a source is missing even if the percentage gate is disabled', async () => {
     const srcDir = path.join(LOCAL_ROOT, 'm2');
     for (let i = 0; i < 10; i++) await writeFixture(`m2/f${i}.txt`, `data-${i}`);
 
@@ -256,6 +259,7 @@ describe('runCatalogDelta — mirror deletion + safety gates', () => {
     // Remove the ENTIRE source directory: every file is now "stale", but because the
     // configured source path itself is gone, the engine must NOT trash anything.
     await fsp.rm(srcDir, { recursive: true, force: true });
+    setMirrorSafetyConfig({ enabled: false });
 
     const res = await runCatalogDelta('m2set', [srcDir], '/', 'Set', 'mirror');
 
@@ -292,6 +296,44 @@ describe('runCatalogDelta — mirror deletion + safety gates', () => {
     expect(res.message).toMatch(/would be removed|>30%/);
     // Surviving + removed catalog entries are all still present (nothing trashed).
     expect(catalog.getFile('m3set', 'Set/m3/f0.txt')).toBeDefined();
+  });
+
+  it('uses a custom global threshold for the live Mirror deletion pass', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'm-custom');
+    for (let i = 0; i < 5; i++) await writeFixture(`m-custom/f${i}.txt`, `data-${i}`);
+    await seed('m-custom-set', srcDir);
+    trashDrive.mockClear();
+
+    // Three missing file rows exceed the historical 30% threshold. Raising the
+    // global threshold to 80% must permit this intentional deletion.
+    await fsp.rm(path.join(srcDir, 'f0.txt'));
+    await fsp.rm(path.join(srcDir, 'f1.txt'));
+    await fsp.rm(path.join(srcDir, 'f2.txt'));
+    setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.8 });
+
+    const res = await runCatalogDelta('m-custom-set', [srcDir], '/', 'Set', 'mirror');
+
+    expect(res.ok).toBe(true);
+    expect(res.deletedCount).toBe(3);
+    expect(trashDrive).toHaveBeenCalledTimes(3);
+    expect(res.message).toContain('3 removed');
+  });
+
+  it('can disable only the percentage gate for an intentional full Mirror deletion', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'm-disabled');
+    for (let i = 0; i < 5; i++) await writeFixture(`m-disabled/f${i}.txt`, `data-${i}`);
+    await seed('m-disabled-set', srcDir);
+    trashDrive.mockClear();
+
+    for (let i = 0; i < 5; i++) await fsp.rm(path.join(srcDir, `f${i}.txt`));
+    setMirrorSafetyConfig({ enabled: false });
+
+    const res = await runCatalogDelta('m-disabled-set', [srcDir], '/', 'Set', 'mirror');
+
+    expect(res.ok).toBe(true);
+    expect(res.deletedCount).toBeGreaterThan(0);
+    expect(trashDrive).toHaveBeenCalled();
+    expect(catalog.count('m-disabled-set')).toBe(0);
   });
 
   it('backup mode never trashes, even when a file vanished locally', async () => {
@@ -440,6 +482,29 @@ describe('previewDelta (dry run — read-only)', () => {
     expect(p.deletionWouldSkip).toMatch(/source path is missing/i);
   });
 
+  it('mirror: uses the same custom or disabled percentage gate as a live run', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pv-safety');
+    for (let i = 0; i < 5; i++) await writeFixture(`pv-safety/f${i}.txt`, `data-${i}`);
+    await runCatalogDelta('pv-safety-set', [srcDir], '/', 'Set', 'mirror');
+    await fsp.rm(path.join(srcDir, 'f0.txt'));
+    await fsp.rm(path.join(srcDir, 'f1.txt'));
+    await fsp.rm(path.join(srcDir, 'f2.txt'));
+
+    setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.2 });
+    const blocked = await previewDelta('pv-safety-set', [srcDir], 'Set', 'mirror');
+    expect(blocked.deletionWouldSkip).toMatch(/>20%/);
+
+    setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.8 });
+    const allowed = await previewDelta('pv-safety-set', [srcDir], 'Set', 'mirror');
+    expect(allowed.deletionWouldSkip).toBeNull();
+    expect(allowed.wouldDeleteCount).toBe(3);
+
+    setMirrorSafetyConfig({ enabled: false });
+    const disabled = await previewDelta('pv-safety-set', [srcDir], 'Set', 'mirror');
+    expect(disabled.deletionWouldSkip).toBeNull();
+    expect(trashDrive).not.toHaveBeenCalled();
+  });
+
   it('backup mode never reports deletions', async () => {
     const srcDir = path.join(LOCAL_ROOT, 'pv5');
     await writeFixture('pv5/a.txt', 'aaa');
@@ -539,11 +604,13 @@ describe('runCatalogDelta — per-file failure isolation (issue #22)', () => {
       if (absList.some((p) => p.endsWith('f0.txt'))) return { code: 1, stdout: '', stderr: 'boom' };
       return { code: 0, stdout: '', stderr: '' };
     });
+    setMirrorSafetyConfig({ enabled: false });
 
     const res = await runCatalogDelta('iso3set', [srcDir], '/', 'Set', 'mirror');
 
     expect(res.failedCount).toBe(1);
-    // Safety gate #2 (an upload failed) → deletion skipped, nothing trashed.
+    // Hard safety gate #2 (an upload failed) remains active when the percentage
+    // gate is disabled → deletion is skipped and nothing is trashed.
     expect(trashDrive).not.toHaveBeenCalled();
     expect(res.deletedCount).toBe(0);
     expect(res.message).toMatch(/failed to upload|deletion skipped/i);

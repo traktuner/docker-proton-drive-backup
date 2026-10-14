@@ -37,12 +37,37 @@ services:
       #     via Proton Drive web.)
       - ./sources:/sources:ro
       #
-      #     MULTIPLE SOURCES: mount each share UNDER /sources as its own subfolder.
-      #     They then show up as top-level folders in the left pane, and backup-set
-      #     source paths are relative to /sources (e.g. "/movies/...").
-      # - /mnt/nas/movies:/sources/movies:ro
-      # - /mnt/nas/photos:/sources/photos:ro
-      # - /mnt/nas/documents:/sources/documents:ro
+      #     MULTIPLE SOURCES: DO NOT simply add mounts at /sources/<sub> while the
+      #     `./sources:/sources:ro` line above stays active. runc creates each
+      #     nested mount's mountpoint INSIDE its parent mount; if that subdirectory
+      #     doesn't already exist on the host, a read-only parent makes container
+      #     start fail with:
+      #       "error mounting ... to rootfs at "/sources/x":
+      #        make mountpoint "/sources/x": ... read-only file system"
+      #     (That is issue #72.) A third workaround exists — pre-creating the
+      #     empty subdirectories on the host and keeping :ro — but it silently
+      #     breaks again when you add the next share, so prefer one of the two
+      #     layouts below:
+      #
+      #     (a) Keep the parent, but mount it READ-WRITE. Only the NESTED mounts
+      #         hold your real data, and they stay :ro. Trade-offs vs. (b): the
+      #         parent directory itself is writable from inside the container,
+      #         and runc leaves the created mountpoint subdirectories behind in
+      #         the host parent:
+      #       - ./sources:/sources:rw
+      #       - /mnt/nas/movies:/sources/movies:ro
+      #       - /mnt/nas/photos:/sources/photos:ro
+      #
+      #     (b) Drop the parent mount entirely. Each share mounts directly under
+      #         /sources; nothing else is writable or visible at all:
+      #       - /mnt/nas/movies:/sources/movies:ro
+      #       - /mnt/nas/photos:/sources/photos:ro
+      #       - /mnt/nas/documents:/sources/documents:ro
+      #
+      #     In both layouts the shares show up as top-level folders in the left
+      #     pane, and backup-set source paths are relative to /sources
+      #     (e.g. "/movies/..."). Both are exercised by the deployment smoke
+      #     matrix (test/deployment/smoke.sh).
 
       # (3) /config — OPTIONAL, declarative job deploy (Ansible/GitOps). Drop a
       #     "backup-sets.yaml" (or .yml / .json) here and the container auto-imports

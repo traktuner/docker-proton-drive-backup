@@ -90,9 +90,35 @@ services:
     restart: unless-stopped
 ```
 
-Mount each share you want to back up as its own subfolder under `/sources`
-(e.g. `- /mnt/nas/photos:/sources/photos:ro`); they show up as top-level folders
-in the left pane.
+Multiple sources need care: `runc` creates each nested mount's mountpoint
+*inside* its parent mount. If the corresponding subdirectory does not already
+exist on the host, a read-only parent makes container start fail with
+`make mountpoint "/sources/...": read-only file system`
+([#72](https://github.com/traktuner/docker-proton-drive-backup/issues/72)).
+Do **not** just add nested `- /mnt/share:/sources/share:ro` lines while
+`- ./sources:/sources:ro` stays active. Use one of these layouts instead:
+
+```yaml
+    volumes:
+      # (a) parent mounted read-write; the nested real-data mounts stay :ro.
+      #     NOTE: the parent directory itself is then writable from inside the
+      #     container (your data in the nested mounts is not), and runc leaves
+      #     the created mountpoint directories behind on the host.
+      - ./sources:/sources:rw
+      - /mnt/nas/photos:/sources/photos:ro
+      - /mnt/nas/documents:/sources/documents:ro
+```
+
+```yaml
+    volumes:
+      # (b) no parent mount at all — each share mounts directly into the
+      #     image's /sources directory. Nothing else is writable or visible.
+      - /mnt/nas/photos:/sources/photos:ro
+      - /mnt/nas/documents:/sources/documents:ro
+```
+
+Mounted shares show up as top-level folders in the left pane; backup-set source
+paths are relative to `/sources` (e.g. `/photos/...`).
 
 ## Supported architectures
 

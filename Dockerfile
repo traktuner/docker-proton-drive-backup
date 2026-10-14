@@ -100,6 +100,12 @@ ENV NODE_ENV=production \
 # Only /data is a managed volume. /sources is always supplied by the operator as
 # (read-only) bind mounts; declaring it VOLUME would spawn a stray writable
 # anonymous volume at the /sources root on every run.
+# Bake an empty /sources dir so the directory always exists even when the operator
+# only mounts NESTED per-share paths (e.g. /mnt/nas/photos:/sources/photos:ro)
+# with no parent bind at /sources — the same layered mount layout documented for
+# issue #72. (runc creates missing mountpoint dirs itself; this bake just makes
+# /sources predictably present and empty rather than relying on that.)
+RUN mkdir -p /sources
 VOLUME ["/data"]
 EXPOSE 3000
 

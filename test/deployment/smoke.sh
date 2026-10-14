@@ -208,7 +208,7 @@ run_mode "net-admin"          "--cap-add NET_ADMIN" 0 "" "true"
 # (a) parent mounted read-write (runc creates mountpoints inside it), nested shares stay :ro.
 run_nested_mode "nested-rw-parent"         ""                                                         1
 # (a) + read-only root fs + non-root user.
-run_nested_mode "nested-rw-parent-ro"     "--read-only --tmpfs /tmp --tmpfs /app/.next/cache"        1 1
+run_nested_mode "nested-rw-parent-ro"     "--read-only --tmpfs /tmp --tmpfs /app/.next/cache --user ${NONROOT_UID}:${NONROOT_GID}"  1 1
 # (b) no parent mount at all — relies on the baked-in /sources dir from the image.
 run_nested_mode "nested-no-parent"        ""                                                         0
 # (b) + PUID/PGID privilege drop (a realistic hardened pairing).

@@ -97,10 +97,44 @@ describe('advertised deployment modes are covered by the smoke matrix', () => {
     const readme = read('README.md');
     expect(readme).toMatch(/#72/);
     expect(readme).toMatch(/make mountpoint/);
-    // README shows BOTH safe layouts as SEPARATE blocks (one block per layout,
-    // so a paste can't produce duplicate mount targets).
+    // README shows BOTH safe layouts — layout (a) explicitly, and layout (b) as
+    // its own yaml block whose mount lines ALL target /sources/<sub> and NONE
+    // targets the parent /sources itself.
     expect(readme).toMatch(/\/sources:rw/);
-    expect(readme.match(/```yaml/g)?.length, 'README must show two separate yaml blocks').toBeGreaterThanOrEqual(2);
+    const yamlBlocks = readme.match(/```yaml[\s\S]*?```/g) ?? [];
+    const noParentBlock = yamlBlocks.some((block) => {
+      // Mount lines only; drop the fences and skip comments/other lines.
+      const mounts = block
+        .split('\n')
+        .map((l) => l.replace(/#.*$/, '').trim())
+        .filter((l) => /^-\s+/.test(l));
+      return (
+        mounts.length > 0 &&
+        mounts.every((l) => /:\/sources\//.test(l))
+      );
+    });
+    expect(
+      noParentBlock,
+      'README must contain a yaml block showing layout (b): nested mounts only, no parent bind at /sources',
+    ).toBe(true);
+  });
+
+  it('the ACTIVE compose volumes never pair a read-only /sources parent with nested mounts', () => {
+    // The default compose guidance ships `- ./sources:/sources:ro` plus the
+    // commented multi-source examples. This guards docker-compose.yml itself
+    // against the exact broken setup from issue #72: an ACTIVE (uncommented)
+    // nested mount under /sources while the :ro parent stays active.
+    const activeVolumeLines = compose
+      .split('\n')
+      // strip comments, keep real volume entries
+      .map((l) => l.replace(/#.*$/, '').trim())
+      .filter((l) => /^-\s+\S+:\/sources/.test(l));
+    const hasRoParent = activeVolumeLines.some((l) => /:\/sources:ro\s*$/.test(l));
+    const hasNested = activeVolumeLines.some((l) => /:\/sources\//.test(l));
+    expect(
+      !(hasRoParent && hasNested),
+      'compose must not activate a read-only /sources parent together with nested mounts (issue #72)',
+    ).toBe(true);
   });
 
   it('nested mount modes never combine a read-only parent with nested mounts', () => {

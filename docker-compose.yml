@@ -31,10 +31,12 @@ services:
       - ./data:/data
 
       # (2) /sources — the folders you want to BACK UP. They appear in the left
-      #     "Local files" pane. Mount READ-ONLY (:ro): the tool only ever READS
-      #     sources, so :ro guarantees it can never modify or delete your data.
-      #     (:rw is not needed — there is no restore-to-source feature; restore
-      #     via Proton Drive web.)
+      #     "Local files" pane. The default below mounts ONE local folder
+      #     READ-ONLY (:ro): the tool only ever READS sources, so :ro guarantees
+      #     it can never modify or delete your data. (:rw is not needed for the
+      #     simple one-source case — there is no restore-to-source feature;
+      #     restore via Proton Drive web. For MULTIPLE sources see the layouts
+      #     further down, where (a) intentionally mounts the parent :rw.)
       - ./sources:/sources:ro
       #
       #     MULTIPLE SOURCES: DO NOT simply add mounts at /sources/<sub> while the

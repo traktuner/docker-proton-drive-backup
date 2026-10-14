@@ -60,6 +60,13 @@ trap cleanup EXIT
 # The ADVERTISED deployment matrix.  Fields: name | extra `docker run` args | nonroot
 # Keep every mode advertised in docker-compose.yml represented here — the
 # consistency vitest test (test/deployment/consistency.test.ts) enforces that link.
+#
+# Overrides a caller may set for ONE invocation (env-prefix style):
+#   SOURCES_MOUNTS        — replaces the default `-v <dir>:/sources:ro` flags
+#                           (run_nested_mode uses this for per-share mounts).
+#   EXPECT_SOURCE_ENTRIES — space-separated share names; each must list its
+#                           sample-<share>.txt via GET /api/local/list (proves
+#                           the mounted shares are genuinely readable).
 # ---------------------------------------------------------------------------
 run_mode() {
   local name="$1" extra="$2" nonroot="${3:-0}" expect_uid="${4:-}" expect_canshape="${5:-}"
@@ -84,7 +91,7 @@ run_mode() {
   docker rm -f "$ctr" >/dev/null 2>&1 || true
   # shellcheck disable=SC2086
   docker run -d --name "$ctr" $extra \
-    -v "$ddir:/data" -v "$sdir:/sources:ro" \
+    -v "$ddir:/data" ${SOURCES_MOUNTS:--v "$sdir:/sources:ro"} \
     -p "$HOST_PORT:3000" "$IMAGE" >/dev/null
   CURRENT_CTR="$ctr"
 
@@ -132,9 +139,55 @@ run_mode() {
       || { docker logs "$ctr" >&2 || true; fail "$name: /api/settings/uploads canShape='$cs', expected '$expect_canshape'"; }
   fi
 
-  green "$name — started, initialised (/api/backup-sets 200), no read-only errors${expect_uid:+, dropped to uid $expect_uid}${expect_canshape:+, canShape=$expect_canshape}"
+  # (6) Nested sources (issue #72): when shares are mounted at /sources/<share>
+  # INSTEAD OF a single dir at /sources, the app must list them as top-level
+  # folders in the left pane. runc creates each nested mount's mountpoint inside
+  # its parent, so a read-only parent fails container start outright — the exact
+  # error from issue #72. These modes therefore boot ONLY with the two safe
+  # layouts (read-write parent, or no parent mount at all).
+  # We list EACH share's CONTENTS (not just the mountpoint name, which appears
+  # regardless) and require the sample file inside it, proving the mounted share
+  # is genuinely readable through the app.
+  if [ -n "${EXPECT_SOURCE_ENTRIES:-}" ]; then
+    local e listing
+    for e in $EXPECT_SOURCE_ENTRIES; do
+      listing="$(curl -fsS "$base/api/local/list?path=%2F$e" 2>/dev/null)" \
+        || { docker logs "$ctr" >&2 || true; fail "$name: GET /api/local/list/$e failed"; }
+      echo "$listing" | grep -q "\"name\":\"sample-$e.txt\"" \
+        || { echo "listing: $listing" >&2; docker logs "$ctr" >&2 || true; \
+             fail "$name: /sources/$e did not list sample-$e.txt (mounted share not visible)"; }
+    done
+  fi
+
+  green "$name — started, initialised (/api/backup-sets 200), no read-only errors${expect_uid:+, dropped to uid $expect_uid}${expect_canshape:+, canShape=$expect_canshape}${EXPECT_SOURCE_ENTRIES:+, nested shares visible}"
   docker rm -f "$ctr" >/dev/null 2>&1 || true
   CURRENT_CTR=""
+}
+
+# Boots the container with shares mounted UNDER /sources (nested) instead of one
+# dir mounted AT /sources, then asserts the shares are visible via /api/local/list.
+#   mount_parent_rw=1 — layout (a): an empty dir is bind-mounted READ-WRITE at
+#     /sources (runc then has a writable place to create the nested mountpoints);
+#     the nested real-data mounts stay :ro.
+#   mount_parent_rw=0 — layout (b): NOTHING is mounted at /sources. The baked-in
+#     empty /sources dir from the image is used, proving per-share mounts work
+#     without any parent bind at all.
+# A read-only parent is deliberately NOT exercised: runc rejects it at container
+# creation with "make mountpoint ... read-only file system" (issue #72).
+run_nested_mode() {
+  local name="$1" extra="$2" mount_parent_rw="$3" nonroot="${4:-0}" expect_uid="${5:-}"
+  local pdir="$WORK/$name/parent" shr1="$WORK/$name/share-one" shr2="$WORK/$name/share-two"
+
+  mkdir -p "$pdir" "$shr1" "$shr2"
+  printf 'nested share one\n' > "$shr1/sample-share-one.txt"
+  printf 'nested share two\n' > "$shr2/sample-share-two.txt"
+
+  local parent_flags=""
+  [ "$mount_parent_rw" = "1" ] && parent_flags="-v $pdir:/sources:rw"
+
+  SOURCES_MOUNTS="$parent_flags -v $shr1:/sources/share-one:ro -v $shr2:/sources/share-two:ro" \
+  EXPECT_SOURCE_ENTRIES="share-one share-two" \
+  run_mode "$name" "$extra" "$nonroot" "$expect_uid"
 }
 
 blue "Deployment smoke matrix against $IMAGE"
@@ -148,4 +201,16 @@ run_mode "puid-pgid"          "-e PUID=${NONROOT_UID} -e PGID=${NONROOT_GID}" 0 
 # Speed-limit opt-in: NET_ADMIN must flip canShape true (tc/iproute2 present + cap).
 run_mode "net-admin"          "--cap-add NET_ADMIN" 0 "" "true"
 
+# Nested sources (issue #72): the two safe layouts for mounting per-share dirs
+# under /sources — each also combined with the hardened flags a user would
+# realistically pair them with (read-only rootfs + non-root; PUID/PGID drop).
+# run_nested_mode <name> <extra> <1=rw-parent | 0=no-parent> [nonroot [uid]]
+# (a) parent mounted read-write (runc creates mountpoints inside it), nested shares stay :ro.
+run_nested_mode "nested-rw-parent"         ""                                                         1
+# (a) + read-only root fs + non-root user.
+run_nested_mode "nested-rw-parent-ro"     "--read-only --tmpfs /tmp --tmpfs /app/.next/cache --user ${NONROOT_UID}:${NONROOT_GID}"  1 1
+# (b) no parent mount at all — relies on the baked-in /sources dir from the image.
+run_nested_mode "nested-no-parent"        ""                                                         0
+# (b) + PUID/PGID privilege drop (a realistic hardened pairing).
+run_nested_mode "nested-no-parent-puid"  "-e PUID=${NONROOT_UID} -e PGID=${NONROOT_GID}"            0 0 "${NONROOT_UID}"
 printf '\n\033[1;32mAll deployment smoke modes passed.\033[0m\n'

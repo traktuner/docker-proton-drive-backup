@@ -212,10 +212,43 @@ still sign in interactively once. See the volume `(3)` comment in
 | `PROTON_DRIVE_CREDENTIALS_STORE` | `unsafe_file` | File-based secret store (required in Docker; CLI 0.6.0+) |
 | `PROTON_DRIVE_LOG_LEVEL` | `ERROR` | CLI log verbosity |
 | `HOME` | `/data/proton` | HOME for the app + CLI, kept on the writable `/data` volume so a read-only root and a non-root user both work |
+| `BUN_JSC_forceRAMSize` | `536870912` (512 MiB) | Memory the CLI's runtime sizes its heap for, in bytes — see [Memory](#memory) |
 | `GITHUB_REPO` | `traktuner/docker-proton-drive-backup` | Repo for the in-app update check |
 
 The CLI version is pinned via the `PROTON_CLI_VERSION` build arg in the Dockerfile
 and bumped automatically (see "Notable changes").
+
+## Memory
+
+The container is two kinds of process: one Node.js server (the UI, scheduler and
+delta engine) and, while a backup runs, up to **Settings → Uploads → parallel
+uploads** copies of the `proton-drive` CLI, one per upload batch. The CLI is a
+[Bun](https://bun.com)-compiled executable, and its JavaScriptCore runtime sizes
+its garbage-collected heap from the memory it sees as *available* — which inside a
+container is the cgroup limit. Left alone, every CLI process treats a 16 GiB
+`mem_limit` as 16 GiB of headroom and collects lazily, so raising the limit after
+an OOM kill mainly raises how much garbage accumulates before the next one.
+
+The image therefore tells the CLI to size its heap for 512 MiB per process
+(`BUN_JSC_forceRAMSize`, bytes). That is a sizing hint, not a hard cap: a process
+that genuinely needs more still gets it, it just collects garbage sooner. Baseline
+is about 80 MiB per CLI process. Rough budget: ~300 MiB for the server plus
+~0.5–1 GiB per parallel upload.
+
+Levers, in order of effect:
+
+- **Fewer parallel uploads** (Settings → Uploads). Each is a full CLI process.
+- **Skip thumbnails** per backup set. Thumbnail generation decodes every image
+  in the CLI process; large photos and videos are the biggest transient spikes.
+- **A sensible `mem_limit`** sized to the budget above, instead of growing it after
+  each kill.
+- `BUN_JSC_forceRAMSize` — lower it (e.g. `268435456` for 256 MiB) on small hosts;
+  raise it only if uploads visibly slow down from GC churn. Must be a positive
+  integer in bytes; a malformed value is ignored with a warning.
+
+The first run of a set (the recursive seed) and interrupted runs are resumable:
+the catalog is recorded per uploaded subtree, so a kill mid-seed costs only the
+subtree in flight, and the next run continues per file.
 
 ## Hardening
 
@@ -361,6 +394,15 @@ Dockerfile · docker-compose.yml · docker-entrypoint.sh
 Newest first. Image tags follow the bundled `proton-drive` CLI version
 (`<cliVersion>-<revision>`); these are app-level highlights, not per-tag notes.
 
+- **Bounded memory** - the CLI's Bun runtime is told to size its heap for 512 MiB
+  per process instead of the whole container limit (`BUN_JSC_forceRAMSize`); the
+  first-run seed uploads one top-level subtree per CLI process and records the
+  catalog after each, so an OOM kill or restart mid-seed resumes instead of
+  restarting; pending upload batches and captured CLI output are capped in the
+  server. See [Memory](#memory). Also at scale: the mirror deletion pass and
+  dry-run compute the top-most stale entries in linear time (was quadratic), and
+  folders with tens of thousands of direct files upload in argv-sized chunks
+  instead of failing the run with `E2BIG`.
 - **Configurable Mirror deletion threshold** - the global 30% safety gate can be
   changed or disabled in Settings, while missing-source and upload-failure gates
   remain mandatory (issue #56).
@@ -390,6 +432,10 @@ Newest first. Image tags follow the bundled `proton-drive` CLI version
   by `PROTON_DRIVE_CREDENTIALS_STORE` with values `keychain` (default) /
   `unsafe_file` / `pass`.)
 - **Left pane empty** - mount your folders into `/sources`.
+- **Container OOM-killed during a backup** - find out *which* process the kernel
+  killed with `journalctl -k | grep -iE 'killed process|oom'` on the host: `node` is
+  the server, `proton-drive` an upload worker. See [Memory](#memory) — usually the
+  fix is fewer parallel uploads and/or skipping thumbnails, not a bigger limit.
 - **Check the CLI works:** `docker exec -it proton-drive-backup proton-drive version`
 
 ## License

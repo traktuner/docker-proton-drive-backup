@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   normalizeProtonPath,
   looksUnauthenticated,
@@ -252,6 +252,47 @@ describe('cliEnv – HOME & secret store (issue #19 / non-root)', () => {
     withCredsStore('keychain', () => {
       expect(cliEnv().PROTON_DRIVE_CREDENTIALS_STORE).toBe('keychain');
     });
+  });
+});
+
+// The proton-drive binary is a Bun (JavaScriptCore) executable. JSC sizes its heap
+// from the memory it sees as available — the container's cgroup limit — so without a
+// hint every concurrent upload process treats the whole limit as headroom (the OOM
+// kill loop at 8 → 16 GiB). cliEnv must always hand the CLI a sane BUN_JSC_forceRAMSize
+// and must never forward a malformed one (Bun aborts with "invalid JSC environment
+// variable" on a non-integer, which would take down every CLI call).
+describe('cliEnv – BUN_JSC_forceRAMSize memory hint for the Bun-based CLI', () => {
+  const withHint = (value: string | undefined, fn: () => void) => {
+    const saved = process.env.BUN_JSC_forceRAMSize;
+    try {
+      if (value === undefined) delete process.env.BUN_JSC_forceRAMSize;
+      else process.env.BUN_JSC_forceRAMSize = value;
+      fn();
+    } finally {
+      if (saved === undefined) delete process.env.BUN_JSC_forceRAMSize;
+      else process.env.BUN_JSC_forceRAMSize = saved;
+    }
+  };
+  const DEFAULT = String(512 * 1024 * 1024);
+
+  it('defaults to 512 MiB (bytes) when the operator sets nothing', () => {
+    withHint(undefined, () => expect(cliEnv().BUN_JSC_forceRAMSize).toBe(DEFAULT));
+    withHint('', () => expect(cliEnv().BUN_JSC_forceRAMSize).toBe(DEFAULT));
+  });
+
+  it('honours an operator-supplied positive integer', () => {
+    withHint('268435456', () => expect(cliEnv().BUN_JSC_forceRAMSize).toBe('268435456'));
+  });
+
+  it('replaces a malformed value with the default instead of forwarding it', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      withHint('512m', () => expect(cliEnv().BUN_JSC_forceRAMSize).toBe(DEFAULT));
+      withHint('0', () => expect(cliEnv().BUN_JSC_forceRAMSize).toBe(DEFAULT));
+      withHint('-1', () => expect(cliEnv().BUN_JSC_forceRAMSize).toBe(DEFAULT));
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

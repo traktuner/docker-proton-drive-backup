@@ -33,9 +33,40 @@ if (process.env.PROTON_DRIVE_UNSAFE_SECRETS !== undefined && !('PROTON_DRIVE_CRE
   );
 }
 
+/**
+ * Memory hint for the CLI's runtime. The proton-drive binary is a Bun (JavaScriptCore)
+ * compiled executable. JSC sizes its heap from the memory it believes is AVAILABLE —
+ * the container's cgroup limit — and only collects aggressively near ~80% of that.
+ * So with a 16 GiB limit EVERY concurrent upload process feels entitled to several
+ * GiB of garbage before it bothers to collect, and raising the limit just raises the
+ * appetite (OOM kills at 8 GiB, then again at 16 GiB). BUN_JSC_forceRAMSize (bytes)
+ * tells JSC to size its heap as if only that much RAM existed, so the GC keeps each
+ * process small. It is a sizing heuristic, NOT a hard cap: a process that truly needs
+ * more still gets it. Default 512 MiB per CLI process (baseline RSS is ~80 MiB);
+ * operators may override via the same env var. Bun aborts with "invalid JSC
+ * environment variable" on a non-integer, so a malformed override is replaced by
+ * the default (with a warning) rather than taking every CLI call down with it.
+ */
+export const CLI_RAM_HINT_DEFAULT_BYTES = 512 * 1024 * 1024;
+let warnedBadRamHint = false;
+export function cliRamHint(): string {
+  const v = process.env.BUN_JSC_forceRAMSize;
+  if (v === undefined || v === '') return String(CLI_RAM_HINT_DEFAULT_BYTES);
+  if (/^\d+$/.test(v) && Number(v) > 0) return v;
+  if (!warnedBadRamHint) {
+    warnedBadRamHint = true;
+    console.warn(
+      `[proton-drive] BUN_JSC_forceRAMSize=${JSON.stringify(v)} is not a positive integer (bytes); ` +
+        `using the default ${CLI_RAM_HINT_DEFAULT_BYTES}.`,
+    );
+  }
+  return String(CLI_RAM_HINT_DEFAULT_BYTES);
+}
+
 export function cliEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    BUN_JSC_forceRAMSize: cliRamHint(),
     // CLI 0.6.0 renamed/replaced PROTON_DRIVE_UNSAFE_SECRETS=1 with an explicit
     // store selector; "unsafe_file" is the file-based store (the only thing that
     // works headless in Docker, avoiding libsecret/D-Bus/machine-id). Default to
@@ -86,6 +117,15 @@ interface RunOpts {
    * promptly demotes the in-memory auth flag and the UI can prompt a reconnect.
    */
   skipAuthDetect?: boolean;
+  /**
+   * Keep at most this many bytes (the TAIL) of each captured stream. Unset = keep
+   * everything, which is right for JSON ops whose whole stdout is the result. Uploads
+   * set it: a verbose recursive upload emits one [metric] line PER FILE, and holding
+   * a million of those in two ever-growing strings is unbounded heap in the server
+   * for output that is only ever inspected for its error text (first 200 chars of
+   * the trimmed tail, auth/lock patterns — all of which the CLI prints last).
+   */
+  maxCapturedBytes?: number;
 }
 
 /** Run the CLI once and resolve when the process exits (with lock-retry). */
@@ -167,6 +207,13 @@ function spawnCli(
     opts.onSpawn?.(proc);
     let stdout = '';
     let stderr = '';
+    // Append with a bounded tail: once a stream exceeds 2× the cap, drop the oldest
+    // half (slicing at 2× keeps this O(n) overall instead of re-slicing per chunk).
+    const cap = opts.maxCapturedBytes;
+    const append = (buf: string, chunk: string): string => {
+      const next = buf + chunk;
+      return cap && next.length > cap * 2 ? next.slice(next.length - cap) : next;
+    };
 
     // timeoutMs <= 0 means no timeout (uploads of huge files can run for hours).
     const timer =
@@ -194,12 +241,12 @@ function spawnCli(
     };
     proc.stdout.on('data', (d) => {
       const s = d.toString();
-      stdout += s;
+      stdout = append(stdout, s);
       pump(s, true);
     });
     proc.stderr.on('data', (d) => {
       const s = d.toString();
-      stderr += s;
+      stderr = append(stderr, s);
       pump(s, false);
     });
     proc.on('error', (err) => {
@@ -767,6 +814,9 @@ export function buildUploadArgs(
   return args;
 }
 
+/** Tail of an upload's stdout/stderr kept in memory (see RunOpts.maxCapturedBytes). */
+export const UPLOAD_CAPTURE_BYTES = 256 * 1024;
+
 export async function upload(
   localPaths: string[],
   targetPath: string,
@@ -792,6 +842,9 @@ export async function upload(
   try {
     return await runCli(args, 0, {
       retryOnLock: true,
+      // Only the error tail of an upload's output is ever read — bound the capture
+      // so a verbose whole-tree upload can't grow the server heap per file.
+      maxCapturedBytes: UPLOAD_CAPTURE_BYTES,
       onSpawn: (p) => {
         proc = p;
         activeUploads.add(p);

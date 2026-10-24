@@ -618,3 +618,154 @@ describe('runCatalogDelta — per-file failure isolation (issue #22)', () => {
     expect(catalog.getFile('iso3set', 'Set/iso3/f1.txt')).toBeDefined();
   });
 });
+
+// Memory-bounding behaviour (the 8 → 16 GiB OOM-kill loop). Two things the engine
+// must do so one kill never becomes a daily kill:
+//  (1) the recursive seed records the catalog PER completed unit (one CLI process per
+//      top-level subtree), so a kill mid-seed leaves a non-empty catalog and the next
+//      run resumes per file instead of re-running the whole seed;
+//  (2) pending upload buckets are capped in TOTAL, so a tree of many small folders
+//      (none ever reaching CHUNK) can't hold every new file in memory until the walk ends.
+describe('runCatalogDelta — bounded memory (seed resumability + pending cap)', () => {
+  it('seed: one CLI process per top-level subtree, catalog recorded after each one', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'seedu');
+    await writeFixture('seedu/d1/a.txt', 'aaa');
+    await writeFixture('seedu/d2/b.txt', 'bbb');
+
+    // Fail the SECOND directory unit (whichever order readdir yields them in).
+    let dirUnits = 0;
+    upload.mockImplementation(async (absList: string[]) => {
+      if (absList.length === 1 && /[/\\]d[12]$/.test(absList[0])) {
+        dirUnits += 1;
+        if (dirUnits === 2) return { code: 1, stdout: '', stderr: 'boom' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    const first = await runCatalogDelta('seedu-set', [srcDir], '/', 'Set', 'backup');
+    expect(first.ok).toBe(false);
+    expect(first.message).toMatch(/Initial upload failed/);
+    // Each subtree was its own upload call (not one call with both children)…
+    expect(dirUnits).toBe(2);
+    // …and the one that completed is already in the catalog despite the failure.
+    const a = catalog.getFile('seedu-set', 'Set/seedu/d1/a.txt');
+    const b = catalog.getFile('seedu-set', 'Set/seedu/d2/b.txt');
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    expect(first.newCount).toBe(1);
+
+    // Next run: catalog is non-empty → per-file path, which uploads ONLY the
+    // subtree that was still missing — no second recursive seed of everything.
+    upload.mockClear();
+    upload.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
+    const second = await runCatalogDelta('seedu-set', [srcDir], '/', 'Set', 'backup');
+    expect(second.ok).toBe(true);
+    expect(second.newCount).toBe(1);
+    expect(second.unchangedCount).toBe(1);
+    expect(upload).toHaveBeenCalledTimes(1);
+    const uploadedAbs = upload.mock.calls[0][0];
+    expect(uploadedAbs).toHaveLength(1);
+    expect(uploadedAbs[0]).toMatch(a ? /d2[/\\]b\.txt$/ : /d1[/\\]a\.txt$/);
+  });
+
+  it('pending cap: flushes mid-walk once the total queued across buckets hits the cap', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'pcap');
+    // 3 folders × 2 files: no bucket ever reaches CHUNK (200), so without a total cap
+    // nothing would be flushed until the walk is over.
+    for (const d of ['x', 'y', 'z']) {
+      await writeFixture(`pcap/${d}/f1.txt`, 'a');
+      await writeFixture(`pcap/${d}/f2.txt`, 'b');
+    }
+    // Count how many files the walk had stat'ed when the FIRST upload started (the
+    // walk stats the source root once, then one stat per file; nothing else in the
+    // per-file path stats before the first flush).
+    const statSpy = vi.spyOn(fsp, 'stat');
+    let statsAtFirstUpload = -1;
+    upload.mockImplementation(async () => {
+      if (statsAtFirstUpload < 0) statsAtFirstUpload = statSpy.mock.calls.length;
+      return { code: 0, stdout: '', stderr: '' };
+    });
+
+    process.env.PDB_PENDING_CAP = '3';
+    try {
+      // excludes.length > 0 forces the per-file path (not the recursive seed).
+      const res = await runCatalogDelta('pcap-set', [srcDir], '/', 'Set', 'backup', ['__none__']);
+      expect(res.ok).toBe(true);
+      expect(res.newCount).toBe(6);
+    } finally {
+      delete process.env.PDB_PENDING_CAP;
+      statSpy.mockRestore();
+    }
+    // Flushed while the walk was still in progress (root + 3 files stat'ed), not only
+    // after all 6 files (root + 6 stats) were walked.
+    expect(statsAtFirstUpload).toBeGreaterThanOrEqual(1);
+    expect(statsAtFirstUpload).toBeLessThanOrEqual(4);
+    // Every file still made it into the catalog exactly once.
+    for (const d of ['x', 'y', 'z']) {
+      expect(catalog.getFile('pcap-set', `Set/pcap/${d}/f1.txt`)).toBeDefined();
+      expect(catalog.getFile('pcap-set', `Set/pcap/${d}/f2.txt`)).toBeDefined();
+    }
+  });
+});
+
+// Scale hazards found in the Oct 2026 review: the top-most computation of the mirror
+// deletion pass / dry-run was O(n²) over stale entries, and every direct child file of
+// a source folder went into ONE argv (E2BIG for folders with tens of thousands of files).
+describe('runCatalogDelta — scale: top-most deletion set and argv-sized file units', () => {
+  it('mirror: trashes a vanished folder ONCE (not each child) and drops all its catalog rows', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'tops');
+    for (let i = 0; i < 8; i++) await writeFixture(`tops/keep/f${i}.txt`, `k${i}`);
+    await writeFixture('tops/gone/a.txt', 'a');
+    await writeFixture('tops/gone/deep/b.txt', 'b');
+    await runCatalogDelta('tops-set', [srcDir], '/', 'Set', 'backup'); // seed
+    trashDrive.mockClear();
+
+    // 4 stale rows (gone, gone/a.txt, gone/deep, gone/deep/b.txt) of ~14 → under 30%.
+    await fsp.rm(path.join(srcDir, 'gone'), { recursive: true });
+    const res = await runCatalogDelta('tops-set', [srcDir], '/', 'Set', 'mirror');
+
+    expect(res.ok).toBe(true);
+    expect(trashDrive).toHaveBeenCalledTimes(1);
+    expect(trashDrive).toHaveBeenCalledWith('/my-files/Set/tops/gone');
+    expect(res.deletedCount).toBe(1);
+    expect(catalog.hasDir('tops-set', 'Set/tops/gone')).toBe(false);
+    expect(catalog.getFile('tops-set', 'Set/tops/gone/a.txt')).toBeUndefined();
+    expect(catalog.getFile('tops-set', 'Set/tops/gone/deep/b.txt')).toBeUndefined();
+    expect(catalog.getFile('tops-set', 'Set/tops/keep/f0.txt')).toBeDefined();
+
+    // The dry-run reports the same single top-most path.
+    await fsp.rm(path.join(srcDir, 'keep', 'f7.txt'));
+    const p = await previewDelta('tops-set', [srcDir], 'Set', 'mirror');
+    expect(p.wouldDelete).toEqual(['Set/tops/keep/f7.txt']);
+  });
+
+  it('topMost: O(n·depth) on a large stale set, same answer as the pairwise definition', async () => {
+    const { topMost } = await import('@/server/engine');
+    const entries: { rel: string }[] = [];
+    for (let d = 0; d < 200; d++) {
+      entries.push({ rel: `S/y/${d}` });
+      for (let f = 0; f < 50; f++) entries.push({ rel: `S/y/${d}/f${f}` });
+    }
+    entries.push({ rel: 'S/z/lonely.txt' }); // no ancestor in the set → top-most itself
+    const t0 = Date.now();
+    const tops = topMost(entries);
+    expect(Date.now() - t0).toBeLessThan(1000); // 10k entries; the O(n²) version took ~seconds+
+    expect(tops).toHaveLength(201);
+    expect(tops.map((e) => e.rel)).toContain('S/z/lonely.txt');
+    expect(tops.some((e) => e.rel.startsWith('S/y/0/'))).toBe(false);
+  });
+
+  it('seed: a folder with many direct files is uploaded in argv-sized chunks, all cataloged', async () => {
+    const srcDir = path.join(LOCAL_ROOT, 'flat');
+    const N = 1100; // > 2 × FILE_UNIT_CHUNK (500)
+    await fsp.mkdir(srcDir, { recursive: true });
+    await Promise.all(Array.from({ length: N }, (_, i) => fsp.writeFile(path.join(srcDir, `f${i}.txt`), 'x')));
+
+    const res = await runCatalogDelta('flat-set', [srcDir], '/', 'Set', 'backup');
+
+    expect(res.ok).toBe(true);
+    expect(res.newCount).toBe(N);
+    expect(upload).toHaveBeenCalledTimes(3); // 500 + 500 + 100
+    for (const call of upload.mock.calls) expect(call[0].length).toBeLessThanOrEqual(500);
+    expect(catalog.count('flat-set')).toBeGreaterThanOrEqual(N);
+  });
+});

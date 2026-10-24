@@ -90,6 +90,29 @@ function makeExcluder(patterns: string[]): (rel: string) => boolean {
   };
 }
 
+/** True if `rel` or any of its ancestor directories is in `set`. */
+function hasAncestorIn(rel: string, set: Set<string>, includeSelf: boolean): boolean {
+  if (includeSelf && set.has(rel)) return true;
+  let dir = path.dirname(rel);
+  while (dir && dir !== '.') {
+    if (set.has(dir)) return true;
+    dir = path.dirname(dir);
+  }
+  return false;
+}
+
+/**
+ * The top-most entries of a set of rel paths: those with no ancestor also in the
+ * set. Trashing a folder on Drive removes its children, so only these need a
+ * `trash` call. O(n × depth) via a Set of ancestors — the obvious pairwise
+ * `filter(some(startsWith))` is O(n²) and pins the server at 100% CPU for hours
+ * once a mirror run has ~10⁵ stale entries (a removed photo year, say).
+ */
+export function topMost<T extends { rel: string }>(entries: T[]): T[] {
+  const all = new Set(entries.map((e) => e.rel));
+  return entries.filter((e) => !hasAncestorIn(e.rel, all, false));
+}
+
 function sha1File(abs: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const h = createHash('sha1');
@@ -145,9 +168,30 @@ export function relBaseFor(subfolder: string, abs: string): string {
  * matches what the per-file engine/catalog records. Used by the fast first-run
  * seed and the lightweight 'add' mode. Returns the first failing CLI result, else
  * the last success.
+ *
+ * Work is split into UNITS, each its own CLI process: one per immediate child
+ * DIRECTORY of a directory source, plus one for all of that source's direct child
+ * files, plus one per destination folder for file sources. Two reasons, both about
+ * memory: a single process recursing a whole multi-TB tree holds that whole job's
+ * state in its own (Bun) heap for hours, and if it dies the caller has nothing to
+ * show for the completed part. `onUnitUploaded` fires after each unit's process
+ * exits 0 with the local roots it covered, so the seed can record the catalog
+ * incrementally — a kill mid-seed then costs only the unit in flight, not the
+ * whole tree (the next run finds a non-empty catalog and resumes per file).
  */
+export type UploadUnit = { abs: string; relBase: string };
+
+/**
+ * Max single-file paths handed to one CLI process as argv. Every direct child file
+ * of a source folder used to go into ONE argv; a folder with tens of thousands of
+ * files then fails at spawn with E2BIG (ARG_MAX is ~2 MiB on Linux, and a NAS path
+ * is easily 100+ bytes) and takes the whole run down. 500 keeps argv well under
+ * 100 KiB even for long paths while still amortising process start-up.
+ */
+const FILE_UNIT_CHUNK = 500;
+
 export async function uploadSourceTrees(
-  sources: { abs: string; relBase: string }[],
+  sources: UploadUnit[],
   target: string,
   fileStrategy: FileStrategy,
   folderStrategy: FolderStrategy,
@@ -155,6 +199,7 @@ export async function uploadSourceTrees(
   shouldCancel: () => boolean = () => false,
   skipThumbnails = false,
   includeHidden = false,
+  onUnitUploaded?: (roots: UploadUnit[]) => Promise<void>,
 ): Promise<RunResult> {
   // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
   const ensured = new Set<string>();
@@ -171,20 +216,37 @@ export async function uploadSourceTrees(
   };
 
   let last: RunResult = { code: 0, stdout: '', stderr: '' };
-  const run = async (absList: string[], parentDrive: string): Promise<boolean> => {
-    if (absList.length === 0) return true;
-    const res = await upload(absList, parentDrive, fileStrategy, folderStrategy, onUploadedFile, skipThumbnails);
-    if (res.code !== 0) {
-      last = res;
-      return false;
-    }
+  // Upload one unit (one CLI process). On success, report the roots it covered.
+  const runOne = async (roots: UploadUnit[], parentDrive: string): Promise<boolean> => {
+    if (roots.length === 0) return true;
+    const res = await upload(
+      roots.map((r) => r.abs),
+      parentDrive,
+      fileStrategy,
+      folderStrategy,
+      onUploadedFile,
+      skipThumbnails,
+    );
     last = res;
+    if (res.code !== 0) return false;
+    // A cancel that landed during the upload killed the process mid-unit (exit≠0),
+    // so reaching here means the unit completed — safe to record.
+    if (onUnitUploaded) await onUnitUploaded(roots);
+    return true;
+  };
+  // Single-file roots in argv-sized chunks (see FILE_UNIT_CHUNK); directory roots
+  // are always passed one at a time by the callers below.
+  const run = async (roots: UploadUnit[], parentDrive: string): Promise<boolean> => {
+    for (let i = 0; i < roots.length; i += FILE_UNIT_CHUNK) {
+      if (i > 0 && shouldCancel()) return false;
+      if (!(await runOne(roots.slice(i, i + FILE_UNIT_CHUNK), parentDrive))) return false;
+    }
     return true;
   };
 
   // File sources grouped by destination parent dir (basename matches relBase).
-  const fileGroups = new Map<string, string[]>();
-  const dirSources: { abs: string; relBase: string }[] = [];
+  const fileGroups = new Map<string, UploadUnit[]>();
+  const dirSources: UploadUnit[] = [];
   for (const s of sources) {
     let st;
     try {
@@ -197,16 +259,16 @@ export async function uploadSourceTrees(
     } else if (st.isFile()) {
       const parentRel = path.dirname(s.relBase);
       const arr = fileGroups.get(parentRel);
-      if (arr) arr.push(s.abs);
-      else fileGroups.set(parentRel, [s.abs]);
+      if (arr) arr.push(s);
+      else fileGroups.set(parentRel, [s]);
     }
   }
 
-  for (const [parentRel, absList] of fileGroups) {
+  for (const [parentRel, roots] of fileGroups) {
     if (shouldCancel()) return last;
     await ensureChain(parentRel === '.' ? '' : parentRel);
     const parentDrive = parentRel === '.' ? target : `${target}/${parentRel}`;
-    if (!(await run(absList, parentDrive))) return last;
+    if (!(await run(roots, parentDrive))) return last;
   }
 
   for (const s of dirSources) {
@@ -218,10 +280,24 @@ export async function uploadSourceTrees(
     } catch {
       continue;
     }
-    const children = ents
-      .filter((e) => includeHidden || !e.name.startsWith('.'))
-      .map((e) => path.join(s.abs, e.name));
-    if (!(await run(children, `${target}/${s.relBase}`))) return last;
+    const parentDrive = `${target}/${s.relBase}`;
+    const childFiles: UploadUnit[] = [];
+    const childDirs: UploadUnit[] = [];
+    for (const e of ents) {
+      if (!includeHidden && e.name.startsWith('.')) continue;
+      const unit = { abs: path.join(s.abs, e.name), relBase: `${s.relBase}/${e.name}` };
+      if (e.isDirectory()) childDirs.push(unit);
+      else childFiles.push(unit);
+    }
+    // Direct child files: one process for all of them (each is a single file).
+    if (!(await run(childFiles, parentDrive))) return last;
+    // Child directories: one process EACH (the CLI recurses the subtree), so a
+    // process never holds more than one top-level subtree and completed subtrees
+    // are reported as soon as they finish.
+    for (const d of childDirs) {
+      if (shouldCancel()) return last;
+      if (!(await run([d], parentDrive))) return last;
+    }
   }
 
   return last;
@@ -269,7 +345,11 @@ export async function runCatalogDelta(
   const matchExclude = makeExcluder(excludes);
   const prefix = `${subfolder}/`;
   const isExcluded = (rel: string) => matchExclude(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
-  const seenAt = Date.now();
+  // This run's "seen" stamp. The mirror pass treats seen_at < seenAt as gone, so the
+  // stamp must be STRICTLY newer than anything already in the catalog: a run that
+  // starts in the same millisecond the previous one finished (or after the clock
+  // stepped back) would otherwise see none of the vanished files as stale.
+  const seenAt = Math.max(Date.now(), catalog.maxSeenAt(setId) + 1);
 
   const CHUNK = 200; // files per upload call
   // How many upload batches may be in flight at once = the user's configured upload
@@ -337,47 +417,16 @@ export async function runCatalogDelta(
     log('Initial upload (recursive)…');
     report('initial upload');
     // Verbose upload so we get a per-file [metric] upload line — gives live file
-    // count, bytes and speed even though the CLI does the whole tree in one go.
+    // count, bytes and speed even though the CLI does whole subtrees in one go.
     let uploaded = 0;
     let lastReport = 0;
-    const res = await uploadSourceTrees(
-      sources,
-      target,
-      'skip',
-      'merge',
-      (bytes) => {
-        uploaded += 1;
-        doneFiles = uploaded;
-        doneBytes += bytes;
-        const now = Date.now();
-        if (now - lastReport >= 250) {
-          lastReport = now;
-          report('uploading');
-        }
-      },
-      shouldCancel,
-      skipThumbnails,
-      includeHidden,
-    );
-    if (shouldCancel()) return cancelledResult();
-    if (res.code !== 0) {
-      const authDead = looksUnauthenticated(res.stderr + res.stdout);
-      return {
-        ok: false,
-        cancelled: false,
-        newCount: 0,
-        changedCount: 0,
-        unchangedCount: 0,
-        deletedCount: 0,
-        failedCount: 1,
-        failedFiles,
-        message: authDead
-          ? SESSION_EXPIRED_MSG
-          : `Initial upload failed — ${describeUploadError(res.stderr || res.stdout)}`,
-      };
-    }
 
-    log('Recording catalog…');
+    // Catalog recording, done PER UNIT right after that unit's CLI process succeeds
+    // (not once after the whole tree). If the container is OOM-killed or restarted
+    // mid-seed, everything up to the last completed unit is already in the catalog,
+    // so the next run takes the bounded per-file path for the remainder instead of
+    // starting the whole recursive seed over — which is what turned one kill into a
+    // daily kill loop (an empty catalog re-triggers the seed every run).
     const dirs = new Set<string>();
     let seeded = 0;
     let buf: WalkedFile[] = [];
@@ -399,20 +448,62 @@ export async function runCatalogDelta(
         }
       });
       seeded += buf.length;
-      doneFiles = seeded;
+      doneFiles = Math.max(uploaded, seeded);
       buf = [];
     };
-    for (const s of sources) {
-      for await (const f of walkSourceStream(s.abs, s.relBase, { includeHidden, onSkip: noteUnreadable })) {
-        if (shouldCancel()) return cancelledResult();
-        buf.push(f);
-        if (buf.length >= 1000) {
-          flushSeed();
-          report('recording');
+    const recordUnit = async (roots: { abs: string; relBase: string }[]) => {
+      for (const r of roots) {
+        for await (const f of walkSourceStream(r.abs, r.relBase, { includeHidden, onSkip: noteUnreadable })) {
+          // On cancel, stop walking but keep what's buffered: every file here was
+          // uploaded by the unit that just succeeded, so recording it is correct.
+          if (shouldCancel()) break;
+          buf.push(f);
+          if (buf.length >= 1000) {
+            flushSeed();
+            report('recording');
+          }
         }
       }
+      if (buf.length) flushSeed();
+    };
+
+    const res = await uploadSourceTrees(
+      sources,
+      target,
+      'skip',
+      'merge',
+      (bytes) => {
+        uploaded += 1;
+        doneFiles = Math.max(uploaded, seeded);
+        doneBytes += bytes;
+        const now = Date.now();
+        if (now - lastReport >= 250) {
+          lastReport = now;
+          report('uploading');
+        }
+      },
+      shouldCancel,
+      skipThumbnails,
+      includeHidden,
+      recordUnit,
+    );
+    if (shouldCancel()) return cancelledResult();
+    if (res.code !== 0) {
+      const authDead = looksUnauthenticated(res.stderr + res.stdout);
+      return {
+        ok: false,
+        cancelled: false,
+        newCount: seeded,
+        changedCount: 0,
+        unchangedCount: 0,
+        deletedCount: 0,
+        failedCount: 1,
+        failedFiles,
+        message: authDead
+          ? SESSION_EXPIRED_MSG
+          : `Initial upload failed — ${describeUploadError(res.stderr || res.stdout)}`,
+      };
     }
-    if (buf.length) flushSeed();
     return {
       ok: failedCount === 0,
       cancelled: false,
@@ -549,12 +640,38 @@ export async function runCatalogDelta(
     report(parentDrive.replace('/my-files', '') || '/');
   };
 
-  // Pending uploads grouped by Drive parent; flushed when a bucket fills.
+  // Pending uploads grouped by Drive parent; a bucket is flushed when it fills
+  // (CHUNK). Buckets that never fill would otherwise sit here until the walk ends —
+  // for a tree of many small folders (photo libraries: one folder per day, a few
+  // files each) that is EVERY new file held in memory for the whole run. So the
+  // total across buckets is capped too: past PENDING_CAP the fullest bucket is
+  // flushed early. Slightly smaller batches in that shape, bounded memory always.
+  // (Env override exists for the test suite only, like PDB_UPLOAD_RETRY_BASE_MS.)
+  const PENDING_CAP = Number(process.env.PDB_PENDING_CAP) || 2000;
+  let pendingTotal = 0;
   const pending = new Map<string, { f: WalkedFile; sha1: string | null }[]>();
   const queue = (parentDrive: string, item: { f: WalkedFile; sha1: string | null }) => {
     const arr = pending.get(parentDrive);
     if (arr) arr.push(item);
     else pending.set(parentDrive, [item]);
+    pendingTotal += 1;
+  };
+  const takeBucket = (parentDrive: string) => {
+    const bucket = pending.get(parentDrive)!;
+    pending.delete(parentDrive);
+    pendingTotal -= bucket.length;
+    return bucket;
+  };
+  const fullestPending = (): string => {
+    let bestKey = '';
+    let best = -1;
+    for (const [k, v] of pending) {
+      if (v.length > best) {
+        best = v.length;
+        bestKey = k;
+      }
+    }
+    return bestKey;
   };
 
   // Mirror mode marks every unchanged file as "seen this run" so the deletion pass
@@ -636,10 +753,13 @@ export async function runCatalogDelta(
       const parentDrive = relDir === '.' ? target : `${target}/${relDir}`;
       queue(parentDrive, { f: file, sha1 });
 
-      const bucket = pending.get(parentDrive)!;
-      if (bucket.length >= CHUNK) {
-        pending.delete(parentDrive);
+      if (pending.get(parentDrive)!.length >= CHUNK) {
+        const bucket = takeBucket(parentDrive);
         await schedule(() => flush(parentDrive, bucket));
+      } else if (pendingTotal >= PENDING_CAP) {
+        const key = fullestPending();
+        const bucket = takeBucket(key);
+        await schedule(() => flush(key, bucket));
       }
     }
     if (cancelled || sessionDead) break;
@@ -647,12 +767,13 @@ export async function runCatalogDelta(
 
   // Flush any partially-filled buckets.
   if (!cancelled && !sessionDead) {
-    for (const [parentDrive, bucket] of pending) {
+    for (const parentDrive of [...pending.keys()]) {
       if (shouldCancel()) {
         cancelled = true;
         break;
       }
       if (sessionDead) break;
+      const bucket = takeBucket(parentDrive);
       await schedule(() => flush(parentDrive, bucket));
     }
   }
@@ -720,7 +841,7 @@ export async function runCatalogDelta(
       log(`Safety: ${deletionSkipped} — deletion skipped. Re-check the source, then re-run to apply deletions.`);
     } else {
       // Only trash top-most items; trashing a folder removes its children.
-      const tops = stale.filter((s) => !stale.some((o) => o !== s && s.rel.startsWith(`${o.rel}/`)));
+      const tops = topMost(stale);
       const removedRels: string[] = [];
       for (const s of tops) {
         if (shouldCancel() || sessionDead) break;
@@ -739,9 +860,8 @@ export async function runCatalogDelta(
         }
       }
       // Drop trashed entries (and their descendants) from the catalog.
-      const gone = stale
-        .filter((s) => removedRels.some((r) => s.rel === r || s.rel.startsWith(`${r}/`)))
-        .map((s) => s.rel);
+      const removedSet = new Set(removedRels);
+      const gone = stale.filter((s) => hasAncestorIn(s.rel, removedSet, true)).map((s) => s.rel);
       if (gone.length) catalog.remove(setId, gone);
       if (tops.length) log(`Removed ${deletedCount} item(s) no longer present locally`);
     }
@@ -886,7 +1006,7 @@ export async function previewDelta(
       }
     });
     // Only the top-most items are trashed (a folder removes its children).
-    const tops = missing.filter((s) => !missing.some((o) => o !== s && s.rel.startsWith(`${o.rel}/`)));
+    const tops = topMost(missing);
     wouldDeleteCount = tops.length;
     const CAP = 500;
     wouldDelete = tops.slice(0, CAP).map((s) => s.rel);

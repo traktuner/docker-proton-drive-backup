@@ -108,6 +108,12 @@ services:
       # CLI log verbosity: ERROR | WARN | INFO | DEBUG. Default ERROR.
       # - PROTON_DRIVE_LOG_LEVEL=ERROR
 
+      # Memory the CLI's (Bun) runtime sizes its heap for, in BYTES, per upload
+      # process. Without it the runtime assumes the whole container limit is its
+      # headroom and collects garbage lazily — the usual cause of OOM kills during
+      # big backups. Default 512 MiB; lower on small hosts. See README → "Memory".
+      # - BUN_JSC_forceRAMSize=536870912
+
       # Proton API host — do not change.
       # - PROTON_DRIVE_BASE_URL=drive-api.proton.me
 

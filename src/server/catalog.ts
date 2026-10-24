@@ -33,6 +33,7 @@ let _stmts: {
   removeOne: Stmt;
   clear: Stmt;
   count: Stmt;
+  maxSeenAt: Stmt;
   eachFile: Stmt;
   eachEntry: Stmt;
 } | null = null;
@@ -87,6 +88,7 @@ function stmts() {
     removeOne: d.prepare('DELETE FROM backup_catalog WHERE set_id = ? AND rel = ?'),
     clear: d.prepare('DELETE FROM backup_catalog WHERE set_id = ?'),
     count: d.prepare('SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ?'),
+    maxSeenAt: d.prepare('SELECT MAX(seen_at) AS t FROM backup_catalog WHERE set_id = ?'),
     eachFile: d.prepare("SELECT rel, size, sha1 FROM backup_catalog WHERE set_id = ? AND kind = 'file'"),
     eachEntry: d.prepare('SELECT rel, kind FROM backup_catalog WHERE set_id = ?'),
   };
@@ -150,6 +152,11 @@ export const catalog = {
 
   count(setId: string): number {
     return (stmts().count.get(setId) as { n: number }).n;
+  },
+
+  /** Newest seen_at recorded for the set (0 if the catalog is empty). */
+  maxSeenAt(setId: string): number {
+    return (stmts().maxSeenAt.get(setId) as { t: number | null }).t ?? 0;
   },
 
   /** Stream every file entry (rel/size/sha1) — bounded memory for huge sets. */

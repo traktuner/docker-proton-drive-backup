@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build the Next.js app (standalone output)
 # ---------------------------------------------------------------------------
-FROM node:24-bookworm AS builder
+FROM node:26-bookworm AS builder
 WORKDIR /app
 
 # Native build deps for better-sqlite3
@@ -48,7 +48,7 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime
 # ---------------------------------------------------------------------------
-FROM node:24-bookworm-slim AS production
+FROM node:26-bookworm-slim AS production
 WORKDIR /app
 
 # Build metadata shown in the app footer. APP_VERSION = git sha (used for the

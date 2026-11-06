@@ -1,7 +1,8 @@
+import { sdkEnabled } from './sdk-worker';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createReadStream, promises as fsp } from 'node:fs';
-import { walkSourceStream, relToLocalRoot, LOCAL_ROOT, type WalkedFile } from './local';
+import { walkSourceStream, checkedSourceStat, relToLocalRoot, LOCAL_ROOT, type WalkedFile } from './local';
 import { catalog, diffFile } from './catalog';
 import { getUploadConfig } from './upload-config';
 import { getMirrorSafetyConfig } from './mirror-safety';
@@ -16,7 +17,7 @@ import {
   type FileStrategy,
   type FolderStrategy,
   type RunResult,
-} from './cli';
+} from './drive';
 
 /** Message shown when a run stops because the Proton session expired mid-flight. */
 const SESSION_EXPIRED_MSG =
@@ -202,6 +203,7 @@ export async function uploadSourceTrees(
   onUnitUploaded?: (roots: UploadUnit[]) => Promise<void>,
 ): Promise<RunResult> {
   // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
+  const sdk = sdkEnabled();
   const ensured = new Set<string>();
   const ensureChain = async (relDir: string) => {
     if (relDir === '' || relDir === '.') return;
@@ -209,9 +211,10 @@ export async function uploadSourceTrees(
     for (let i = 1; i <= parts.length; i++) {
       const sub = parts.slice(0, i).join('/');
       if (ensured.has(sub)) continue;
-      ensured.add(sub);
       const parentRel = parts.slice(0, i - 1).join('/');
-      await createFolder(parentRel ? `${target}/${parentRel}` : target, parts[i - 1]);
+      const res = await createFolder(parentRel ? `${target}/${parentRel}` : target, parts[i - 1], true);
+      if (sdk && !res.ok) throw new Error(`Cannot ensure Drive folder "${sub}": ${res.error}`);
+      ensured.add(sub);
     }
   };
 
@@ -226,6 +229,7 @@ export async function uploadSourceTrees(
       folderStrategy,
       onUploadedFile,
       skipThumbnails,
+      includeHidden,
     );
     last = res;
     if (res.code !== 0) return false;
@@ -250,9 +254,10 @@ export async function uploadSourceTrees(
   for (const s of sources) {
     let st;
     try {
-      st = await fsp.stat(s.abs);
-    } catch {
-      continue; // unreadable source → skip
+      st = sdk ? await checkedSourceStat(s.abs) : await fsp.stat(s.abs);
+    } catch (err) {
+      if (sdk) throw err;
+      continue; // legacy CLI skips inaccessible source roots
     }
     if (st.isDirectory()) {
       dirSources.push(s);
@@ -274,13 +279,28 @@ export async function uploadSourceTrees(
   for (const s of dirSources) {
     if (shouldCancel()) return last;
     await ensureChain(s.relBase); // create <target>/<relBase> in full
+    const parentDrive = `${target}/${s.relBase}`;
+    if (sdk) {
+      // The SDK walks each child directly; the parent need only buffer one batch.
+      let children: UploadUnit[] = [];
+      for await (const child of await fsp.opendir(s.abs)) {
+        if (shouldCancel()) return last;
+        if (!includeHidden && child.name.startsWith('.')) continue;
+        children.push({ abs: path.join(s.abs, child.name), relBase: `${s.relBase}/${child.name}` });
+        if (children.length === FILE_UNIT_CHUNK) {
+          if (!(await run(children, parentDrive))) return last;
+          children = [];
+        }
+      }
+      if (!(await run(children, parentDrive))) return last;
+      continue;
+    }
     let ents;
     try {
       ents = await fsp.readdir(s.abs, { withFileTypes: true });
     } catch {
       continue;
     }
-    const parentDrive = `${target}/${s.relBase}`;
     const childFiles: UploadUnit[] = [];
     const childDirs: UploadUnit[] = [];
     for (const e of ents) {
@@ -332,6 +352,7 @@ export async function runCatalogDelta(
 ): Promise<DeltaResult> {
   // Keep one stable value for the whole run. Existing installations with no
   // settings file resolve to the historical 30% default.
+  const sdk = sdkEnabled();
   const DELETE_SAFETY_PCT = configuredDeleteSafetyPct();
   const { skipThumbnails = false, includeHidden = false } = opts;
   const target = normalizeProtonPath(targetPath);
@@ -413,7 +434,9 @@ export async function runCatalogDelta(
   // catalog from a local walk. Structure is preserved via uploadSourceTrees.
   // Excludes can't be honoured by the CLI recursion, so those sets fall through to
   // the per-file path below.
-  if (excludes.length === 0 && catalog.count(setId) === 0) {
+  // For the SDK worker, catalog only explicit file batches whose transfers
+  // completed. A second walk after a recursive seed could record unuploaded files.
+  if (!sdk && excludes.length === 0 && catalog.count(setId) === 0) {
     log('Initial upload (recursive)…');
     report('initial upload');
     // Verbose upload so we get a per-file [metric] upload line — gives live file
@@ -523,22 +546,29 @@ export async function runCatalogDelta(
 
   // Folders we've already ensured exist on Drive this run (dirs ≪ files).
   const ensuredDirs = new Set<string>();
-  const ensureDir = async (relDir: string): Promise<void> => {
-    if (relDir === '' || relDir === '.') return;
+  const failedDirs = new Set<string>();
+  const ensureDir = async (relDir: string): Promise<boolean> => {
+    if (relDir === '' || relDir === '.') return true;
     const parts = relDir.split('/');
     for (let i = 1; i <= parts.length; i++) {
       const sub = parts.slice(0, i).join('/');
+      if (failedDirs.has(sub)) return false;
       if (ensuredDirs.has(sub)) continue;
       ensuredDirs.add(sub);
       if (catalog.hasDir(setId, sub)) continue;
       const name = parts[i - 1];
       const parentRel = parts.slice(0, i - 1).join('/');
       const parentDrive = parentRel ? `${target}/${parentRel}` : target;
-      const res = await createFolder(parentDrive, name);
-      // create-folder errors harmlessly if it already exists; record either way.
-      void res;
+      const res = await createFolder(parentDrive, name, true);
+      if (sdk && !res.ok) {
+        failedDirs.add(sub);
+        noteUnreadable(sub, res.error);
+        if (looksUnauthenticated(res.error)) sessionDead = true;
+        return false;
+      }
       catalog.upsertDir(setId, sub, seenAt);
     }
+    return true;
   };
 
   // Bounded-concurrency flush pool. Wait until we're below the (live) cap BEFORE
@@ -707,9 +737,17 @@ export async function runCatalogDelta(
     if (touchBuf.length >= TOUCH_FLUSH) flushTouches();
   };
 
+  const visitDirectory = async (rel: string) => {
+    if (shouldCancel() || sessionDead) return false;
+    if (!isExcluded(rel) && !(await ensureDir(rel))) return false;
+    if (mode === 'mirror') queueTouch(rel);
+    return true;
+  };
   log('Comparing against catalog…');
   for (const s of sources) {
-    for await (const file of walkSourceStream(s.abs, s.relBase, { includeHidden, onSkip: noteUnreadable })) {
+    for await (const file of walkSourceStream(s.abs, s.relBase, {
+      includeHidden, onSkip: noteUnreadable, requireSource: sdk, onDirectory: sdk ? visitDirectory : undefined,
+    })) {
       if (shouldCancel()) {
         cancelled = true;
         break;
@@ -749,7 +787,8 @@ export async function runCatalogDelta(
       else changedCount++;
 
       const relDir = path.dirname(file.rel);
-      await ensureDir(relDir === '.' ? '' : relDir);
+      if (!(await ensureDir(relDir))) continue;
+      if (sdk && mode === 'mirror') queueTouch(file.rel);
       const parentDrive = relDir === '.' ? target : `${target}/${relDir}`;
       queue(parentDrive, { f: file, sha1 });
 
@@ -818,7 +857,7 @@ export async function runCatalogDelta(
     let sourcesIntact = true;
     for (const s of sources) {
       try {
-        await fsp.stat(s.abs);
+        await (sdk ? checkedSourceStat(s.abs) : fsp.stat(s.abs));
       } catch {
         sourcesIntact = false;
         break;
@@ -944,6 +983,8 @@ export async function previewDelta(
 ): Promise<PreviewResult> {
   // Snapshot the same global value as a live run so the preview and execution
   // agree even if the user changes Settings while this local walk is in progress.
+  const sdk = sdkEnabled();
+  let unreadable = false;
   const DELETE_SAFETY_PCT = configuredDeleteSafetyPct();
   const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
   const managedRoots = new Set([subfolder]);
@@ -958,7 +999,9 @@ export async function previewDelta(
 
   // Same diff the real run does, but it only counts — no upload, no catalog write.
   for (const s of sources) {
-    for await (const file of walkSourceStream(s.abs, s.relBase, { includeHidden })) {
+    for await (const file of walkSourceStream(s.abs, s.relBase, {
+      includeHidden, requireSource: sdk, onSkip: sdk ? () => { unreadable = true; } : undefined,
+    })) {
       if (shouldCancel()) break;
       if (isExcluded(file.rel)) continue;
       const cat = catalog.getFile(setId, file.rel);
@@ -1017,7 +1060,7 @@ export async function previewDelta(
     let sourcesIntact = true;
     for (const s of sources) {
       try {
-        await fsp.stat(s.abs);
+        await (sdk ? checkedSourceStat(s.abs) : fsp.stat(s.abs));
       } catch {
         sourcesIntact = false;
         break;
@@ -1027,6 +1070,8 @@ export async function previewDelta(
     const pctGone = totalEntries > 0 ? missing.length / totalEntries : 0;
     if (!sourcesIntact) {
       deletionWouldSkip = 'a source path is missing on disk (mount offline?)';
+    } else if (unreadable) {
+      deletionWouldSkip = 'a source could not be read';
     } else if (DELETE_SAFETY_PCT !== null && pctGone > DELETE_SAFETY_PCT) {
       deletionWouldSkip = `${missing.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
     }
@@ -1056,8 +1101,8 @@ export async function previewDelta(
 
 export interface VerifyResult {
   ok: boolean;
-  checked: number; // catalog file entries examined
-  repaired: number; // entries dropped (missing/changed on Drive) → re-uploaded next run
+  checked: number; // catalog entries examined
+  repaired: number; // missing or changed entries to recreate on the next run
   message: string;
 }
 
@@ -1084,6 +1129,7 @@ export async function verifyCatalog(
 
   // Map of present Drive files: rel (catalog-style "<subfolder>/…") → size (-1 = unknown).
   const present = new Map<string, number>();
+  const presentDirs = sdkEnabled() ? new Set<string>() : undefined;
   let aborted: string | null = null;
 
   async function recur(drivePath: string, relPrefix: string): Promise<void> {
@@ -1091,10 +1137,14 @@ export async function verifyCatalog(
     const res = await listDrive(drivePath);
     if (!res.ok) {
       // Folder genuinely gone → treat as empty. Any other failure → don't risk it.
-      if (/not found|no such|not exist|does not exist|cannot be found/i.test(res.error)) return;
-      aborted = res.error;
+      const missing = presentDirs
+        ? 'code' in res && res.code === 'NOT_FOUND'
+        : /not found|no such|not exist|does not exist|cannot be found/i.test(res.error);
+      if (missing) return;
+      aborted = res.error || 'Drive listing failed';
       return;
     }
+    presentDirs?.add(relPrefix);
     for (const e of res.data) {
       if (aborted || shouldCancel()) return;
       const rel = `${relPrefix}/${e.name}`;
@@ -1118,6 +1168,14 @@ export async function verifyCatalog(
     const size = present.get(f.rel);
     if (size === undefined || (size >= 0 && size !== f.size)) invalid.push(f.rel);
   });
+  if (presentDirs) {
+    await catalog.eachEntryAsync(setId, async ({ kind, rel }) => {
+      if (kind !== 'dir') return;
+      checked++;
+      if (!presentDirs.has(rel)) invalid.push(rel);
+    });
+    if (shouldCancel()) return { ok: false, checked: 0, repaired: 0, message: 'Cancelled' };
+  }
   if (invalid.length) catalog.remove(setId, invalid);
 
   const message = `${checked} checked · ${invalid.length} to re-upload on next run`;

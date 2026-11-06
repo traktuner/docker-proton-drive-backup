@@ -1,4 +1,4 @@
-import { trashDrive, normalizeProtonPath, cleanCliError } from '@/server/cli';
+import { trashDrive, normalizeProtonPath, cleanCliError } from '@/server/drive';
 import { backupSets } from '@/server/db';
 
 export const dynamic = 'force-dynamic';

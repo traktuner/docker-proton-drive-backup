@@ -1,4 +1,4 @@
-import { listDriveCached, cleanCliError } from '@/server/cli';
+import { listDriveCached, cleanCliError } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 

@@ -59,7 +59,22 @@ export interface WalkedFile {
   mtimeMs: number;
 }
 
+/** A configured source may be removed, remounted or replaced by a symlink. */
+export async function checkedSourceStat(source: string) {
+  const [root, resolved] = await Promise.all([fs.realpath(LOCAL_ROOT), fs.realpath(source)]);
+  const rel = path.relative(root, resolved);
+  if (rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) {
+    throw new Error('Source escapes LOCAL_ROOT');
+  }
+  const stat = await fs.lstat(source);
+  if (!stat.isFile() && !stat.isDirectory()) throw new Error('Source is not a regular file or directory');
+  return stat;
+}
+
 export interface WalkOptions {
+  requireSource?: boolean;
+  /** Return false to skip this directory's contents. Called for empty directories too. */
+  onDirectory?: (rel: string) => Promise<boolean>;
   /** Include hidden dotfiles/dotfolders (default: skip them, as the browser does). */
   includeHidden?: boolean;
   /**
@@ -98,10 +113,9 @@ export async function* walkSourceStream(
   const { includeHidden = false, onSkip } = opts;
   let st;
   try {
-    st = await fs.stat(absPath);
-  } catch {
-    // The SOURCE ROOT itself is missing/unreadable — handled at a higher level
-    // (missing-source mirror gate / runner checks), so stay silent here.
+    st = opts.requireSource ? await checkedSourceStat(absPath) : await fs.stat(absPath);
+  } catch (err) {
+    if (opts.requireSource) onSkip?.(relBase, `source not available (${err instanceof Error ? err.message : skipReason(err)})`);
     return;
   }
   if (st.isFile()) {
@@ -110,15 +124,18 @@ export async function* walkSourceStream(
   }
   if (!st.isDirectory()) return;
 
-  async function* recur(dir: string, relPrefix: string): AsyncGenerator<WalkedFile> {
-    let ents;
+  async function* entries(dir: string, relPrefix: string) {
     try {
-      ents = await fs.readdir(dir, { withFileTypes: true });
+      // opendir buffers a fixed number of entries even in a very wide NAS folder.
+      if (opts.requireSource) yield* await fs.opendir(dir);
+      else yield* await fs.readdir(dir, { withFileTypes: true });
     } catch (e) {
       onSkip?.(relPrefix, `folder not readable (${skipReason(e)})`);
-      return;
     }
-    for (const e of ents) {
+  }
+  async function* recur(dir: string, relPrefix: string): AsyncGenerator<WalkedFile> {
+    if (opts.onDirectory && !(await opts.onDirectory(relPrefix))) return;
+    for await (const e of entries(dir, relPrefix)) {
       if (!includeHidden && e.name.startsWith('.')) continue;
       const childAbs = path.join(dir, e.name);
       const childRel = `${relPrefix}/${e.name}`;

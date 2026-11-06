@@ -1,6 +1,6 @@
 name: CI
 
-# Regression gate for every change. Two layers:
+# Regression gates for every change:
 #   1. `checks`         — typecheck + the vitest suite (fast, no Docker). Includes
 #      the static deployment guards (test/deployment/*.test.ts) that assert the
 #      entrypoint / Dockerfile / compose invariants behind #19 and #20.
@@ -8,6 +8,7 @@ name: CI
 #      advertised mode (default, hardened, read-only, non-root, read-only+non-root),
 #      asserting it starts and really initialises. This is what makes an
 #      "advertised but doesn't start" deployment mode impossible to merge.
+#   3. `sdk-smoke` — typechecks the worker, runs its tests, and boots the SDK image offline.
 
 on:
   push:
@@ -62,3 +63,16 @@ jobs:
         # runners are not root by default); without it those modes self-skip.
         # `env` reliably forwards the wait knob through sudo.
         run: sudo env SMOKE_WAIT=120 ./test/deployment/smoke.sh proton-drive-backup:smoke
+
+  sdk-smoke:
+    name: Experimental SDK worker and image (offline)
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v7
+      - name: Typecheck and test against pinned Proton source
+        run: docker build --target sdk-check .
+      - name: Build the SDK runtime
+        run: docker build --target sdk-runner -t drive-backup:sdk-smoke .
+      - name: Verify encrypted store and app-to-worker RPC without a Proton account
+        run: sh test/deployment/sdk-smoke.sh drive-backup:sdk-smoke

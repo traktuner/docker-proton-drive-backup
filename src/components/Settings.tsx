@@ -8,6 +8,7 @@ interface Info {
   app: string;
   imageTag: string;
   cli: string;
+  backend: 'SDK' | 'CLI';
   tz: string;
   localRoot: string;
   dataDir: string;
@@ -33,8 +34,8 @@ interface MirrorSafetyCfg {
   deleteSafetyPct: number;
 }
 interface Updates {
-  cli: { current: string; latest: string; updateAvailable: boolean };
-  container: { current: string; latest: string | null; updateAvailable: boolean };
+  cli: { current: string; latest: string; updateAvailable: boolean } | null;
+  container: { current: string; latest: string | null; updateAvailable: boolean } | null;
 }
 
 const fmt = (n: number) => formatBytes(n, 'precise');
@@ -182,9 +183,15 @@ export default function Settings() {
     return () => window.removeEventListener('keydown', onKey);
   }, [open, checkUpdates, requestClose]);
 
+  const [logoutError, setLogoutError] = useState('');
   const logout = async () => {
-    await fetch('/api/auth/logout', { method: 'POST' });
-    window.location.href = '/onboarding';
+    try {
+      const response = await fetch('/api/auth/logout', { method: 'POST' });
+      if (!response.ok) throw new Error((await response.json()).error || 'Could not sign out.');
+      window.location.href = '/onboarding';
+    } catch (error) {
+      setLogoutError(error instanceof Error ? error.message : 'Could not sign out.');
+    }
   };
 
   const products = info
@@ -239,12 +246,13 @@ export default function Settings() {
               <button onClick={logout} className="pbtn pbtn--danger mt-2 w-full px-4 py-2 text-sm">
                 Log out
               </button>
+              {logoutError && <p role="alert" className="mt-2 text-sm text-amber-300">{logoutError}</p>}
             </Section>
 
             {/* Updates */}
             <Section title="Updates">
-              <Row label="Proton Drive CLI">
-                {!updates ? (
+              <Row label={`Proton Drive ${info?.backend || 'CLI'}`}>
+                {info?.backend === 'SDK' ? info.cli : !updates?.cli ? (
                   <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
                 ) : updates.cli.updateAvailable ? (
                   <span className="text-amber-300">
@@ -255,7 +263,7 @@ export default function Settings() {
                 )}
               </Row>
               <Row label="Container image">
-                {!updates ? (
+                {info?.backend === 'SDK' ? info.imageTag : !updates?.container ? (
                   <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
                 ) : updates.container.updateAvailable ? (
                   <span className="text-amber-300">update available - {updates.container.latest}</span>
@@ -265,13 +273,13 @@ export default function Settings() {
                   <span className="text-[color:var(--muted)]">{updates.container.current}</span>
                 )}
               </Row>
-              <button
+              {info?.backend !== 'SDK' && <button
                 onClick={checkUpdates}
                 disabled={checking}
                 className="pbtn pbtn--ghost mt-2 px-3 py-1.5 text-xs text-[color:var(--muted)] hover:text-[color:var(--text)]"
               >
                 {checking ? 'Checking…' : 'Check again'}
-              </button>
+              </button>}
             </Section>
 
             {/* Uploads */}
@@ -293,7 +301,7 @@ export default function Settings() {
                     className="prange mt-2 w-full"
                   />
                   <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
-                    How many files upload at the same time, each its own CLI process (~4 streams each).
+                    How many upload batches may run at the same time.
                     Higher is faster but heavier on the connection and likelier to hit Proton rate limits.
                     Takes effect during a running backup, as in-flight uploads finish.
                   </p>
@@ -443,12 +451,12 @@ export default function Settings() {
                   GitHub repo
                 </a>
                 <a
-                  href="https://proton.me/support/drive-cli"
+                  href={info?.backend === 'SDK' ? 'https://github.com/ProtonDriveApps/sdk' : 'https://proton.me/support/drive-cli'}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[color:var(--accent-2)] hover:underline"
                 >
-                  Proton Drive CLI docs
+                  Proton Drive {info?.backend || 'CLI'} docs
                 </a>
               </div>
             </Section>

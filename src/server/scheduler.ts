@@ -1,6 +1,6 @@
 import { backupSets, type BackupSet } from './db';
 import { runBackupSet } from './runner';
-import { isAuthenticated } from './cli';
+import { isAuthenticated } from './drive';
 
 /**
  * Minimal in-process scheduler. Ticks once a minute and runs any backup set

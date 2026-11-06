@@ -11,15 +11,35 @@ the right, and define "backup sets" that upload the former into the latter.
 > nominatively to describe what this tool interoperates with. For the official
 > product and support, see [proton.me](https://proton.me).
 
-## Why the CLI (and not the SDK)?
+## TrueNAS SCALE and the experimental direct SDK image
 
-The [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) explicitly does
-**not** include authentication, login flows or session management - you'd have to
-reimplement Proton's SRP/SSO login and key handling yourself. The official CLI is
-the SDK *plus* all of that, maintained by Proton. So this app wraps the CLI and
-gets the SDK's capabilities for free.
+On TrueNAS SCALE 24.10 and later, open **Apps → Discover Apps → Install via YAML**
+and paste the Compose service from this repository. Use absolute host paths for
+your datasets, with `/data` writable and each source mounted read-only. The
+checked-in port mapping serves the web UI at `http://<nas-ip>:3000`. Select a
+different host port if it is already in use. The app runs its own scheduler and
+web UI. Its jobs appear inside the app. Restrict access to your trusted network
+or authenticated reverse proxy, because the TrueNAS login does not protect this port.
 
-## How it works
+The default image uses the official Proton CLI. The experimental
+[`sdk-runner` build](sdk-worker/README.md) runs a persistent process using
+Proton's TypeScript Drive SDK, browser sign-in implementation and crypto library.
+It shares one SDK client across upload batches. Start it with a fresh test
+dataset for app state and a separate Drive destination. Production backups
+should wait for an authenticated upload, revision and restore check on your NAS.
+
+## Why the default image uses the CLI
+
+The official CLI bundles Proton's Drive SDK, browser sign-in, token refresh,
+address keys and encrypted Drive operations in a released executable. Wrapping
+it keeps the stable image simple to maintain. A direct client has to supply
+the SDK's account and crypto dependencies. The experimental image reuses the
+account implementation Proton ships in its source tree. Proton describes that
+module as temporary and currently targets its first-party apps with the SDK.
+See the [Drive SDK](https://github.com/ProtonDriveApps/sdk) and the
+[account module](https://github.com/ProtonDriveApps/sdk/tree/05c9115955589d9f6ab7392a36f8f0cb39327133/incubating/account).
+
+## How the default image works
 
 - **Single Next.js container** serving the web UI and invoking the CLI.
 - Every Drive operation runs the CLI **one-shot** (`proton-drive … -j`) and parses
@@ -66,7 +86,7 @@ volume is otherwise root-only; treat it like any other secret store.
 
 ```bash
 docker compose up -d
-# then open http://localhost:3005
+# then open http://localhost:3000
 ```
 
 The bundled [`docker-compose.yml`](docker-compose.yml) pulls the prebuilt image
@@ -81,7 +101,7 @@ services:
     image: ghcr.io/traktuner/docker-proton-drive-backup:latest
     # build: .            # or build locally instead of pulling
     ports:
-      - "3005:3000"       # host:container - change the host port freely
+      - "3000:3000"       # host:container - change the host port freely
     volumes:
       - ./data:/data            # session + SQLite DB (keep to stay logged in)
       - ./sources:/sources:ro   # folders to back up -> left pane (read-only)

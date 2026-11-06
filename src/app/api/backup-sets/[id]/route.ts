@@ -2,7 +2,7 @@ import { backupSets, type BackupMode, type Schedule } from '@/server/db';
 import { sanitizeSegment } from '@/server/local';
 import { catalog } from '@/server/catalog';
 import { runs } from '@/server/runs';
-import { renameDrive, normalizeProtonPath, cleanCliError } from '@/server/cli';
+import { renameDrive, normalizeProtonPath, cleanCliError } from '@/server/drive';
 import { claimBackupSet, isBackupSetBusy, releaseBackupSet } from '@/server/backup-lock';
 
 export const dynamic = 'force-dynamic';

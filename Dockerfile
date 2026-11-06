@@ -48,7 +48,7 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 # Stage 3: Runtime
 # ---------------------------------------------------------------------------
-FROM node:26-bookworm-slim AS production
+FROM node:26-bookworm-slim AS runtime
 WORKDIR /app
 
 # Build metadata shown in the app footer. APP_VERSION = git sha (used for the
@@ -71,11 +71,8 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 # Next 16's tracer over-includes the repo into the standalone output; drop the
 # source/config files that aren't needed at runtime (keeps source out of the image).
-RUN rm -rf src Dockerfile README.md docker-compose.yml docker-entrypoint.sh \
+RUN rm -rf src sdk-worker Dockerfile README.md docker-compose.yml docker-entrypoint.sh \
     tsconfig.json package-lock.json postcss.config.mjs .dockerignore
-
-# proton-drive CLI
-COPY --from=cli /usr/local/bin/proton-drive /usr/local/bin/proton-drive
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
@@ -90,9 +87,6 @@ ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \
     DB_PATH=/data/backup.db \
     LOCAL_ROOT=/sources \
-    PROTON_DRIVE_CLI=/usr/local/bin/proton-drive \
-    PROTON_DRIVE_CACHE_DIR=/data/proton \
-    PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file \
     PROTON_DRIVE_LOG_LEVEL=ERROR \
     CONFIG_DIR=/config \
     HOME=/data/proton
@@ -116,3 +110,48 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["node", "server.js"]
+
+# Isolate SDK-only build inputs from the production CLI release.
+FROM oven/bun:1.4.2 AS sdk-build
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends patch \
+    && rm -rf /var/lib/apt/lists/*
+ADD https://github.com/ProtonDriveApps/sdk.git#05c9115955589d9f6ab7392a36f8f0cb39327133 /opt/proton
+WORKDIR /opt/proton/cli
+# Rebase Proton's package mirror URLs onto public npm. The frozen lock still
+# validates every tarball and applies Proton's OpenPGP patch.
+RUN sed -i 's#https://pkg.protontech.ch/npm/npm-public/#https://registry.npmjs.org/#g' bun.lock \
+    && bun install --production --frozen-lockfile --ignore-scripts \
+    && ln -s cli/node_modules ../node_modules
+# Expose the authenticated transport and caches already created by init().
+COPY sdk-worker/init.patch /tmp/init.patch
+RUN patch --directory=/opt/proton -p1 --fuzz=0 < /tmp/init.patch
+COPY sdk-worker/*.ts src/backup-worker/
+RUN CLI_VERSION=0.1.0-alpha JS_VERSION=0.23.0+05c91159 \
+    bun scripts/build-cli.mjs src/backup-worker/worker.ts
+
+# CI also checks the worker against the pinned SDK TypeScript declarations.
+FROM sdk-build AS sdk-check
+ENV DRIVE_SDK_WORKER=/opt/proton/cli/release/worker
+RUN bun install --frozen-lockfile --ignore-scripts \
+    && bun node_modules/typescript/bin/tsc --noEmit \
+    && bun test src/backup-worker/*.test.ts
+
+FROM runtime AS sdk-runner
+RUN apt-get update && apt-get install -y --no-install-recommends pass gnupg \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=sdk-build /opt/proton/cli/release/worker /usr/local/bin/drive-sdk-worker
+COPY --from=sdk-build /opt/proton/LICENSE.md /usr/share/doc/drive-sdk-worker/LICENSE
+ENV DRIVE_BACKEND=sdk \
+    DB_PATH=/data/sdk-backup.db \
+    PROTON_DRIVE_CREDENTIALS_STORE=pass \
+    PROTON_DRIVE_CACHE_DIR=/data/proton-sdk \
+    HOME=/data/proton-sdk \
+    GNUPGHOME=/keys
+
+# Keep the unqualified build (including the release workflow) on the CLI.
+FROM runtime AS production
+COPY --from=cli /usr/local/bin/proton-drive /usr/local/bin/proton-drive
+ENV PROTON_DRIVE_CLI=/usr/local/bin/proton-drive \
+    PROTON_DRIVE_CACHE_DIR=/data/proton \
+    PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file

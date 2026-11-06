@@ -7,9 +7,10 @@ import {
   isAuthenticated,
   looksUnauthenticated,
   describeUploadError,
-} from './cli';
+} from './drive';
 import { runCatalogDelta, uploadSourceTrees, relBaseFor } from './engine';
 import { progress } from './progress';
+import { sdkEnabled } from './sdk-worker';
 import { control } from './control';
 import { runs } from './runs';
 import { getUploadConfig } from './upload-config';
@@ -58,7 +59,14 @@ async function doRunBackupSet(id: string): Promise<void> {
   // 'authenticated' but the session has silently expired, the engine's precise
   // (auth-text-gated) sessionDead detection aborts the run cleanly instead. Either
   // way the set itself is left untouched.
-  if (!(await isAuthenticated())) {
+  let signedIn;
+  try {
+    signedIn = await isAuthenticated();
+  } catch {
+    backupSets.updateStatus(id, 'error', 'Cannot reach the Drive backend. Check the app and its credential store.', true);
+    return;
+  }
+  if (!signedIn) {
     backupSets.updateStatus(
       id,
       'error',
@@ -118,6 +126,10 @@ async function doRunBackupSet(id: string): Promise<void> {
     log('Verifying target…');
     const targetOk = await drivePathExists(set.targetPath);
     if (bailIfCancelled()) return;
+    if (sdkEnabled() && targetOk === null) {
+      backupSets.updateStatus(id, 'error', 'Could not verify the destination on Proton Drive. Retry when it is reachable.', true);
+      return;
+    }
     if (targetOk === false) {
       backupSets.updateStatus(
         id,

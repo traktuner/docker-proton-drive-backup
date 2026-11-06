@@ -1,0 +1,12 @@
+diff --git a/cli/src/init.ts b/cli/src/init.ts
+index c29bfc3..213d64c 100644
+--- a/cli/src/init.ts
++++ b/cli/src/init.ts
+@@ -80,5 +80,7 @@ export async function init(configOptions: InitConfig) {
+     return {
+         config,
++        apiClient,
++        caches,
+         logger: logger as Logger,
+         auth,
+         addresses,

@@ -59,7 +59,7 @@ export default function Onboarding() {
         window.open(d.signInUrl, '_blank', 'noopener,noreferrer');
         startPolling();
       } else {
-        throw new Error('No sign-in URL returned by the CLI');
+        throw new Error('No sign-in URL returned by Proton');
       }
     } catch (e) {
       setPhase('error');
@@ -121,7 +121,7 @@ export default function Onboarding() {
         {(phase === 'idle' || phase === 'connecting') && (
           <>
             <p className="mb-6 text-sm leading-relaxed text-[color:var(--muted)]">
-              You&apos;ll be sent to Proton to sign in securely in your browser. The session is
+              This independent app is not officially supported by Proton. You sign in at Proton in your browser. The session is
               stored inside the container - no password is ever handled here.
             </p>
             <button

@@ -14,6 +14,12 @@ for d in /data /data/proton /sources; do
   mkdir -p "$d" 2>/dev/null || true
 done
 
+# The SDK has a separate home for pass, its files and the encrypted caches.
+if [ "${DRIVE_BACKEND:-cli}" = sdk ]; then
+  umask 077
+  mkdir -p -m 700 "${PROTON_DRIVE_CACHE_DIR:-/data/proton-sdk}" 2>/dev/null || true
+fi
+
 # PUID/PGID convenience layer (issue #20). If we start as ROOT and PUID or PGID is
 # set, take ownership of the writable /data volume and re-exec DROPPED to that
 # unprivileged user — for hosts where you can't chown the bind-mount source

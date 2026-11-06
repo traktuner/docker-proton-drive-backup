@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 
 export default function Footer() {
-  const [v, setV] = useState<{ imageTag: string; cli: string } | null>(null);
+  const [v, setV] = useState<{ imageTag: string; cli: string; backend: string } | null>(null);
 
   useEffect(() => {
     fetch('/api/version')
@@ -18,7 +18,7 @@ export default function Footer() {
       <span className="opacity-40">·</span>
       <span className="font-mono" title="Container image tag (cliVersion-revision)">{v ? v.imageTag : '…'}</span>
       <span className="opacity-40">·</span>
-      <span className="font-mono" title="proton-drive CLI version">CLI {v ? v.cli : '…'}</span>
+      <span className="font-mono" title="Drive backend version">{v?.backend || 'Drive'} {v ? v.cli : '…'}</span>
       <span className="opacity-40">·</span>
       <span className="opacity-70" title="Independent community project - not made, endorsed, or supported by Proton AG.">
         Unofficial · not affiliated with Proton

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { CACHE_DIR, runCli, getCliAppVersion } from './cli';
+import { sdkEnabled, sdkWorker } from './sdk-worker';
 
 /**
  * Storage usage. The CLI exposes no quota command, but it keeps an authenticated
@@ -50,20 +51,28 @@ async function callUsers(): Promise<Response | null> {
   });
 }
 
+async function cliUserInfo() {
+  let res = await callUsers();
+  if (res && res.status === 401) {
+    // Token may be stale - a CLI call refreshes and rewrites the session file.
+    await runCli(['filesystem', 'list', '/my-files', '-j'], 20_000).catch(() => {});
+    res = await callUsers();
+  }
+  if (!res || !res.ok) return null;
+  return res.json();
+}
+
+export function clearUserInfo() {
+  cache = null;
+}
+
 let cache: { data: UserInfo; at: number } | null = null;
 const TTL = 60_000;
 
 export async function getUserInfo(force = false): Promise<UserInfo | null> {
   if (!force && cache && Date.now() - cache.at < TTL) return cache.data;
   try {
-    let res = await callUsers();
-    if (res && res.status === 401) {
-      // Token may be stale - a CLI call refreshes and rewrites the session file.
-      await runCli(['filesystem', 'list', '/my-files', '-j'], 20_000).catch(() => {});
-      res = await callUsers();
-    }
-    if (!res || !res.ok) return null;
-    const j = await res.json();
+    const j = sdkEnabled() ? await sdkWorker.call('quota', {}) : await cliUserInfo();
     const u = j?.User;
     if (!u || typeof u.MaxSpace !== 'number') return null;
     const data: UserInfo = {

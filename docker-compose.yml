@@ -1,6 +1,6 @@
 # Proton Drive Backup — docker-compose reference.
 # Copy, adjust the volume host paths, and `docker compose up -d`.
-# Then open http://<host>:3005 and sign in once (the session persists in /data).
+# Then open http://<host>:3000 and sign in once (the session persists in /data).
 
 services:
   proton-drive:
@@ -14,7 +14,7 @@ services:
     # build: .
 
     ports:
-      # host:container — change the host port (3005) freely; keep container 3000.
+      # host:container — change the host port (3000) freely; keep container 3000.
       - "3000:3000"
 
     # ---------------------------------------------------------------------------

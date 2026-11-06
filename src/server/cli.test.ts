@@ -56,6 +56,11 @@ describe('looksUnauthenticated', () => {
     expect(looksUnauthenticated('ERR_SECRETS could not be read')).toBe(true);
   });
 
+  it('matches the CLI answer "You need to login first" (a lost stored session)', () => {
+    expect(looksUnauthenticated('You need to login first')).toBe(true);
+    expect(looksUnauthenticated('Error: you need to login first.')).toBe(true);
+  });
+
   it('matches when the pattern is embedded in larger noisy text', () => {
     expect(looksUnauthenticated('2024-01-01 [ERROR] No Session available, please login')).toBe(true);
     expect(looksUnauthenticated('{"error":"err_secrets: store missing"}')).toBe(true);
@@ -76,6 +81,12 @@ describe('cleanCliError', () => {
     expect(out.toLowerCase()).toContain('session expired');
     expect(cleanCliError('please login').toLowerCase()).toContain('session expired');
     expect(cleanCliError('ERR_SECRETS').toLowerCase()).toContain('session expired');
+  });
+
+  it('maps "You need to login first" to the reconnect message, not the generic failure text', () => {
+    const out = cleanCliError('You need to login first');
+    expect(out.toLowerCase()).toContain('session expired');
+    expect(out).not.toBe('The Drive operation failed.');
   });
 
   it('maps not-found text to a not-found message', () => {

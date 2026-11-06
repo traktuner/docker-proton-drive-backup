@@ -353,6 +353,8 @@ const AUTH_ERROR_PATTERNS = [
   'please login',
   'not authenticated',
   'not signed',
+  // The CLI answers "You need to login first" when its stored session is gone.
+  'need to login',
   'err_secrets',
 ];
 

@@ -62,6 +62,7 @@ const AUTH_HINTS = [
   'please login',
   'not authenticated',
   'not signed',
+  'need to login',
   'unauthor',
   'session expired',
   'err_secrets',

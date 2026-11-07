@@ -291,10 +291,15 @@ export class LruCache<T> {
       if (!set) this.byTag.set(t, (set = new Set()));
       set.add(key);
     }
-    while (this.map.size > this.max) {
-      const [k, e] = this.map.entries().next().value!;
-      this.map.delete(k);
-      this.untag(k, e.tags);
+    if (this.map.size > this.max) {
+      // Evict the oldest 10% in ONE pass: a V8 Map iterator has to skip deleted
+      // slots from the front, so evicting one entry per insert is quadratic.
+      let drop = this.map.size - Math.floor(this.max * 0.9);
+      for (const [k, e] of this.map) {
+        if (drop-- <= 0) break;
+        this.map.delete(k);
+        this.untag(k, e.tags);
+      }
     }
   }
   async getEntity(key: string): Promise<T> {

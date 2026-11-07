@@ -59,17 +59,18 @@ describe('SDK runtime bundle', () => {
 
 describe('LruCache (replaces the SDK MemoryCache: bounded, O(1))', () => {
   it('evicts the least recently used entry and keeps the tag index consistent', async () => {
-    const c = new LruCache<string>(3);
+    const c = new LruCache<string>(3); // evicts down to 90% (2 entries) when exceeded
     await c.setEntity('a', '1', ['parent-x']);
     await c.setEntity('b', '2', ['parent-x']);
     await c.setEntity('c', '3');
     await c.getEntity('a'); // a is now most recent
-    await c.setEntity('d', '4', ['parent-x']); // evicts b
-    expect(c.size).toBe(3);
+    await c.setEntity('d', '4', ['parent-x']); // evicts the oldest (b, then c)
+    expect(c.size).toBeLessThanOrEqual(3);
     await expect(c.getEntity('b')).rejects.toThrow();
     const tagged: string[] = [];
     for await (const r of c.iterateEntitiesByTag('parent-x')) if (r.ok) tagged.push(r.key);
     expect(tagged.sort()).toEqual(['a', 'd']);
+    await expect(c.getEntity('c')).rejects.toThrow();
     await c.removeEntities(['a']);
     tagged.length = 0;
     for await (const r of c.iterateEntitiesByTag('parent-x')) if (r.ok) tagged.push(r.key);
@@ -80,7 +81,7 @@ describe('LruCache (replaces the SDK MemoryCache: bounded, O(1))', () => {
     const c = new LruCache<string>(20_000);
     const t0 = performance.now();
     for (let i = 0; i < 200_000; i++) await c.setEntity(`node-${i}`, 'v', [`parent-${i % 100}`]);
-    expect(c.size).toBe(20_000);
+    expect(c.size).toBeLessThanOrEqual(20_000);
     expect(performance.now() - t0).toBeLessThan(3000);
   });
 });

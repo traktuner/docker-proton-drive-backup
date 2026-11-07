@@ -244,6 +244,10 @@ class RunContext {
   private listing = new Map<string, Promise<Map<string, RemoteNode>>>();
   /** Called while a large folder is being listed (progress for the UI). */
   onListing?: (folderUid: string, count: number) => void;
+  /** Listings in progress, for /api/diagnostics: a stalled listing shows as idle time. */
+  readonly activeListings = new Map<string, { items: number; startedAt: number; lastItemAt: number }>();
+  /** Folder resolutions in progress: parallel work in one new folder creates it ONCE. */
+  private resolving = new Map<string, Promise<string | null>>();
   setFolderUid = '';
   targetUid = '';
   /** Folders this run created: known to be empty, no listing needed. */
@@ -322,21 +326,29 @@ class RunContext {
     const p = (async () => {
       const map = new Map<string, RemoteNode>();
       let chunk: RemoteNode[] = [];
-      for await (const n of this.drive.children(folderUid)) {
-        if (n.name === null) continue;
-        // Only what decisions need: keeps a 100k-entry folder at a few MiB.
-        const slim: RemoteNode = { uid: n.uid, parentUid: n.parentUid, name: n.name, kind: n.kind, size: n.size, mtimeMs: n.mtimeMs, sha1: n.sha1, mediaType: null, trashed: false };
-        map.set(n.name, slim);
-        if (this.onChunk) {
-          chunk.push(slim);
-          if (chunk.length >= 500) {
-            await this.onChunk(folderUid, chunk);
-            chunk = [];
+      const act = { items: 0, startedAt: Date.now(), lastItemAt: Date.now() };
+      this.activeListings.set(folderUid, act);
+      try {
+        for await (const n of this.drive.children(folderUid)) {
+          act.items++;
+          act.lastItemAt = Date.now();
+          if (n.name === null) continue;
+          // Only what decisions need: keeps a 100k-entry folder at a few MiB.
+          const slim: RemoteNode = { uid: n.uid, parentUid: n.parentUid, name: n.name, kind: n.kind, size: n.size, mtimeMs: n.mtimeMs, sha1: n.sha1, mediaType: null, trashed: false };
+          map.set(n.name, slim);
+          if (this.onChunk) {
+            chunk.push(slim);
+            if (chunk.length >= 500) {
+              await this.onChunk(folderUid, chunk);
+              chunk = [];
+            }
           }
+          if (map.size % 1000 === 0) this.onListing?.(folderUid, map.size);
         }
-        if (map.size % 1000 === 0) this.onListing?.(folderUid, map.size);
+        if (chunk.length) await this.onChunk?.(folderUid, chunk);
+      } finally {
+        this.activeListings.delete(folderUid);
       }
-      if (chunk.length) await this.onChunk?.(folderUid, chunk);
       this.kids.set(folderUid, map);
       while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
       return map;
@@ -480,6 +492,19 @@ class RunContext {
     if (rel === this.spec.subfolder) return this.setFolderUid;
     const hit = this.dirUids.get(rel);
     if (hit) return hit;
+    const key = `${create ? '+' : '?'}${rel}`;
+    const pending = this.resolving.get(key);
+    if (pending) return pending;
+    const p = this.resolveDir(rel, create);
+    this.resolving.set(key, p);
+    try {
+      return await p;
+    } finally {
+      this.resolving.delete(key);
+    }
+  }
+
+  private async resolveDir(rel: string, create: boolean): Promise<string | null> {
     const row = catalog.getDir(this.spec.setId, rel);
     if (row?.nodeUid) {
       this.remember(rel, row.nodeUid);
@@ -779,7 +804,32 @@ class RemovedCollector {
 /* The run                                                              */
 /* ------------------------------------------------------------------ */
 
+/** Contexts of the runs in progress, per set (diagnostics only). */
+const activeRuns = new Map<string, RunContext>();
+
+/** What running backups are doing on Drive right now (for /api/diagnostics). */
+export function engineActivity() {
+  const now = Date.now();
+  return [...activeRuns.entries()].map(([setId, ctx]) => ({
+    setId,
+    listings: [...ctx.activeListings.entries()].map(([uid, a]) => ({
+      folder: ctx.relOf(uid) ?? uid,
+      items: a.items,
+      runningS: Math.round((now - a.startedAt) / 1000),
+      idleS: Math.round((now - a.lastItemAt) / 1000),
+    })),
+  }));
+}
+
 export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHooks = {}): Promise<DeltaResult> {
+  try {
+    return await runSetImpl(drive, specIn, hooks);
+  } finally {
+    activeRuns.delete(specIn.setId);
+  }
+}
+
+async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks): Promise<DeltaResult> {
   const spec = { ...specIn };
   const log = hooks.log ?? (() => {});
   const shouldCancel = hooks.shouldCancel ?? (() => false);
@@ -787,6 +837,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   const DELETE_SAFETY_PCT = mirrorCfg.enabled ? mirrorCfg.deleteSafetyPct : null;
   const seenAt = Math.max(Date.now(), catalog.maxSeenAt(spec.setId) + 1);
   const ctx = new RunContext(drive, spec, seenAt, true);
+  activeRuns.set(spec.setId, ctx);
 
   let newCount = 0;
   let changedCount = 0;
@@ -801,6 +852,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   const speed = makeSpeedMeter();
   let lastReport = 0;
   let scanned = 0;
+  let emptyDirsMade = 0;
   // While an existing Drive folder is listed: adopt every entry that matches the
   // local file (same size and modification time), in transactions of one chunk —
   // so even an interrupted listing keeps what it found.
@@ -840,6 +892,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
     // over an unchanged (or already uploaded) tree visibly progress.
     const parts = [`${scanned.toLocaleString('en')} checked`, `${unchangedCount.toLocaleString('en')} unchanged`];
     if (adoptedCount) parts.push(`${adoptedCount.toLocaleString('en')} already on Drive`);
+    if (emptyDirsMade) parts.push(`${emptyDirsMade.toLocaleString('en')} empty folders created`);
     if (failedCount) parts.push(`${failedCount.toLocaleString('en')} skipped`);
     if (where) parts.push(where);
     hooks.onProgress?.({ doneFiles, totalFiles: 0, doneBytes, totalBytes: 0, current: parts.join(' · '), bytesPerSec: speed(doneBytes) });
@@ -1079,15 +1132,21 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   // 4. Walk + diff. Mirror finds local removals per folder (no per-file writes).
   const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
   const pendingDirs: string[] = [];
+  // Empty folders go through the same parallel pool as uploads: thousands of them
+  // (a photo library's internals) no longer stall the scan one request at a time.
   const drainDirs = async () => {
-    while (pendingDirs.length && !sessionDead) {
+    while (pendingDirs.length && !sessionDead && !shouldCancel()) {
       const rel = pendingDirs.shift()!;
-      try {
-        await ctx.dirUid(rel, true);
-      } catch (e) {
-        if (driveErrorCode(e) === 'UNAUTHENTICATED') sessionDead = true;
-        else noteFailed(rel, describeUploadError(e));
-      }
+      await schedule(async () => {
+        try {
+          await ctx.dirUid(rel, true);
+          emptyDirsMade++;
+          report('creating empty folders');
+        } catch (e) {
+          if (driveErrorCode(e) === 'UNAUTHENTICATED') sessionDead = true;
+          else noteFailed(rel, describeUploadError(e));
+        }
+      });
     }
   };
 

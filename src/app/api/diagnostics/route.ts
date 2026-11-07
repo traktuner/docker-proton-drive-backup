@@ -1,5 +1,6 @@
 import { runtime, uploadsBusy } from '@/server/drive';
 import { catalog } from '@/server/catalog';
+import { engineActivity } from '@/server/engine';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,5 +19,7 @@ export async function GET() {
     notices: rt.notices(),
     // Drive folders fully listed once (never listed again), per backup set.
     listedDirs: catalog.listedSummary(),
+    // Drive listings of running backups; a large idleS means the listing is stalled.
+    activity: engineActivity(),
   });
 }

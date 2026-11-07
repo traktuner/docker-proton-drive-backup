@@ -221,6 +221,58 @@ describe('an existing Drive folder is listed once, ever', () => {
   });
 });
 
+describe('many empty folders (a photo library\'s internals) do not stall the scan', () => {
+  it('creates them in parallel, each exactly once, reports progress, and an unchanged re-run creates none', async () => {
+    for (let i = 0; i < 60; i++) fs.mkdirSync(path.join(src, `lib/private/c${i % 6}/e${i}`), { recursive: true });
+    write('z-after.txt', 'scanned after the empty folders');
+    const spec = makeSet('mirror');
+    let active = 0;
+    let peak = 0;
+    const made = new Map<string, number>();
+    const orig = drive.createFolder.bind(drive);
+    drive.createFolder = async (parentUid: string, name: string) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 15)); // a real create takes ~300 ms
+      try {
+        const n = await orig(parentUid, name);
+        made.set(`${parentUid}/${name}`, (made.get(`${parentUid}/${name}`) ?? 0) + 1);
+        return n;
+      } finally {
+        active--;
+      }
+    };
+    const seen: string[] = [];
+    const r = await runSet(drive, spec, { onProgress: (p) => seen.push(p.current) });
+    expect(r.ok).toBe(true);
+    expect(r.newCount).toBe(1);
+    expect(peak).toBeGreaterThan(1); // not one request after the other
+    expect([...made.values()].every((c) => c === 1)).toBe(true); // shared parents created once
+    for (let i = 0; i < 60; i++) expect(drive.at(remote(spec, `lib/private/c${i % 6}/e${i}`))?.kind).toBe('folder');
+    expect(seen.some((c) => /\d+ empty folders created/.test(c))).toBe(true);
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(drive.calls.createFolder).toBe(0);
+  });
+
+  it('parallel uploads into one new folder create that folder once', async () => {
+    for (let i = 0; i < 20; i++) write(`fresh/deep/f${i}.txt`, `n${i}`);
+    const spec = makeSet('backup');
+    const orig = drive.createFolder.bind(drive);
+    const names: string[] = [];
+    drive.createFolder = async (parentUid: string, name: string) => {
+      names.push(name);
+      await new Promise((r) => setTimeout(r, 10));
+      return orig(parentUid, name);
+    };
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(names.filter((x) => x === 'fresh')).toHaveLength(1);
+    expect(names.filter((x) => x === 'deep')).toHaveLength(1);
+  });
+});
+
 describe('one listing per existing Drive folder, even with parallel uploads into it', () => {
   it('parallel new files in a folder that already exists on Drive share a single listing', async () => {
     const spec = makeSet('backup');

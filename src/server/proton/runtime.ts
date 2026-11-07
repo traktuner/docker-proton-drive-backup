@@ -371,7 +371,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   const baseUrl = opts.baseUrl || 'drive-api.proton.me';
   const header = appVersionHeader(opts.appVersion, opts.appBuild);
   const notices: UpdateNotice[] = [];
-  const stats = { total: 0, byEndpoint: {} as Record<string, number> };
+  const stats = { total: 0, byEndpoint: {} as Record<string, number>, byStatus: {} as Record<string, number> };
   const noticeOnce = (kind: UpdateNotice['kind'], message: string) => {
     if (notices.some((n) => n.message === message)) return;
     notices.push({ kind, message, at: Date.now() });
@@ -407,6 +407,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
     afterResponseHooks: [
       (req, _o, res) => {
         stats.total++;
+        stats.byStatus[res.status] = (stats.byStatus[res.status] ?? 0) + 1; // 429 = Proton rate limit
         try {
           const u = new URL(req.url);
           // Mask ids (long tokens) so the endpoint shape is countable.
@@ -780,7 +781,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
     onFolderChanged: (cb) => void folderChangedCbs.add(cb),
     onSessionLost: (cb) => void lostCbs.add(cb),
     notices: () => [...notices],
-    requestStats: () => ({ total: stats.total, byEndpoint: { ...stats.byEndpoint } }),
+    requestStats: () => ({ total: stats.total, byEndpoint: { ...stats.byEndpoint }, byStatus: { ...stats.byStatus } }),
     async dispose() {
       loginAbort?.abort();
       stopEvents();

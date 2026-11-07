@@ -190,7 +190,7 @@ export interface ProtonRuntime {
   onSessionLost(cb: () => void): void;
   notices(): UpdateNotice[];
   /** Proton API requests since start, by method + endpoint (ids masked). */
-  requestStats(): { total: number; byEndpoint: Record<string, number> };
+  requestStats(): { total: number; byEndpoint: Record<string, number>; byStatus?: Record<string, number> };
   dispose(): Promise<void>;
 }
 

@@ -258,6 +258,10 @@ still sign in interactively once. See the volume `(3)` comment in
 | `HOME` | `/data/proton` | HOME for the app, kept on the writable `/data` volume so a read-only root and a non-root user both work |
 | `GITHUB_REPO` | `traktuner/docker-proton-drive-backup` | Repo for the in-app update check |
 | `PDB_ENABLE_DOWNLOAD` | *(unset)* | `1` enables `GET /api/drive/download` (test/diagnostics; exposes Drive content to anyone who can reach the port) |
+| `PDB_SDK_BUFFERED_BLOCKS` | `6` | Encrypted 4 MiB blocks the SDK keeps ready per file (upstream 15). Lower = less memory per upload |
+| `PDB_ENTITY_CACHE` / `PDB_CRYPTO_CACHE` | `5000` / `200` | Size of the SDK node / key caches (entries) |
+| `PDB_DIR_BACKLOG_CAP` | `100000` | Empty folders queued for creation before the scan waits (~10 MiB per 100k) |
+| `PDB_DEBUG` | *(unset)* | `1` logs SDK requests and debug messages |
 
 `PROTON_DRIVE_CLI`, `PROTON_DRIVE_CREDENTIALS_STORE`, `PROTON_DRIVE_LOG_LEVEL` and
 `BUN_JSC_forceRAMSize` belonged to the CLI releases and are ignored. The SDK version

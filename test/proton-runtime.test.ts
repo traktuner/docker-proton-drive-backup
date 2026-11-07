@@ -60,6 +60,14 @@ describe('SDK runtime bundle', () => {
   });
 });
 
+describe('build patches', () => {
+  it('patch 7: the SDK block buffer is bounded (default 6, env-tunable)', () => {
+    const bundle = fs.readFileSync(path.join(ROOT, 'dist-proton/runtime.mjs'), 'utf8');
+    expect(bundle).toContain('PDB_SDK_BUFFERED_BLOCKS');
+    expect(bundle).not.toMatch(/MAX_BUFFERED_BLOCKS\s*=\s*15/);
+  });
+});
+
 describe('LruCache (replaces the SDK MemoryCache: bounded, O(1))', () => {
   it('evicts the least recently used entry and keeps the tag index consistent', async () => {
     const c = new LruCache<string>(3); // evicts down to 90% (2 entries) when exceeded

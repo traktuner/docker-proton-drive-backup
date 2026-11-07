@@ -1,118 +1,88 @@
 # syntax=docker/dockerfile:1
 
 # ---------------------------------------------------------------------------
-# Stage 1: Build the Next.js app (standalone output)
+# Stage 1: build the Next.js app (standalone) and the Proton SDK bundle
 # ---------------------------------------------------------------------------
-FROM node:26-bookworm AS builder
+FROM node:26-trixie-slim AS builder
 WORKDIR /app
 
-# Native build deps for better-sqlite3
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 make g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install deps first (cached unless package.json/lock change). The npm cache
-# mount keeps downloads warm across builds even when the layer is invalidated.
+# No native toolchain needed: SQLite is Node's built-in node:sqlite and sharp
+# ships prebuilt libvips. Install scripts stay denied (package.json allowScripts).
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN npm run build
+# sdk:check fails the build if package.json, the lockfile and the vendored
+# account module disagree about the pinned Proton SDK version.
+RUN npm run sdk:check && npm run build
 
 # ---------------------------------------------------------------------------
-# Stage 2: Download the official proton-drive CLI binary
+# Stage 2: runtime
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS cli
-# Keep these in sync via .github/workflows/check-cli-update.yml
-ARG PROTON_CLI_VERSION=0.9.0
-ARG PROTON_CLI_SHA512_X64=3533025ba69ae112b64e3e01fbcc1ad0688136a4043f6cf6a72886967d85fdcd9ec235479c2e113171614be5225bfba93427509a05ca5aa6071d924fa7e91ca8
-ARG PROTON_CLI_SHA512_ARM64=c8d5a6b174e57f06d05cb5483400b9963faf58e743b6b33706bb73ecff718047ffce6b439994255b94b5b226b90d2e91bef7418ec96c1c3f5d8bf39b6cd01321
-WORKDIR /tmp
-RUN apt-get update && apt-get install -y --no-install-recommends wget ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    case "$(uname -m)" in \
-      x86_64)  A=linux-x64;   EXPECT="$PROTON_CLI_SHA512_X64" ;; \
-      aarch64) A=linux-arm64; EXPECT="$PROTON_CLI_SHA512_ARM64" ;; \
-      *) echo "Unsupported arch: $(uname -m)" >&2; exit 1 ;; \
-    esac; \
-    wget --tries=3 --timeout=30 \
-      "https://proton.me/download/drive/cli/${PROTON_CLI_VERSION}/${A}/proton-drive" \
-      -O /usr/local/bin/proton-drive; \
-    # Verify integrity against the pinned checksum (Proton publishes none).
-    echo "${EXPECT}  /usr/local/bin/proton-drive" | sha512sum -c -; \
-    chmod +x /usr/local/bin/proton-drive; \
-    test -x /usr/local/bin/proton-drive
-
-# ---------------------------------------------------------------------------
-# Stage 3: Runtime
-# ---------------------------------------------------------------------------
-FROM node:26-bookworm-slim AS production
+FROM node:26-trixie-slim AS production
 WORKDIR /app
 
-# Build metadata shown in the app footer. APP_VERSION = git sha (used for the
-# container update check); IMAGE_TAG = friendly "<cliVersion>-<revision>".
-ARG APP_VERSION=dev
-ENV APP_VERSION=$APP_VERSION
-ARG IMAGE_TAG=dev
-ENV IMAGE_TAG=$IMAGE_TAG
-
-# libsecret is linked by the CLI but never used (we force the file-based secret
-# store); ca-certificates for TLS; wget for the healthcheck; util-linux for
-# `setpriv` (PUID/PGID drop — issue #20); iproute2 for `tc`/`ip` (opt-in upload
-# speed limit — issue #23, only active with cap_add: NET_ADMIN).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libsecret-1-0 wget util-linux iproute2 \
+# util-linux: `setpriv` for the PUID/PGID privilege drop (issue #20); wget: the
+# healthcheck (a 2 ms wget instead of starting a second Node process every 30 s).
+RUN apt-get update && apt-get install -y --no-install-recommends util-linux ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Next.js standalone server + static assets
+# Next.js standalone server + static assets + the one-file Proton SDK bundle.
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
-# Next 16's tracer over-includes the repo into the standalone output; drop the
-# source/config files that aren't needed at runtime (keeps source out of the image).
-RUN rm -rf src Dockerfile README.md docker-compose.yml docker-entrypoint.sh \
-    tsconfig.json package-lock.json postcss.config.mjs .dockerignore
-
-# proton-drive CLI
-COPY --from=cli /usr/local/bin/proton-drive /usr/local/bin/proton-drive
+COPY --from=builder /app/dist-proton/runtime.mjs /app/dist-proton/runtime.mjs.LEGAL.txt ./dist-proton/
+COPY --from=builder /app/src/server/proton/vendor/UPSTREAM.json ./dist-proton/UPSTREAM.json
+# sharp (thumbnails) is loaded by the SDK bundle at runtime, so the tracer can't
+# see it: copy it and its prebuilt libvips explicitly.
+COPY --from=builder /app/node_modules/sharp ./node_modules/sharp
+COPY --from=builder /app/node_modules/@img ./node_modules/@img
+COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
+COPY --from=builder /app/node_modules/semver ./node_modules/semver
+RUN rm -rf src Dockerfile README.md docker-compose.yml docker-entrypoint.sh scripts test \
+    tsconfig*.json package-lock.json postcss.config.mjs vitest.config.ts .dockerignore
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
-# HOME is pinned to the writable, persistent /data volume (NOT the nonexistent
-# /home/app): so a read-only root filesystem AND a non-root `user:` both work — any
-# stray dotfile the CLI/deps write stays off the read-only root. The Proton session
-# lives in PROTON_DRIVE_CACHE_DIR (same dir), so this only relocates incidental
-# HOME writes; it is not the session store.
+# Build metadata. APP_VERSION = git sha (diagnostics); IMAGE_TAG = "<app>-<rev>"
+# (update check); SDK_VERSION/SDK_COMMIT label the image (the running app reports
+# the values compiled into the SDK bundle itself).
+ARG APP_VERSION=dev
+ARG IMAGE_TAG=dev
+ARG APP_RELEASE=dev
+ARG SDK_VERSION=unknown
+ARG SDK_COMMIT=unknown
+ENV APP_VERSION=$APP_VERSION IMAGE_TAG=$IMAGE_TAG
+LABEL org.opencontainers.image.title="Proton Drive Backup" \
+      org.opencontainers.image.version="$APP_RELEASE" \
+      org.opencontainers.image.revision="$APP_VERSION" \
+      org.opencontainers.image.source="https://github.com/traktuner/docker-proton-drive-backup" \
+      io.github.traktuner.proton-drive-sdk.version="$SDK_VERSION" \
+      io.github.traktuner.proton-drive-sdk.commit="$SDK_COMMIT"
+
+# HOME stays on the writable /data volume so a read-only root and a non-root
+# `user:` both work. The Proton session lives in PROTON_DRIVE_CACHE_DIR
+# (/data/proton/auth-session.json, the same file the CLI-era releases used).
 ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
     DB_PATH=/data/backup.db \
     LOCAL_ROOT=/sources \
-    PROTON_DRIVE_CLI=/usr/local/bin/proton-drive \
     PROTON_DRIVE_CACHE_DIR=/data/proton \
-    PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file \
-    PROTON_DRIVE_LOG_LEVEL=ERROR \
+    PROTON_RUNTIME=/app/dist-proton/runtime.mjs \
     CONFIG_DIR=/config \
     HOME=/data/proton
 
-# Only /data is a managed volume. /sources is always supplied by the operator,
-# either as (a) one parent bind (e.g. ./sources:/sources:ro — keep it rw if you
-# nest per-share mounts under it, see issue #72) or (b) nested per-share binds
-# only; declaring it VOLUME would spawn a stray writable anonymous volume at the
-# /sources root on every run.
-# Bake an empty /sources dir so the directory always exists even when the operator
-# only mounts NESTED per-share paths (e.g. /mnt/nas/photos:/sources/photos:ro)
-# with no parent bind at /sources — the same layered mount layout documented for
-# issue #72. (runc creates missing mountpoint dirs itself; this bake just makes
-# /sources predictably present and empty rather than relying on that.)
+# Only /data is a managed volume; /sources is always supplied by the operator
+# (see docker-compose.yml, issue #72). Bake an empty /sources so nested-only
+# share mounts have a predictable parent.
 RUN mkdir -p /sources
 VOLUME ["/data"]
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget -qO- http://localhost:3000/api/health || exit 1
+    CMD wget -qO- http://127.0.0.1:3000/api/health || exit 1
 
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["node", "server.js"]

@@ -724,7 +724,12 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
       onDir: (rel) => {
         if (ctx.isExcluded(rel) && rel !== relBase) return;
         touch(rel);
-        if (!catalog.getDir(spec.setId, rel)) pendingDirs.push(rel); // created on Drive below (empty folders too)
+      },
+      // Folders are created on demand for the files in them; only truly EMPTY local
+      // folders are created explicitly, so they are mirrored too.
+      onEmptyDir: (rel) => {
+        if (ctx.isExcluded(rel) && rel !== relBase) return;
+        if (!catalog.getDir(spec.setId, rel)) pendingDirs.push(rel);
       },
     })) {
       if (shouldCancel()) {
@@ -767,6 +772,27 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
           // Could not compare (unreadable/remote error): fall through and upload.
         }
         verdict = 'changed';
+      }
+      if (verdict === 'new' && spec.mode === 'add') {
+        // Add mode: "exists on Drive" decides, never content. One listing per folder
+        // (cached) instead of one request — or a full local read — per file. This is
+        // also what CLI-era Add sets need after the upgrade: they had no catalog.
+        try {
+          const parentUid = await ctx.dirUid(path.posix.dirname(file.rel), false);
+          const ex = parentUid ? (await ctx.childMap(parentUid)).get(path.posix.basename(file.rel)) : undefined;
+          if (ex && ex.kind === 'file') {
+            // Record what Drive has (not the local stat): Backup would still see a difference.
+            record(file.rel, ex.size ?? -1, ex.mtimeMs ?? 0, ex.sha1, ex.uid);
+            unchangedCount++;
+            continue;
+          }
+        } catch (e) {
+          if (driveErrorCode(e) === 'UNAUTHENTICATED') {
+            sessionDead = true;
+            break outer;
+          }
+          throw e;
+        }
       }
       if (verdict === 'unchanged') {
         unchangedCount++;

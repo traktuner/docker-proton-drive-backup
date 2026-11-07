@@ -72,6 +72,8 @@ export interface WalkOptions {
   onSkip?: (rel: string, reason: string) => void;
   /** Called for every directory the walk enters (rel), including the source root. */
   onDir?: (rel: string) => void;
+  /** Called for a directory that has no (non-hidden) entries at all. */
+  onEmptyDir?: (rel: string) => void;
 }
 
 /** The errno code of a filesystem error (EACCES/EPERM/EIO…), for a readable reason. */
@@ -97,7 +99,7 @@ export async function* walkSourceStream(
   relBase: string = path.basename(absPath),
   opts: WalkOptions = {},
 ): AsyncGenerator<WalkedFile> {
-  const { includeHidden = false, onSkip, onDir } = opts;
+  const { includeHidden = false, onSkip, onDir, onEmptyDir } = opts;
   let st;
   try {
     st = await fs.stat(absPath);
@@ -121,6 +123,7 @@ export async function* walkSourceStream(
       onSkip?.(relPrefix, `folder not readable (${skipReason(e)})`);
       return;
     }
+    if (onEmptyDir && !ents.some((e) => includeHidden || !e.name.startsWith('.'))) onEmptyDir(relPrefix);
     for (const e of ents) {
       if (!includeHidden && e.name.startsWith('.')) continue;
       const childAbs = path.join(dir, e.name);

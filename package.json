@@ -1,16 +1,20 @@
 {
   "name": "proton-drive-backup",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "node scripts/build-proton.mjs && next dev",
+    "build": "node scripts/build-proton.mjs && next build",
+    "build:proton": "node scripts/build-proton.mjs",
     "start": "node .next/standalone/server.js",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "typecheck": "tsc --noEmit && node scripts/typecheck-proton.mjs",
+    "test": "node scripts/sdk-check.mjs && vitest run",
     "test:watch": "vitest",
-    "test:smoke": "test/deployment/smoke.sh"
+    "test:smoke": "test/deployment/smoke.sh",
+    "test:upgrade": "test/upgrade/upgrade.sh",
+    "sdk:update": "node scripts/sdk-update.mjs",
+    "sdk:check": "node scripts/sdk-check.mjs"
   },
   "dependencies": {
     "@protontech/crypto": "2.0.0",
@@ -36,7 +40,7 @@
     "vitest": "^5.0.0"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=26.0.0"
   },
   "allowScripts": {
     "core-js": false,

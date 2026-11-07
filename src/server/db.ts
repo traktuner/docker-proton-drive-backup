@@ -83,11 +83,13 @@ let _db: DatabaseSync | null = null;
  *  1  SDK release: Drive node ids in the catalog, per-set Drive bindings and the
  *     app_meta key/value table.
  *  2  drive_parts: continuation folders ("<name> · part N") for local folders
- *     with more items than Proton allows in one Drive folder. Purely ADDITIVE, so a CLI-era image can still open
+ *     with more items than Proton allows in one Drive folder.
+ *  3  listed_dirs: folders whose Drive contents were fully listed and adopted once
+ *     (an existing Drive folder is never re-listed just to find already-uploaded files). Purely ADDITIVE, so a CLI-era image can still open
  *     the same file after a rollback (it ignores columns and tables it does not
  *     know, and every one of its statements names its columns explicitly).
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Path of the one-time pre-migration snapshot next to the DB. */
 export function preMigrationBackupPath(): string {
@@ -230,6 +232,9 @@ function migrate(db: DatabaseSync) {
       PRIMARY KEY (set_id, rel, part)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_parts_uid ON drive_parts (set_id, node_uid)');
+    db.exec(`CREATE TABLE IF NOT EXISTS listed_dirs (
+      set_id TEXT NOT NULL, rel TEXT NOT NULL, listed_at INTEGER NOT NULL, PRIMARY KEY (set_id, rel)
+    )`);
     // Remember that this DB came from a CLI-era release (decides session takeover).
     if (v === 0 && hasData) db.prepare('INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)').run('upgrade.fromCli', String(Date.now()));
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -545,6 +550,7 @@ export const backupSets = {
     tx(() => {
       getDb().exec('DELETE FROM backup_catalog');
       getDb().exec('DELETE FROM drive_parts');
+      getDb().exec('DELETE FROM listed_dirs');
       getDb().exec('UPDATE backup_sets SET folder_uid = NULL, source_marks = NULL');
     });
   },

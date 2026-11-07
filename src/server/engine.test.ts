@@ -166,6 +166,45 @@ describe('first SDK run after an interrupted CLI first upload (files on Drive, n
   });
 });
 
+describe('an existing Drive folder is listed once, ever', () => {
+  it('adopts while listing and never lists that folder again just to find uploaded files', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    for (let i = 0; i < 30; i++) {
+      write(`old/f${i}.jpg`, `p${i}`, t);
+      drive.putFile(remote(spec, `old/f${i}.jpg`), `p${i}`, t);
+    }
+    write('old/new1.jpg', 'new one', t);
+    const r1 = await runSet(drive, spec);
+    expect(r1.adoptedCount).toBe(30);
+    expect(r1.newCount).toBe(1);
+    const folderUid = drive.at(remote(spec, 'old'))!.uid;
+    write('old/new2.jpg', 'new two', t);
+    let listedOld = 0;
+    const orig = drive.children.bind(drive);
+    drive.children = (uid: string) => {
+      if (uid === folderUid) listedOld++;
+      return orig(uid);
+    };
+    const r2 = await runSet(drive, spec);
+    expect(r2.newCount).toBe(1);
+    expect(listedOld).toBe(0);
+  });
+
+  it('never adopts hidden files when the set excludes them', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    write('d/.hidden', 'h', t);
+    write('d/visible.txt', 'v', t);
+    drive.putFile(remote(spec, 'd/.hidden'), 'h', t);
+    drive.putFile(remote(spec, 'd/other.txt'), 'o', t);
+    write('d/other.txt', 'o', t);
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(catalog.getFile(spec.setId, remote(spec, 'd/.hidden'))).toBeUndefined();
+  });
+});
+
 describe('one listing per existing Drive folder, even with parallel uploads into it', () => {
   it('parallel new files in a folder that already exists on Drive share a single listing', async () => {
     const spec = makeSet('backup');

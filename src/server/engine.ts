@@ -274,6 +274,42 @@ class RunContext {
     return `${this.spec.subfolder}/`;
   }
 
+  /** Called with each chunk of a folder listing while it is read (incremental adoption). */
+  onChunk?: (folderUid: string, chunk: RemoteNode[]) => Promise<void>;
+  /** Drive folder uid → local folder rel (the folder itself or one of its parts). */
+  private uidRel = new Map<string, string>();
+  private listingRel = new Map<string, Promise<void>>();
+
+  relOf(uid: string): string | undefined {
+    if (uid === this.setFolderUid) return this.spec.subfolder;
+    return this.uidRel.get(uid) ?? this.partOwner(uid) ?? undefined;
+  }
+
+  /**
+   * List every Drive folder of local folder `rel` once (shared by parallel uploads),
+   * adopting already-uploaded files chunk by chunk while it reads (onChunk), then
+   * remember that it was listed: a restart never repeats a completed listing.
+   */
+  ensureListed(rel: string): Promise<void> {
+    const pending = this.listingRel.get(rel);
+    if (pending) return pending;
+    const p = (async () => {
+      for (const uid of await this.folders(rel, false)) await this.childMap(uid);
+      if (this.write) catalog.markListed(this.spec.setId, rel);
+    })();
+    this.listingRel.set(rel, p);
+    return p.finally(() => this.listingRel.delete(rel));
+  }
+
+  /** Item `name` of `rel` from listings already in memory (no request). */
+  cachedFind(rel: string, name: string, folders: string[]): RemoteNode | undefined {
+    for (const uid of folders) {
+      const hit = this.kids.get(uid)?.get(name);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
   async childMap(folderUid: string, fresh = false): Promise<Map<string, RemoteNode>> {
     let m = this.kids.get(folderUid);
     if (m && !fresh) {
@@ -285,12 +321,22 @@ class RunContext {
     if (pending && !fresh) return pending;
     const p = (async () => {
       const map = new Map<string, RemoteNode>();
+      let chunk: RemoteNode[] = [];
       for await (const n of this.drive.children(folderUid)) {
         if (n.name === null) continue;
         // Only what decisions need: keeps a 100k-entry folder at a few MiB.
-        map.set(n.name, { uid: n.uid, parentUid: n.parentUid, name: n.name, kind: n.kind, size: n.size, mtimeMs: n.mtimeMs, sha1: n.sha1, mediaType: null, trashed: false });
+        const slim: RemoteNode = { uid: n.uid, parentUid: n.parentUid, name: n.name, kind: n.kind, size: n.size, mtimeMs: n.mtimeMs, sha1: n.sha1, mediaType: null, trashed: false };
+        map.set(n.name, slim);
+        if (this.onChunk) {
+          chunk.push(slim);
+          if (chunk.length >= 500) {
+            await this.onChunk(folderUid, chunk);
+            chunk = [];
+          }
+        }
         if (map.size % 1000 === 0) this.onListing?.(folderUid, map.size);
       }
+      if (chunk.length) await this.onChunk?.(folderUid, chunk);
       this.kids.set(folderUid, map);
       while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
       return map;
@@ -388,6 +434,7 @@ class RunContext {
   private addPart(rel: string, n: number, uid: string) {
     catalog.addPart(this.spec.setId, rel, n, uid);
     this.partsCache.delete(rel);
+    this.uidRel.set(uid, rel);
   }
 
   /** If `uid` is a continuation folder: the local folder it belongs to. */
@@ -461,6 +508,8 @@ class RunContext {
   }
 
   private remember(rel: string, uid: string) {
+    this.uidRel.set(uid, rel);
+    if (this.uidRel.size > 40_000) this.uidRel.delete(this.uidRel.keys().next().value!);
     this.dirUids.set(rel, uid);
     if (this.dirUids.size > 20_000) this.dirUids.delete(this.dirUids.keys().next().value!);
   }
@@ -752,6 +801,32 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   const speed = makeSpeedMeter();
   let lastReport = 0;
   let scanned = 0;
+  // While an existing Drive folder is listed: adopt every entry that matches the
+  // local file (same size and modification time), in transactions of one chunk —
+  // so even an interrupted listing keeps what it found.
+  ctx.onChunk = async (uid, chunk) => {
+    const rel = ctx.relOf(uid);
+    if (!rel) return;
+    const cands = chunk.filter((n) => n.kind === 'file' && n.name && (spec.includeHidden || !n.name.startsWith('.')));
+    const stats = await Promise.all(
+      cands.map(async (n) => {
+        const fileRel = `${rel}/${n.name}`;
+        if (ctx.isExcluded(fileRel) || catalog.getFile(spec.setId, fileRel)) return null;
+        const abs = localAbsFor(spec, fileRel);
+        const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+        return st && st.isFile() && st.size === n.size && n.mtimeMs !== null && Math.abs(st.mtimeMs - n.mtimeMs) <= 2000
+          ? { fileRel, size: st.size, mtimeMs: st.mtimeMs, n }
+          : null;
+      }),
+    );
+    catalog.batch(() => {
+      for (const x of stats) {
+        if (!x) continue;
+        record(x.fileRel, x.size, x.mtimeMs, x.n.sha1, x.n.uid);
+        adoptedCount++;
+      }
+    });
+  };
   ctx.onListing = (_uid, count) => report(`reading a large Drive folder (${count.toLocaleString('en')} items so far)`);
   const report = (where: string, force = false) => {
     const now = Date.now();
@@ -922,7 +997,14 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
           // One listing per folder (cached) instead of one failed upload per file:
           // decisive after a CLI-era first upload that died before it was recorded.
           if (!folders.every((uid) => ctx.wasCreated(uid))) {
-            const ex = await ctx.findIn(relDir, name);
+            // Existing Drive folder: list it ONCE (ever), adopting what is already there.
+            if (!catalog.isListed(spec.setId, relDir)) await ctx.ensureListed(relDir);
+            const now = catalog.getFile(spec.setId, f.rel);
+            if (now?.nodeUid && now.size === f.size && Math.abs(now.mtimeMs - f.mtimeMs) <= 2000) {
+              done('kept'); // adopted by the listing meanwhile
+              return;
+            }
+            const ex = ctx.cachedFind(relDir, name, folders);
             if (ex && (await handleExisting(ex, parentUid))) return;
           }
           try {

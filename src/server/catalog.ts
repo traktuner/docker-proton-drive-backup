@@ -67,6 +67,10 @@ const SQL = {
   addPart: 'INSERT OR REPLACE INTO drive_parts (set_id, rel, part, node_uid) VALUES (?, ?, ?, ?)',
   partOwner: 'SELECT rel, part FROM drive_parts WHERE set_id = ? AND node_uid = ?',
   clearParts: 'DELETE FROM drive_parts WHERE set_id = ?',
+  isListed: 'SELECT 1 FROM listed_dirs WHERE set_id = ? AND rel = ?',
+  markListed: 'INSERT OR REPLACE INTO listed_dirs (set_id, rel, listed_at) VALUES (?, ?, ?)',
+  removeListedTree: 'DELETE FROM listed_dirs WHERE set_id = ? AND (rel = ? OR (rel > ? AND rel < ?))',
+  clearListed: 'DELETE FROM listed_dirs WHERE set_id = ?',
   anyBelow: 'SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ? LIMIT 1',
 } as const;
 
@@ -150,6 +154,7 @@ export const catalog = {
     ensure();
     stmt(SQL.clear).run(setId);
     stmt(SQL.clearParts).run(setId);
+    stmt(SQL.clearListed).run(setId);
   },
 
   count(setId: string): number {
@@ -243,6 +248,18 @@ export const catalog = {
     ensure();
     stmt(SQL.removeTree).run(setId, rel, rel + '/', rel + '0');
     stmt(SQL.removePartsTree).run(setId, rel, rel + '/', rel + '0');
+    stmt(SQL.removeListedTree).run(setId, rel, rel + '/', rel + '0');
+  },
+
+  /** Was this folder's Drive content fully listed (and matching files adopted) once? */
+  isListed(setId: string, rel: string): boolean {
+    ensure();
+    return !!stmt(SQL.isListed).get(setId, rel);
+  },
+
+  markListed(setId: string, rel: string): void {
+    ensure();
+    stmt(SQL.markListed).run(setId, rel, Date.now());
   },
 
   /**

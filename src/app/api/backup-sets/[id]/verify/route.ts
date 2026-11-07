@@ -1,6 +1,7 @@
 import { backupSets } from '@/server/db';
 import { verifySet } from '@/server/engine';
 import { drive, normalizeProtonPath, uploadsBusy, writeGate } from '@/server/drive';
+import { claimBackupSet, releaseBackupSet } from '@/server/backup-lock';
 
 export const dynamic = 'force-dynamic';
 
@@ -27,6 +28,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   }
   // Read-only on Drive; only removes catalog rows (idempotent). Single-flighted so
   // concurrent requests can't pile up multiple full-Drive scans.
+  // The set's own lock too: no run of this set (scheduled or manual) and no edit
+  // (target change, rename) may start while verify rewrites its catalog.
+  if (!claimBackupSet(id)) {
+    return Response.json({ error: 'This set is busy (running or being edited) - try again when it is idle.' }, { status: 409 });
+  }
   g.__pdVerifying = true;
   try {
     // Verify only edits OUR catalog, but it must still be the bound account's Drive.
@@ -48,5 +54,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return Response.json(res, { status: res.ok ? 200 : 502 });
   } finally {
     g.__pdVerifying = false;
+    releaseBackupSet(id);
   }
 }

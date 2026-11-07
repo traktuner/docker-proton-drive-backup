@@ -143,6 +143,22 @@ export function importConfig(text: string): ImportResult {
         continue;
       }
 
+      // A key the config leaves out keeps the set's current value: a re-import at
+      // container start must never flip a setting (e.g. turning "include hidden
+      // files" off would make Mirror trash every hidden file on Drive).
+      const has = (k: string) => raw != null && typeof raw === 'object' && k in raw;
+      if (!has('mode')) payload.mode = dupe.mode;
+      if (!has('schedule')) payload.schedule = dupe.schedule;
+      if (!has('time')) {
+        payload.scheduleHour = dupe.scheduleHour;
+        payload.scheduleMinute = dupe.scheduleMinute;
+      }
+      if (!has('dayOfWeek')) payload.scheduleDow = dupe.scheduleDow;
+      if (!has('excludes')) payload.excludes = dupe.excludes;
+      if (!has('skipThumbnails')) payload.skipThumbnails = dupe.skipThumbnails;
+      if (!has('includeHidden')) payload.includeHidden = dupe.includeHidden;
+      if (!has('watch')) payload.watch = dupe.watch;
+
       // A source addition keeps every retained catalog key valid. Only moving the
       // Drive target invalidates the catalog and still requires a rebuild.
       const targetChanged = dupe.targetPath !== payload.targetPath;

@@ -42,7 +42,8 @@ async function doRun(id: string, req: RunRequest): Promise<void> {
   // The single gate for every writing job: a live session AND the bound account.
   const blocked = await writeGate();
   if (blocked) {
-    backupSets.updateStatus(id, 'error', blocked, true);
+    // Not a run: the schedule slot stays open, so the set runs once the gate opens.
+    backupSets.updateStatus(id, 'error', blocked, false);
     return;
   }
   if (set.sourcePaths.length === 0) {

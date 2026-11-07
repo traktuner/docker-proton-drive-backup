@@ -40,11 +40,13 @@ const SQL = {
        ON CONFLICT(set_id, rel) DO UPDATE SET
          kind = 'file', size = excluded.size, mtime_ms = excluded.mtime_ms,
          sha1 = excluded.sha1, seen_at = excluded.seen_at,
-         node_uid = COALESCE(excluded.node_uid, backup_catalog.node_uid)`,
+         node_uid = CASE WHEN backup_catalog.kind = 'file' THEN COALESCE(excluded.node_uid, backup_catalog.node_uid) ELSE excluded.node_uid END`,
   upsertDir: `INSERT INTO backup_catalog (set_id, rel, kind, seen_at, node_uid)
        VALUES (?, ?, 'dir', ?, ?)
        ON CONFLICT(set_id, rel) DO UPDATE SET seen_at = excluded.seen_at,
-         node_uid = COALESCE(excluded.node_uid, backup_catalog.node_uid)`,
+         node_uid = CASE WHEN backup_catalog.kind = 'dir' THEN COALESCE(excluded.node_uid, backup_catalog.node_uid) ELSE excluded.node_uid END,
+         sha1 = CASE WHEN backup_catalog.kind = 'dir' THEN backup_catalog.sha1 ELSE NULL END,
+         kind = 'dir'`,
   setNodeUid: 'UPDATE backup_catalog SET node_uid = ? WHERE set_id = ? AND rel = ?',
   attachNode: `UPDATE backup_catalog SET node_uid = ?, sha1 = COALESCE(sha1, ?)
        WHERE set_id = ? AND rel = ? AND kind = ? AND node_uid IS NULL`,
@@ -78,6 +80,7 @@ const SQL = {
     (SELECT rel FROM listed_dirs l2 WHERE l2.set_id = l.set_id ORDER BY listed_at DESC LIMIT 1) AS lastRel
     FROM listed_dirs l GROUP BY set_id`,
   anyBelow: 'SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ? LIMIT 1',
+  countBelow: 'SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ?',
 } as const;
 
 // The catalog table is part of the base schema (db.ts); make sure it exists.
@@ -290,6 +293,12 @@ export const catalog = {
   parts(setId: string, rel: string): { part: number; nodeUid: string }[] {
     ensure();
     return (stmt(SQL.parts).all(setId, rel) as { part: number; node_uid: string }[]).map((r) => ({ part: r.part, nodeUid: r.node_uid }));
+  },
+
+  /** Number of catalog rows below folder `rel` (index range scan). */
+  countBelow(setId: string, rel: string): number {
+    ensure();
+    return (stmt(SQL.countBelow).get(setId, rel + '/', rel + '0') as { n: number }).n;
   },
 
   /** Local folders split on Drive because of Proton's per-folder item limit (UI notice). */

@@ -181,7 +181,9 @@ skipped, with the reason shown, when:
   sources looked fine, so an offline share never becomes the new normal;
 - any upload failed or a file was unreadable in this run;
 - more than the configured share of the catalog would be removed (Settings →
-  Mirror safety; default 30%, can be disabled — the other gates cannot).
+  Mirror safety; default 30%, can be disabled — the other gates cannot). A removed
+  folder counts with everything recorded below it, so a vanished nested share or a
+  moved top-level folder is caught as "most of the set", not as one entry.
 
 Before an item is trashed it is re-read from Drive and must still be the node this
 backup uploaded, in the same place and under the same name. A folder that contains
@@ -218,7 +220,15 @@ reason), so nothing is ever lost silently. A file is skipped when:
   instead of vanishing silently — and in Mirror mode this also prevents an
   unreadable-but-present file from being mistaken for "deleted".
 - **It's hidden** (a dotfile like `.env`/`.config`) and the set's **"Include hidden
-  files"** option is off (the default).
+  files"** option is off (the default). Like an exclude: switching the option off
+  later leaves hidden items already on Drive alone — Mirror never trashes them.
+- **It's a symbolic link.** Links are not followed (loops, duplicates, targets
+  outside the share); each one is listed with the run, and in Mirror a link never
+  causes the folder or file it replaced to be trashed. To back up a link's target,
+  add the target as a source.
+
+A **config re-import** (`/config/backup-sets.yaml` at start) changes only the keys
+the file contains; a key it leaves out keeps the set's current value.
 
 ## Scheduling
 

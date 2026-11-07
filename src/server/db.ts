@@ -379,6 +379,16 @@ export interface CreateBackupSet {
   watch?: boolean;
 }
 
+/**
+ * One spelling per Drive location ("/Backups", "/my-files/Backups/" and
+ * "Backups" are the same folder), so two sets can never share a Drive folder.
+ */
+export function sameTarget(p: string): string {
+  const segs = (p || '/').trim().split('/').filter(Boolean);
+  if (segs[0] === 'my-files') segs.shift();
+  return '/' + segs.join('/');
+}
+
 export const backupSets = {
   all(): BackupSet[] {
     return (
@@ -397,10 +407,11 @@ export const backupSets = {
    * -2/-3/… until free, so two sets sharing a target never write into the same
    * top-level folder.
    */
-  uniqueSubfolder(desired: string, targetPath: string): string {
+  uniqueSubfolder(desired: string, targetPath: string, exceptId?: string): string {
+    const t = sameTarget(targetPath);
     const taken = new Set(
       this.all()
-        .filter((s) => s.targetPath === targetPath)
+        .filter((s) => s.id !== exceptId && sameTarget(s.targetPath) === t)
         .map((s) => s.targetSubfolder),
     );
     if (!taken.has(desired)) return desired;
@@ -518,16 +529,16 @@ export const backupSets = {
   renameSubfolder(id: string, oldSub: string, newSub: string): void {
     const db = getDb();
     const likePattern = oldSub.replace(/[\\%_]/g, '\\$&') + '/%';
+    // The cut position is computed by SQLite (length() counts characters; JS .length
+    // counts UTF-16 units — an emoji in the old name shifted every key).
     tx(() => {
-      db.prepare(
-        `UPDATE backup_catalog SET rel = ? || substr(rel, ?)
-         WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
-      ).run(newSub, oldSub.length + 1, id, oldSub, likePattern);
+      for (const table of ['backup_catalog', 'drive_parts', 'listed_dirs']) {
+        db.prepare(
+          `UPDATE ${table} SET rel = ? || substr(rel, length(?) + 1)
+           WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
+        ).run(newSub, oldSub, id, oldSub, likePattern);
+      }
       db.prepare('UPDATE backup_sets SET target_subfolder = ? WHERE id = ?').run(newSub, id);
-      db.prepare(
-        `UPDATE drive_parts SET rel = ? || substr(rel, ?)
-         WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
-      ).run(newSub, oldSub.length + 1, id, oldSub, likePattern);
     });
   },
 

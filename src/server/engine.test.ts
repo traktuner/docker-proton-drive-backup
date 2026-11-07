@@ -637,7 +637,9 @@ describe('mirror safety', () => {
     const preview = await previewSet(drive, next);
     const live = await runSet(drive, next);
     expect(live.deletedCount).toBe(preview.wouldDeleteCount);
-    expect(preview.wouldDelete.sort()).toEqual([remote(spec, '.hidden'), remote(spec, 'a/a.txt'), remote(spec, 'b')].sort());
+    expect(preview.wouldDelete.sort()).toEqual([remote(spec, 'a/a.txt'), remote(spec, 'b')].sort());
+    // Hidden files switched off = like an exclude: left alone, never trashed.
+    expect(drive.at(remote(spec, '.hidden'))?.trashed).toBe(false);
     expect(drive.at(remote(spec, 'a'))?.trashed).toBe(false); // empty folder kept
     expect(drive.at(remote(spec, 'skip.tmp'))?.trashed).toBe(false); // excluded = kept
   });

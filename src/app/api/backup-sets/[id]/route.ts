@@ -1,4 +1,4 @@
-import { backupSets, type BackupMode, type Schedule } from '@/server/db';
+import { backupSets, sameTarget, type BackupMode, type Schedule } from '@/server/db';
 import { sanitizeSegment } from '@/server/local';
 import { catalog } from '@/server/catalog';
 import { runs } from '@/server/runs';
@@ -50,7 +50,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     } else if (typeof body.excludes === 'string') {
       patch.excludes = body.excludes.split('\n').map((s) => s.trim()).filter(Boolean);
     }
-    const targetChanged = patch.targetPath != null && patch.targetPath !== cur.targetPath;
+    const targetChanged = patch.targetPath != null && sameTarget(patch.targetPath) !== sameTarget(cur.targetPath);
 
     // --- Validate everything that can be rejected BEFORE mutating anything ---
 
@@ -76,9 +76,21 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           { status: 400 },
         );
       }
-      if (backupSets.all().some((s) => s.id !== id && s.targetPath === cur.targetPath && s.targetSubfolder === newSub)) {
+      if (backupSets.all().some((s) => s.id !== id && sameTarget(s.targetPath) === sameTarget(cur.targetPath) && s.targetSubfolder === newSub)) {
         return Response.json(
           { error: `Another set already uses the Drive folder “${newSub}” under this target.` },
+          { status: 409 },
+        );
+      }
+    }
+
+    // A new target must not lead into another set's Drive folder (the run would
+    // adopt that folder, and Mirror could trash files the other set relies on).
+    if (targetChanged && !subfolderChanging) {
+      const sub = cur.targetSubfolder;
+      if (backupSets.all().some((s) => s.id !== id && sameTarget(s.targetPath) === sameTarget(patch.targetPath!) && s.targetSubfolder === sub)) {
+        return Response.json(
+          { error: `Another set already uses the Drive folder “${sub}” under that target. Rename this set's Drive folder first.` },
           { status: 409 },
         );
       }

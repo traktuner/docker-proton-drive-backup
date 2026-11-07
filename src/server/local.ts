@@ -71,6 +71,8 @@ export interface WalkOptions {
    * deletion pass from mistaking an unreadable-but-present file for "gone").
    */
   onSkip?: (rel: string, reason: string) => void;
+  /** A symbolic link (not followed: loops, duplicates, targets outside the share). */
+  onSymlink?: (rel: string) => void;
   /**
    * Called for every directory the walk enters (rel), including the source root,
    * with the names of its (visible) subdirectories — or null if it is unreadable.
@@ -132,6 +134,7 @@ async function recur(dir, rel) {
     const r = rel + '/' + e.name;
     if (e.isDirectory()) subdirs.push([abs, r]);
     else if (e.isFile()) files.push([abs, r]);
+    else if (e.isSymbolicLink()) batch.push(['l', r]); // never followed: reported, not lost silently
   }
   // Local disks: synchronous stat (~8 µs). Network mounts (NFS/SMB): each stat is a
   // round trip, so issue many at once. Decided by measuring the first stats.
@@ -179,7 +182,7 @@ export async function* walkSourceStream(
   relBase: string = path.basename(absPath),
   opts: WalkOptions = {},
 ): AsyncGenerator<WalkedFile> {
-  const { includeHidden = false, onSkip, onDir, onEmptyDir } = opts;
+  const { includeHidden = false, onSkip, onDir, onEmptyDir, onSymlink } = opts;
   let st;
   try {
     st = await fs.stat(absPath);
@@ -227,6 +230,9 @@ export async function* walkSourceStream(
             break;
           case 's':
             onSkip?.(it[1] as string, it[2] as string);
+            break;
+          case 'l':
+            onSymlink?.(it[1] as string);
             break;
         }
       }

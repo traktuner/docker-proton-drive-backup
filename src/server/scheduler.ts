@@ -58,7 +58,11 @@ async function tick() {
       }
       return;
     }
-    for (const s of due) {
+    for (const s0 of due) {
+      // Re-read: an earlier run of this tick can take hours; the user may have
+      // switched the schedule off, paused, or already run this set meanwhile.
+      const s = backupSets.get(s0.id);
+      if (!s || !isDue(s, new Date())) continue;
       console.log('[scheduler] running backup set %s (%s)', s.name, s.id);
       await runBackupSet(s.id); // serialized via the CLI mutex anyway
     }

@@ -253,9 +253,9 @@ const TRANSIENT = new Set(['NETWORK', 'RATE_LIMITED', 'SERVER', 'INTEGRITY', 'UN
  */
 export function partName(name: string, n: number): string {
   const suffix = ` · part ${n}`;
-  let base = name;
-  while (Buffer.byteLength(base + suffix) > 255) base = base.slice(0, -1);
-  return base + suffix;
+  const chars = [...name]; // code points: never cut a character in half
+  while (chars.length && Buffer.byteLength(chars.join('') + suffix) > 255) chars.pop();
+  return chars.join('') + suffix;
 }
 
 /** Refusals that no retry will change: the whole folder is affected for the rest of the run. */
@@ -473,7 +473,8 @@ class RunContext {
       const isSetFolder = rel === this.spec.subfolder;
       const parentRel = isSetFolder ? null : path.posix.dirname(rel) === '.' ? this.spec.subfolder : path.posix.dirname(rel);
       const base = path.posix.basename(rel);
-      for (let n = this.partUids(rel).length + 2; n < 10_000; n++) {
+      const stored = catalog.parts(this.spec.setId, rel);
+      for (let n = (stored.length ? stored[stored.length - 1].part : 1) + 1; n < 10_000; n++) {
         const name = partName(base, n);
         const sibling = parentRel === null ? `${name}` : `${parentRel}/${name}`;
         const ex = parentRel === null ? (await this.childMap(this.targetUid)).get(name) : await this.findIn(parentRel, name);
@@ -528,11 +529,27 @@ class RunContext {
     this.kids.get(folderUid)?.set(node.name ?? '', node);
   }
 
-  forgetDir(rel: string) {
-    const uid = this.dirUids.get(rel);
+  /**
+   * Drive answered "not found" for folder `rel`. If the folder really is gone
+   * (deleted, or in the Drive trash), nothing recorded below it is on Drive any
+   * more: drop those rows (and its listed/parts records), so this run re-creates
+   * what it meets and the next run uploads the rest — instead of calling them
+   * "unchanged" forever.
+   */
+  async forgetDir(rel: string) {
+    const uid = this.dirUids.get(rel) ?? catalog.getDir(this.spec.setId, rel)?.nodeUid ?? null;
     this.dirUids.delete(rel);
     if (uid) this.kids.delete(uid);
-    if (this.write) catalog.setNodeUid(this.spec.setId, rel, null);
+    if (!this.write) return;
+    const node = uid ? await this.drive.getNode(uid).catch(() => undefined) : null;
+    if (node === undefined || (node && !node.trashed)) {
+      catalog.setNodeUid(this.spec.setId, rel, null); // could not tell, or it still exists: resolve again
+      return;
+    }
+    catalog.removeTree(this.spec.setId, rel);
+    const below = rel + '/';
+    for (const k of [...this.dirUids.keys()]) if (k.startsWith(below)) this.dirUids.delete(k);
+    for (const k of [...this.partsCache.keys()]) if (k === rel || k.startsWith(below)) this.partsCache.delete(k);
   }
 
   /**
@@ -568,6 +585,15 @@ class RunContext {
     if (!parent) return null;
     const name = path.posix.basename(rel);
     let n = await this.lookup(parentRel, name);
+    if (n && n.kind !== 'folder' && create && this.write && this.spec.mode === 'mirror' && catalog.getFile(this.spec.setId, rel)?.nodeUid === n.uid) {
+      // Mirror: our own file was replaced locally by a folder of the same name. The
+      // file is gone locally (Mirror trashes it anyway); trash it now so the folder fits.
+      const [res] = await this.drive.trash([n.uid]);
+      if (!res?.ok) throw new DriveError('NAME_CONFLICT', `a file named "${name}" is where a folder belongs (could not move it to the trash: ${res?.error ?? 'unknown'})`);
+      catalog.remove(this.spec.setId, [rel]);
+      for (const uid of await this.folders(parentRel, false)) this.kids.get(uid)?.delete(name);
+      n = undefined;
+    }
     if (n && n.kind !== 'folder') throw new DriveError('NAME_CONFLICT', `a file named "${name}" is where a folder belongs`);
     if (n && this.partOwner(n.uid)) throw new DriveError('NAME_CONFLICT', `"${name}" is the name of a continuation folder of this backup`);
     if (!n) {
@@ -745,9 +771,9 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
     if (!ctx.write) return;
     // A removed folder's continuation folders go with it, each identity-checked
     // (still where it was created, still named "<name> · part N").
-    for (const [i, partUid] of parts.entries()) {
+    for (const { part, nodeUid: partUid } of e.kind === 'dir' ? catalog.parts(spec.setId, e.rel) : []) {
       const pn = await drive.getNode(partUid);
-      if (pn && !pn.trashed && parentFolders.includes(pn.parentUid ?? '') && pn.name === partName(name, i + 2)) {
+      if (pn && !pn.trashed && parentFolders.includes(pn.parentUid ?? '') && pn.name === partName(name, part)) {
         batch.push({ uid: partUid, rel: e.rel });
       }
     }
@@ -793,6 +819,17 @@ function sourceProblem(spec: RunSpec, marksNow: MarksNow): string | null {
 }
 
 /** Gates that must ALL pass before anything is deleted. Returns the reason to skip, or null. */
+/**
+ * How many catalog entries a deletion would remove: a removed FOLDER counts with
+ * everything recorded below it (a vanished nested share or a moved top folder is
+ * most of the set, not "one entry").
+ */
+function staleWeight(setId: string, stale: CatalogEntry[]): number {
+  let n = 0;
+  for (const e of stale) n += 1 + (e.kind === 'dir' ? catalog.countBelow(setId, e.rel) : 0);
+  return n;
+}
+
 function deletionGate(spec: RunSpec, marksNow: MarksNow, failedCount: number, staleCount: number, total: number, pct: number | null): string | null {
   const src = sourceProblem(spec, marksNow);
   if (src) return src;
@@ -815,7 +852,14 @@ function deletionGate(spec: RunSpec, marksNow: MarksNow, failedCount: number, st
 class RemovedCollector {
   readonly removed: CatalogEntry[] = [];
   private cur: { rel: string; files: Set<string>; dirs: Set<string> } | null = null;
-  constructor(private readonly setId: string) {}
+  /**
+   * includeHidden=false: the walk does not see dot-entries at all, so they are
+   * never "gone" — switching the option off must not trash them on Drive.
+   */
+  constructor(
+    private readonly setId: string,
+    private readonly includeHidden = false,
+  ) {}
   enter(rel: string, subdirs: string[] | null) {
     this.finish();
     // An unreadable folder (null) is never diffed: nothing below it is "gone".
@@ -847,6 +891,7 @@ class RemovedCollector {
     const cut = c.rel.length + 1;
     for (const row of catalog.childNames(this.setId, c.rel)) {
       const name = row.rel.slice(cut);
+      if (!this.includeHidden && name.startsWith('.')) continue;
       if (!(row.kind === 'file' ? c.files.has(name) : c.dirs.has(name))) this.removed.push({ rel: row.rel, kind: row.kind, nodeUid: row.node_uid });
     }
   }
@@ -910,6 +955,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   let lastReport = 0;
   let scanned = 0;
   let emptyDirsMade = 0;
+  let symlinkCount = 0;
   const pendingDirs = new Fifo<string>(); // empty local folders still to create on Drive
   // While an existing Drive folder is listed: adopt every entry that matches the
   // local file (same size and modification time), in transactions of one chunk —
@@ -1121,7 +1167,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
 
         if (verdict === 'changed' && nodeUid) {
           const remote = await drive.getNode(nodeUid);
-          if (!remote || remote.trashed || !folders.includes(remote.parentUid ?? '') || remote.kind !== 'file') {
+          if (!remote || remote.trashed || !folders.includes(remote.parentUid ?? '') || remote.kind !== 'file' || remote.name !== name) {
             nodeUid = null; // gone or no longer ours where it was: upload as a new file
           } else if (await sameContent(remote, f.abs, f.size, f.mtimeMs, true)) {
             record(f.rel, f.size, f.mtimeMs, remote.sha1, remote.uid);
@@ -1194,7 +1240,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         }
         if (code === 'NOT_FOUND' && attempt === 1) {
           // A cached folder uid went stale (folder deleted on Drive): resolve again.
-          ctx.forgetDir(relDir);
+          await ctx.forgetDir(relDir);
           continue;
         }
         const fsCode = code ? undefined : (e as NodeJS.ErrnoException)?.code; // DriveError has .code too
@@ -1212,7 +1258,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   };
 
   // 4. Walk + diff. Mirror finds local removals per folder (no per-file writes).
-  const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
+  const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId, !!spec.includeHidden) : null;
   let dirsWalked = 0;
   ctx.info = () => ({ filesChecked: scanned, foldersWalked: dirsWalked, emptyFoldersQueued: pendingDirs.length, emptyFoldersCreated: emptyDirsMade });
   // Empty folders are created in their own background lane while the scan and the
@@ -1223,11 +1269,14 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   // ~10 MiB per 100k queued paths (measured); a photo library alone had 66k+.
   const DIR_BACKLOG_CAP = Number(process.env.PDB_DIR_BACKLOG_CAP) || 100_000;
   const dirLane = new Set<Promise<void>>();
+  const laneSlots = new Set<number>(); // worker 0 keeps going while Proton throttles
+  let laneStop = false; // set when the run ends early: no worker outlives the run
   // Proton answered 429 (rate limit) recently: the lane shrinks to one worker
   // until a full cool-down passed without one, then opens up again.
   const throttled = () => Date.now() - (drive.rateLimitedAt?.() ?? 0) < RATE_LIMIT_COOLDOWN_MS;
+  const laneOpen = () => !laneStop && !sessionDead && !shouldCancel();
   const dirWorker = async (index: number) => {
-    while (pendingDirs.length && !sessionDead && !shouldCancel()) {
+    while (pendingDirs.length && laneOpen()) {
       if (index > 0 && throttled()) {
         await sleep(1000);
         continue;
@@ -1245,13 +1294,13 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
             sessionDead = true;
             break;
           }
-          if (code === 'CANCELLED' || shouldCancel()) break;
+          if (code === 'CANCELLED' || !laneOpen()) break;
           // Rate limit, network, server hiccup: wait and try the same folder again —
           // a transient answer never turns into a skipped folder on the first try.
           if (code && TRANSIENT.has(code) && attempt < 4) {
             const wait = retryDelay(code, attempt);
             log(`  ${rel}: ${describeUploadError(e)} — retry ${attempt}/3 in ${Math.round(wait / 1000)}s`);
-            for (let w = 0; w < wait && !shouldCancel(); w += 250) await sleep(Math.min(250, wait));
+            for (let w = 0; w < wait && laneOpen(); w += 250) await sleep(Math.min(250, wait));
             continue;
           }
           noteFailed(rel, describeUploadError(e));
@@ -1261,8 +1310,14 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
     }
   };
   const drainDirs = async (all = false) => {
-    while (dirLane.size < DIR_LANE && pendingDirs.length) {
-      const w: Promise<void> = dirWorker(dirLane.size).finally(() => dirLane.delete(w));
+    while (dirLane.size < DIR_LANE && pendingDirs.length && laneOpen()) {
+      let slot = 0;
+      while (laneSlots.has(slot)) slot++;
+      laneSlots.add(slot);
+      const w: Promise<void> = dirWorker(slot).finally(() => {
+        dirLane.delete(w);
+        laneSlots.delete(slot);
+      });
       dirLane.add(w);
     }
     while (pendingDirs.length > (all ? 0 : DIR_BACKLOG_CAP) && dirLane.size) await Promise.race(dirLane);
@@ -1271,6 +1326,8 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
 
   log('Comparing against catalog…');
   report('scanning', true);
+  let walkError: unknown = null;
+  try {
   outer: for (const abs of spec.sourcePaths) {
     const relBase = relBaseFor(spec.subfolder, abs);
     for await (const file of walkSourceStream(abs, relBase, {
@@ -1282,6 +1339,12 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
       onDir: (rel, subdirs) => {
         dirsWalked++;
         removed?.enter(rel, subdirs);
+      },
+      onSymlink: (rel) => {
+        removed?.unreadable(rel); // present: never trash what a link replaced
+        if (ctx.isExcluded(rel)) return;
+        symlinkCount++;
+        if (failedFiles.length < FAILED_SAMPLE_CAP) failedFiles.push({ rel, reason: 'symbolic link — not followed; add its target as a source to back it up' });
       },
       // Folders are created on demand for the files in them; only truly EMPTY local
       // folders are created explicitly, so they are mirrored too.
@@ -1363,7 +1426,15 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
     removed?.finish();
     await drainDirs(true);
   }
-  await Promise.all(inflight);
+  } catch (e) {
+    walkError = e; // scanner or database failure: stop, but let in-flight work settle first
+  }
+  // Nothing this run started may outlive it (a cancelled run's folder lane once kept
+  // creating folders after the run had returned and the lock was released).
+  if (walkError || cancelled || sessionDead) laneStop = true;
+  await Promise.allSettled([...dirLane]);
+  await Promise.allSettled([...inflight]);
+  if (walkError) throw walkError;
   if (shouldCancel()) cancelled = true;
   report('', true);
 
@@ -1375,7 +1446,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   if (spec.mode === 'mirror' && !cancelled) {
     const stale = removed!.removed;
     if (stale.length || missingSources.length) {
-      deletionSkipped = deletionGate(spec, marksNow, failedCount, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+      deletionSkipped = deletionGate(spec, marksNow, failedCount, staleWeight(spec.setId, stale), catalog.count(spec.setId), DELETE_SAFETY_PCT);
       if (deletionSkipped) {
         log(`Safety: ${deletionSkipped} — deletion skipped.`);
       } else {
@@ -1402,8 +1473,9 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   if (adoptedCount) parts.push(`${adoptedCount} already on Drive`);
   if (spec.mode === 'mirror' && !cancelled && !deletionSkipped) parts.push(`${deletedCount} removed`);
   if (deletionSkipped) parts.push(`deletion skipped for safety (${deletionSkipped})`);
+  if (symlinkCount) parts.push(`${symlinkCount} symbolic link${symlinkCount === 1 ? '' : 's'} not followed`);
   if (failedCount) {
-    const ex = failedFiles[0];
+    const ex = failedFiles.find((f) => !f.reason.startsWith('symbolic link'));
     parts.push(ex ? `${failedCount} failed (e.g. “${path.basename(ex.rel)}” — ${ex.reason})` : `${failedCount} failed`);
   }
   return {
@@ -1451,7 +1523,7 @@ export async function previewSet(drive: DriveService, spec: RunSpec, shouldCance
   const mirrorCfg = getMirrorSafetyConfig();
   const DELETE_SAFETY_PCT = mirrorCfg.enabled ? mirrorCfg.deleteSafetyPct : null;
   const ctx = new RunContext(drive, { ...spec }, 0, false);
-  const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
+  const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId, !!spec.includeHidden) : null;
   let unreadable = 0;
   let newCount = 0;
   let changedCount = 0;
@@ -1466,6 +1538,7 @@ export async function previewSet(drive: DriveService, spec: RunSpec, shouldCance
         unreadable++;
         removed?.unreadable(rel);
       },
+      onSymlink: (rel) => removed?.unreadable(rel),
     })) {
       if (shouldCancel()) break;
       removed?.seen(file.rel);
@@ -1495,7 +1568,7 @@ export async function previewSet(drive: DriveService, spec: RunSpec, shouldCance
     const marksNow: MarksNow = {};
     for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
     // Same gates as the live run; an unreadable entry counts like a failed upload.
-    deletionWouldSkip = deletionGate(spec, marksNow, unreadable, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+    deletionWouldSkip = deletionGate(spec, marksNow, unreadable, staleWeight(spec.setId, stale), catalog.count(spec.setId), DELETE_SAFETY_PCT);
     if (!deletionWouldSkip) {
       const target = await ctx.resolvePath(spec.targetPath);
       const set = backupSets.get(spec.setId);

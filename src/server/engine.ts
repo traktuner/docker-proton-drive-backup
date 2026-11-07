@@ -616,7 +616,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   let cap = 2;
   const maxInflight = () => {
     if (Date.now() - capAt > 1000) {
-      cap = Math.max(1, Math.min(8, getUploadConfig().concurrency || 2));
+      cap = Math.max(1, Math.min(5, getUploadConfig().concurrency || 2));
       capAt = Date.now();
     }
     return cap;

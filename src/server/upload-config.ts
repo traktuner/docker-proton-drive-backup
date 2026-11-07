@@ -20,7 +20,9 @@ export interface UploadConfig {
 }
 
 const MIN = 1;
-const MAX = 8;
+// The SDK itself never runs more than 5 file uploads (and 40 MiB of file data) at
+// once (internal/upload/queue.ts), so higher values would only queue in memory.
+const MAX = 5;
 // Speed-cap floor: a too-low cap would starve the CLI's own API/control traffic and
 // risk Proton-side timeouts, so anything above 0 is clamped up to this.
 const MIN_KBPS = 50;

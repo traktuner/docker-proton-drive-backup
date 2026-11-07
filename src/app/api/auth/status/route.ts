@@ -18,6 +18,8 @@ export async function GET(req: Request) {
     // 'confirm' / 'mismatch' block every writing job until resolved (see drive.ts).
     binding,
     boundEmail: boundEmail(),
+    // Lets an open tab notice that the container was updated underneath it.
+    build: process.env.APP_VERSION || 'dev',
     targets:
       binding === 'confirm' || binding === 'mismatch'
         ? backupSets.all().map((s) => ({ name: s.name, target: `${s.targetPath === '/' ? '' : s.targetPath}/${s.targetSubfolder}` }))

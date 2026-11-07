@@ -287,14 +287,15 @@ export default function Settings() {
                   <input
                     type="range"
                     min={1}
-                    max={8}
+                    max={5}
                     value={uploads.concurrency}
                     onChange={(e) => saveUploads({ concurrency: +e.target.value })}
                     className="prange mt-2 w-full"
                   />
                   <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
-                    How many files upload at the same time. All share one connection pool and Proton&apos;s
-                    rate limits; small files profit most from more. Takes effect during a running backup.
+                    How many files upload at the same time (at most 5 — the Proton SDK&apos;s own limit, which
+                    also caps the data in flight at 40 MiB). Small files profit most from more. Takes effect
+                    during a running backup.
                   </p>
                 </div>
 

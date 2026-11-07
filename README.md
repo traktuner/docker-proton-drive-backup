@@ -248,7 +248,9 @@ is pinned in `package.json` and updated by a workflow ([docs/SDK-UPDATE.md](docs
 
 One Node.js process does everything, so memory is predictable: about 60 MiB idle,
 signed out or in. During a run, memory is bounded by design — a fixed number of
-files in flight (**Settings → Uploads → parallel uploads**), each streamed from
+files in flight (**Settings → Uploads → parallel uploads**, at most 5 — the SDK's own
+limit, which also caps file data in flight at 40 MiB; per large file the SDK buffers
+at most 15 encrypted 4 MiB blocks), each streamed from
 disk in 1 MiB chunks into the SDK's 4 MiB encryption blocks; the local scan runs
 in a separate thread with one batch in flight; the catalog lives in SQLite, not in
 memory. A fast disk and a slow uplink do not make memory grow: the scan simply

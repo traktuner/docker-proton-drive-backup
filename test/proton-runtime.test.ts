@@ -16,6 +16,7 @@ const ROOT = path.resolve(__dirname, '..');
 const UPSTREAM = JSON.parse(fs.readFileSync(path.join(ROOT, 'src/server/proton/vendor/UPSTREAM.json'), 'utf8'));
 let createRuntime: (o: unknown) => Promise<ProtonRuntime>;
 let mapError: (e: unknown) => { code: string };
+let scopedSignal: (p?: AbortSignal) => { signal: AbortSignal; dispose(): void };
 let LruCache: new <T>(max: number) => {
   setEntity(k: string, v: T, tags?: string[]): Promise<void>;
   getEntity(k: string): Promise<T>;
@@ -27,7 +28,7 @@ let LruCache: new <T>(max: number) => {
 
 beforeAll(async () => {
   execFileSync(process.execPath, [path.join(ROOT, 'scripts/build-proton.mjs')], { cwd: ROOT, stdio: 'pipe' });
-  ({ createRuntime, LruCache, mapError } = await import(pathToFileURL(path.join(ROOT, 'dist-proton/runtime.mjs')).href));
+  ({ createRuntime, LruCache, mapError, scopedSignal } = await import(pathToFileURL(path.join(ROOT, 'dist-proton/runtime.mjs')).href));
 }, 120_000);
 
 describe('SDK runtime bundle', () => {
@@ -98,5 +99,23 @@ describe('Proton API error codes → permanent DriveError codes', () => {
     expect(mapError(v(200001)).code).toBe('QUOTA');
     expect(mapError({ name: 'Error', message: 'wrapped', cause: { code: 200300 } }).code).toBe('FOLDER_FULL');
     expect(mapError({ name: 'NotFoundAPIError', code: 2501, message: 'gone' }).code).toBe('NOT_FOUND');
+  });
+});
+
+describe('per-upload abort signal (the SDK never removes its abort listener)', () => {
+  it('follows the run signal while the upload runs and leaves no listener behind', async () => {
+    const { getEventListeners } = await import('node:events');
+    const run = new AbortController();
+    for (let i = 0; i < 1000; i++) {
+      const s = scopedSignal(run.signal);
+      s.signal.addEventListener('abort', () => {}); // what the SDK's FileUploader does
+      s.dispose();
+    }
+    expect(getEventListeners(run.signal, 'abort')).toHaveLength(0); // nothing keeps 1000 uploaders alive
+    const live = scopedSignal(run.signal);
+    run.abort(new Error('cancelled'));
+    expect(live.signal.aborted).toBe(true); // cancel still reaches a running upload
+    const late = scopedSignal(run.signal);
+    expect(late.signal.aborted).toBe(true);
   });
 });

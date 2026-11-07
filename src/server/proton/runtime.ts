@@ -222,6 +222,19 @@ function fileStream(abs: string, opts: UploadOptions, hash: Hash): ReadableStrea
   );
 }
 
+/**
+ * A child signal that follows `parent` (abort) until dispose(): then it is detached
+ * from the parent, so whatever listens on the child can be garbage-collected even
+ * though the parent lives on.
+ */
+export function scopedSignal(parent?: AbortSignal): { signal: AbortSignal; dispose(): void } {
+  const ctrl = new AbortController();
+  const relay = () => ctrl.abort(parent?.reason);
+  if (parent?.aborted) ctrl.abort(parent.reason);
+  else parent?.addEventListener('abort', relay, { once: true });
+  return { signal: ctrl.signal, dispose: () => parent?.removeEventListener('abort', relay) };
+}
+
 /** EXIF lives in the file header for every format the SDK parses; never read whole images into RAM. */
 const EXIF_HEADER_BYTES = 256 * 1024;
 
@@ -650,20 +663,27 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   };
 
   const runUpload = async (
-    getUploader: (meta: Awaited<ReturnType<typeof metadataFor>>) => Promise<{ uploadFromStream: (s: ReadableStream, t: Thumbnail[], p?: (n: number) => void) => Promise<{ completion(): Promise<{ nodeUid: string; nodeRevisionUid: string }> }> }>,
+    getUploader: (meta: Awaited<ReturnType<typeof metadataFor>>, signal: AbortSignal) => Promise<{ uploadFromStream: (s: ReadableStream, t: Thumbnail[], p?: (n: number) => void) => Promise<{ completion(): Promise<{ nodeUid: string; nodeRevisionUid: string }> }> }>,
     file: LocalFile,
     o: UploadOptions,
   ): Promise<UploadResult> => {
     const meta = await metadataFor(file, o);
     const thumbs = await thumbnailsFor(file, o);
-    const uploader = await getUploader(meta);
+    // One short-lived signal per upload, linked to the run's signal only while the
+    // upload runs. The SDK's FileUploader adds an 'abort' listener to the signal it
+    // gets and never removes it: given the run's signal, every finished uploader
+    // (with its buffers) stayed reachable until the run ended — a live heap growing
+    // ~4 MB/min in production. Unlinked here, each upload is collectable when done.
+    const local = scopedSignal(o.signal);
     const hash = createHash('sha1');
     const stream = fileStream(file.abs, o, hash);
     try {
+      const uploader = await getUploader(meta, local.signal);
       const ctrl = await uploader.uploadFromStream(stream, thumbs);
       const done = await ctrl.completion();
       return { nodeUid: done.nodeUid, revisionUid: done.nodeRevisionUid, sha1: hash.digest('hex') };
     } finally {
+      local.dispose();
       await stream.cancel().catch(() => {}); // closes the fd if the SDK stopped early
     }
   };
@@ -719,9 +739,9 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
         }
       }),
     uploadNew: (parentUid, name, file, o) =>
-      guard(() => runUpload((meta) => sdk.getFileUploader(parentUid, name, meta, o.signal) as never, file, o)),
+      guard(() => runUpload((meta, signal) => sdk.getFileUploader(parentUid, name, meta, signal) as never, file, o)),
     uploadRevision: (nodeUid, file, o) =>
-      guard(() => runUpload((meta) => sdk.getFileRevisionUploader(nodeUid, meta, o.signal) as never, file, o)),
+      guard(() => runUpload((meta, signal) => sdk.getFileRevisionUploader(nodeUid, meta, signal) as never, file, o)),
     trash: (uids) =>
       guard(async () => {
         const out: { uid: string; ok: boolean; error?: string; code?: DriveErrorCode }[] = [];

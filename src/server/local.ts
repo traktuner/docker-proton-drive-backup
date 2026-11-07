@@ -171,7 +171,7 @@ export async function* walkSourceStream(
     queue.push(m);
     waiting?.();
   });
-  worker.on('error', (e) => {
+  worker.on('error', (e: Error) => {
     failure = e;
     waiting?.();
   });

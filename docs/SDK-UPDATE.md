@@ -1,7 +1,8 @@
 # Update the Proton SDK
 
-The app release has its own version (`package.json` → `version`, image tag
-`<version>-<revision>`). The Proton Drive SDK is a pinned dependency of it.
+The app release has its own version (`package.json` → `version`, image tags
+`X.Y.Z`/`X.Y`/`X`, see [RELEASING.md](RELEASING.md)). The Proton Drive SDK is a
+pinned dependency of it.
 
 ## One pin, everything derived
 

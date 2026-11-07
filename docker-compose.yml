@@ -6,9 +6,8 @@ services:
   proton-drive:
     container_name: proton-drive-backup
 
-    # Pin to a specific version-revision tag so Renovate proposes updates, e.g.:
-    #   image: ghcr.io/traktuner/docker-proton-drive-backup:0.4.3-22
-    # or track the rolling tag:
+    # `latest` follows releases. To pin, use `:1` (all 1.x), `:1.0` (fixes only)
+    # or an exact version such as `:1.0.0` (docs/RELEASING.md).
     image: ghcr.io/traktuner/docker-proton-drive-backup:latest
     # Or build locally instead of pulling:
     # build: .

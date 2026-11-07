@@ -66,6 +66,9 @@ mark() { wc -l <"$W/fake-drive/ops.log" 2>/dev/null || echo 0; }
 
 # ---------------------------------------------------------------- setup ---
 log "Workdir $W  (old: $OLD_IMAGE  new: $NEW_IMAGE)"
+# The published image is pulled like a user would; the new one must be built locally.
+docker image inspect "$OLD_IMAGE" >/dev/null 2>&1 || docker pull --platform linux/amd64 "$OLD_IMAGE" >/dev/null
+docker image inspect "$NEW_IMAGE" >/dev/null 2>&1 || { echo "build $NEW_IMAGE first (docker build -t $NEW_IMAGE .)" >&2; exit 2; }
 mkdir -p "$W/data" "$W/sources" "$W/fake-drive"
 # The documented compose file, unchanged except host port, name and image tag.
 sed -e "s#\"3000:3000\"#\"127.0.0.1:$PORT:3000\"#" \

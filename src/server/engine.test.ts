@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { describe, it, expect, beforeEach } from 'vitest';
 import { FakeDrive } from '../../test/fake-drive';
-import { runSet, previewSet, verifySet, relBaseFor, topMost, type RunSpec } from '@/server/engine';
+import { runSet, previewSet, verifySet, relBaseFor, topMost, engineActivity, type RunSpec } from '@/server/engine';
 import { catalog } from '@/server/catalog';
 import { LOCAL_ROOT } from '@/server/local';
 import { backupSets, getDb } from '@/server/db';
@@ -267,9 +267,12 @@ describe('many empty folders (a photo library\'s internals) do not stall the sca
     let peak = 0;
     const made = new Map<string, number>();
     const orig = drive.createFolder.bind(drive);
+    let maxQueued = 0;
     drive.createFolder = async (parentUid: string, name: string) => {
       active++;
       peak = Math.max(peak, active);
+      const act = engineActivity().find((a) => a.setId === spec.setId) as { emptyFoldersQueued?: number } | undefined;
+      maxQueued = Math.max(maxQueued, act?.emptyFoldersQueued ?? 0);
       await new Promise((r) => setTimeout(r, 15)); // a real create takes ~300 ms
       try {
         const n = await orig(parentUid, name);
@@ -296,6 +299,8 @@ describe('many empty folders (a photo library\'s internals) do not stall the sca
     expect([...made.values()].every((c) => c === 1)).toBe(true); // shared parents created once
     for (let i = 0; i < 60; i++) expect(drive.at(remote(spec, `lib/private/c${i % 6}/e${i}`))?.kind).toBe('folder');
     expect(seen.some((c) => /\d+ empty folders created/.test(c))).toBe(true);
+    expect(maxQueued).toBeGreaterThan(0); // /api/diagnostics shows the backlog
+    expect(engineActivity().find((a) => a.setId === spec.setId)).toBeUndefined(); // gone after the run
     drive.reset();
     const r2 = await runSet(drive, spec);
     expect(r2.ok).toBe(true);

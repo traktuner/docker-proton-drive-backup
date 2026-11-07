@@ -246,6 +246,8 @@ class RunContext {
   onListing?: (folderUid: string, count: number) => void;
   /** Listings in progress, for /api/diagnostics: a stalled listing shows as idle time. */
   readonly activeListings = new Map<string, { items: number; startedAt: number; lastItemAt: number }>();
+  /** Counters of the running walk, for /api/diagnostics. */
+  info?: () => Record<string, number>;
   /** Folder resolutions in progress: parallel work in one new folder creates it ONCE. */
   private resolving = new Map<string, Promise<string | null>>();
   setFolderUid = '';
@@ -827,6 +829,7 @@ export function engineActivity() {
   const now = Date.now();
   return [...activeRuns.entries()].map(([setId, ctx]) => ({
     setId,
+    ...ctx.info?.(),
     listings: [...ctx.activeListings.entries()].map(([uid, a]) => ({
       folder: ctx.relOf(uid) ?? uid,
       items: a.items,
@@ -868,6 +871,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   let lastReport = 0;
   let scanned = 0;
   let emptyDirsMade = 0;
+  const pendingDirs: string[] = []; // empty local folders still to create on Drive
   // While an existing Drive folder is listed: adopt every entry that matches the
   // local file (same size and modification time), in transactions of one chunk —
   // so even an interrupted listing keeps what it found.
@@ -931,6 +935,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
     const parts = [`${scanned.toLocaleString('en')} checked`, `${unchangedCount.toLocaleString('en')} unchanged`];
     if (adoptedCount) parts.push(`${adoptedCount.toLocaleString('en')} already on Drive`);
     if (emptyDirsMade) parts.push(`${emptyDirsMade.toLocaleString('en')} empty folders created`);
+    if (pendingDirs.length) parts.push(`${pendingDirs.length.toLocaleString('en')} queued`);
     if (failedCount) parts.push(`${failedCount.toLocaleString('en')} skipped`);
     if (where) parts.push(where);
     hooks.onProgress?.({ doneFiles, totalFiles: 0, doneBytes, totalBytes: 0, current: parts.join(' · '), bytesPerSec: speed(doneBytes) });
@@ -1169,7 +1174,8 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
 
   // 4. Walk + diff. Mirror finds local removals per folder (no per-file writes).
   const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
-  const pendingDirs: string[] = [];
+  let dirsWalked = 0;
+  ctx.info = () => ({ filesChecked: scanned, foldersWalked: dirsWalked, emptyFoldersQueued: pendingDirs.length, emptyFoldersCreated: emptyDirsMade });
   // Empty folders are created in their own background lane while the scan and the
   // uploads go on: thousands of them (a photo library's internals) take a while at
   // ~0.5 s per request, and nothing else depends on them. The scan only waits when
@@ -1209,12 +1215,16 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         removed?.unreadable(rel);
         noteFailed(rel, reason);
       },
-      onDir: (rel, subdirs) => removed?.enter(rel, subdirs),
+      onDir: (rel, subdirs) => {
+        dirsWalked++;
+        removed?.enter(rel, subdirs);
+      },
       // Folders are created on demand for the files in them; only truly EMPTY local
       // folders are created explicitly, so they are mirrored too.
       onEmptyDir: (rel) => {
         if (ctx.isExcluded(rel) && rel !== relBase) return;
         if (!catalog.getDir(spec.setId, rel)) pendingDirs.push(rel);
+        report('scanning'); // a stretch of folders without files still shows progress
       },
     })) {
       if (shouldCancel()) {

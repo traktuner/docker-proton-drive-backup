@@ -102,6 +102,8 @@ export interface UploadResult {
 
 /** The Drive operations the app uses. Implemented by the SDK runtime and by test fakes. */
 export interface DriveService {
+  /** When Proton last answered 429 (rate limit), epoch ms; 0 = never. */
+  rateLimitedAt?(): number;
   /** The "My files" root folder. */
   root(): Promise<RemoteNode>;
   /** Fresh node metadata, or null if Drive confirms the node does not exist. */

@@ -371,6 +371,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   const baseUrl = opts.baseUrl || 'drive-api.proton.me';
   const header = appVersionHeader(opts.appVersion, opts.appBuild);
   const notices: UpdateNotice[] = [];
+  let last429At = 0;
   const stats = { total: 0, byEndpoint: {} as Record<string, number>, byStatus: {} as Record<string, number> };
   const noticeOnce = (kind: UpdateNotice['kind'], message: string) => {
     if (notices.some((n) => n.message === message)) return;
@@ -408,6 +409,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
       (req, _o, res) => {
         stats.total++;
         stats.byStatus[res.status] = (stats.byStatus[res.status] ?? 0) + 1; // 429 = Proton rate limit
+        if (res.status === 429) last429At = Date.now();
         try {
           const u = new URL(req.url);
           // Mask ids (long tokens) so the endpoint shape is countable.
@@ -634,6 +636,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   };
 
   const drive: DriveService = {
+    rateLimitedAt: () => last429At,
     root: () => guard(async () => toRemote(await sdk.getMyFilesRootFolder())),
     async getNode(uid) {
       return guard(async () => {

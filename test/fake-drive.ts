@@ -52,10 +52,17 @@ export class FakeDrive implements DriveService {
     return n;
   }
 
+  /** When a (simulated) 429 last happened — the runtime reports Proton's real ones. */
+  last429At = 0;
+  rateLimitedAt() {
+    return this.last429At;
+  }
+
   private fault(op: Op, name = '', afterCommit = false) {
     const f = this.faults.find((x) => x.op === op && !!x.afterCommit === afterCommit && (!x.match || x.match(name)));
     if (!f) return;
     if (--f.times <= 0) this.faults.splice(this.faults.indexOf(f), 1);
+    if (f.code === 'RATE_LIMITED') this.last429At = Date.now();
     throw new DriveError(f.code, `injected ${f.code} on ${op}`);
   }
 

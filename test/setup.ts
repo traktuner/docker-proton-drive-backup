@@ -14,6 +14,7 @@ process.env.TZ = 'UTC';
 // Near-zero upload-retry backoff so failure-path tests (batch isolation / bisection)
 // don't wait out the real multi-second exponential backoff.
 process.env.PDB_UPLOAD_RETRY_BASE_MS = '1';
+process.env.PDB_RATE_LIMIT_COOLDOWN_MS = '20'; // the real SDK cool-down is 60 s
 fs.mkdirSync(process.env.LOCAL_ROOT, { recursive: true });
 
 // Expose the temp root for tests that need to create fixture files.

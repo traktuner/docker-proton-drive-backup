@@ -100,6 +100,19 @@ export interface RunHooks {
 
 const FAILED_SAMPLE_CAP = 100;
 const RETRY_BASE_MS = Number(process.env.PDB_UPLOAD_RETRY_BASE_MS) || 2000;
+/**
+ * After 50 consecutive 429 answers the SDK refuses every request for 60 s
+ * ("Too many server requests"). A rate-limited retry waits that long, so it is
+ * never wasted on the SDK's own cool-down (the SDK itself already waits out each
+ * 429's Retry-After before it gives up).
+ */
+const RATE_LIMIT_COOLDOWN_MS = Number(process.env.PDB_RATE_LIMIT_COOLDOWN_MS) || 60_000;
+
+/** How long to wait before retry `attempt` (1-based) after a transient error. */
+function retryDelay(code: string, attempt: number): number {
+  const backoff = RETRY_BASE_MS * 4 ** (attempt - 1);
+  return code === 'RATE_LIMITED' ? Math.max(RATE_LIMIT_COOLDOWN_MS, backoff) : backoff;
+}
 const SESSION_EXPIRED_MSG =
   'Proton session expired — reconnect to Proton Drive to resume. Nothing was deleted and your backup set is unchanged.';
 
@@ -1161,7 +1174,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         const fsCode = code ? undefined : (e as NodeJS.ErrnoException)?.code; // DriveError has .code too
         if (fsCode === 'ENOENT') return; // deleted locally since the walk — not a failure
         if (code && TRANSIENT.has(code) && attempt < 4 && !fsCode) {
-          const wait = RETRY_BASE_MS * 4 ** (attempt - 1);
+          const wait = retryDelay(code, attempt);
           log(`  ${f.rel}: ${describeUploadError(e)} — retry ${attempt}/3 in ${Math.round(wait / 1000)}s`);
           for (let w = 0; w < wait && !shouldCancel(); w += 250) await sleep(Math.min(250, wait));
           continue;
@@ -1183,22 +1196,46 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   const DIR_LANE = 4;
   const DIR_BACKLOG_CAP = 20_000;
   const dirLane = new Set<Promise<void>>();
-  const dirWorker = async () => {
+  // Proton answered 429 (rate limit) recently: the lane shrinks to one worker
+  // until a full cool-down passed without one, then opens up again.
+  const throttled = () => Date.now() - (drive.rateLimitedAt?.() ?? 0) < RATE_LIMIT_COOLDOWN_MS;
+  const dirWorker = async (index: number) => {
     while (pendingDirs.length && !sessionDead && !shouldCancel()) {
+      if (index > 0 && throttled()) {
+        await sleep(1000);
+        continue;
+      }
       const rel = pendingDirs.shift()!;
-      try {
-        await ctx.dirUid(rel, true);
-        emptyDirsMade++;
-        report('');
-      } catch (e) {
-        if (driveErrorCode(e) === 'UNAUTHENTICATED') sessionDead = true;
-        else noteFailed(rel, describeUploadError(e));
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await ctx.dirUid(rel, true);
+          emptyDirsMade++;
+          report('');
+          break;
+        } catch (e) {
+          const code = driveErrorCode(e);
+          if (code === 'UNAUTHENTICATED') {
+            sessionDead = true;
+            break;
+          }
+          if (code === 'CANCELLED' || shouldCancel()) break;
+          // Rate limit, network, server hiccup: wait and try the same folder again —
+          // a transient answer never turns into a skipped folder on the first try.
+          if (code && TRANSIENT.has(code) && attempt < 4) {
+            const wait = retryDelay(code, attempt);
+            log(`  ${rel}: ${describeUploadError(e)} — retry ${attempt}/3 in ${Math.round(wait / 1000)}s`);
+            for (let w = 0; w < wait && !shouldCancel(); w += 250) await sleep(Math.min(250, wait));
+            continue;
+          }
+          noteFailed(rel, describeUploadError(e));
+          break;
+        }
       }
     }
   };
   const drainDirs = async (all = false) => {
     while (dirLane.size < DIR_LANE && pendingDirs.length) {
-      const w: Promise<void> = dirWorker().finally(() => dirLane.delete(w));
+      const w: Promise<void> = dirWorker(dirLane.size).finally(() => dirLane.delete(w));
       dirLane.add(w);
     }
     while (pendingDirs.length > (all ? 0 : DIR_BACKLOG_CAP) && dirLane.size) await Promise.race(dirLane);

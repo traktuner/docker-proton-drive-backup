@@ -307,6 +307,31 @@ describe('many empty folders (a photo library\'s internals) do not stall the sca
     expect(drive.calls.createFolder).toBe(0);
   });
 
+  it('a rate limit (429) never skips a folder, and the lane shrinks to one worker while Proton throttles', async () => {
+    for (let i = 0; i < 12; i++) fs.mkdirSync(path.join(src, `cache/e${i}`), { recursive: true });
+    const spec = makeSet('mirror');
+    drive.faults.push({ op: 'createFolder', code: 'RATE_LIMITED', times: 3, match: (n) => n.startsWith('e') });
+    let active = 0;
+    let peak = 0;
+    const orig = drive.createFolder.bind(drive);
+    drive.createFolder = async (parentUid: string, name: string) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 5));
+      try {
+        return await orig(parentUid, name);
+      } finally {
+        active--;
+      }
+    };
+    drive.rateLimitedAt = () => Date.now(); // Proton keeps answering 429 for this run
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.failedCount).toBe(0);
+    for (let i = 0; i < 12; i++) expect(drive.at(remote(spec, `cache/e${i}`))?.kind).toBe('folder');
+    expect(peak).toBe(1);
+  });
+
   it('parallel uploads into one new folder create that folder once', async () => {
     for (let i = 0; i < 20; i++) write(`fresh/deep/f${i}.txt`, `n${i}`);
     const spec = makeSet('backup');

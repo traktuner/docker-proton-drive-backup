@@ -332,6 +332,22 @@ describe('many empty folders (a photo library\'s internals) do not stall the sca
     expect(peak).toBe(1);
   });
 
+  it('a backlog over the cap makes the scan wait, and still every folder is created', async () => {
+    process.env.PDB_DIR_BACKLOG_CAP = '5';
+    try {
+      for (let i = 0; i < 5000; i++) fs.mkdirSync(path.join(src, `many/d${i}`), { recursive: true });
+      write('zz/after.txt', 'after');
+      const spec = makeSet('mirror');
+      const r = await runSet(drive, spec);
+      expect(r.ok).toBe(true);
+      expect(r.newCount).toBe(1);
+      const many = drive.at(remote(spec, 'many'))!.uid;
+      expect([...drive.nodes.values()].filter((n) => n.parentUid === many).length).toBe(5000);
+    } finally {
+      delete process.env.PDB_DIR_BACKLOG_CAP;
+    }
+  });
+
   it('parallel uploads into one new folder create that folder once', async () => {
     for (let i = 0; i < 20; i++) write(`fresh/deep/f${i}.txt`, `n${i}`);
     const spec = makeSet('backup');

@@ -188,6 +188,27 @@ export function relBaseFor(subfolder: string, abs: string): string {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** FIFO with O(1) shift (Array#shift is O(n): 100k shifts took 9.5 s). */
+class Fifo<T> {
+  private items: T[] = [];
+  private head = 0;
+  get length() {
+    return this.items.length - this.head;
+  }
+  push(x: T) {
+    this.items.push(x);
+  }
+  shift(): T | undefined {
+    if (this.head >= this.items.length) return undefined;
+    const x = this.items[this.head++];
+    if (this.head > 4096 && this.head * 2 > this.items.length) {
+      this.items = this.items.slice(this.head); // compact now and then
+      this.head = 0;
+    }
+    return x;
+  }
+}
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 160);
 
 /** Human reason for one file's failure (run summary / skipped-files panel). */
@@ -884,7 +905,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   let lastReport = 0;
   let scanned = 0;
   let emptyDirsMade = 0;
-  const pendingDirs: string[] = []; // empty local folders still to create on Drive
+  const pendingDirs = new Fifo<string>(); // empty local folders still to create on Drive
   // While an existing Drive folder is listed: adopt every entry that matches the
   // local file (same size and modification time), in transactions of one chunk —
   // so even an interrupted listing keeps what it found.
@@ -1194,7 +1215,8 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   // ~0.5 s per request, and nothing else depends on them. The scan only waits when
   // the backlog gets very large (memory bound).
   const DIR_LANE = 4;
-  const DIR_BACKLOG_CAP = 20_000;
+  // ~10 MiB per 100k queued paths (measured); a photo library alone had 66k+.
+  const DIR_BACKLOG_CAP = Number(process.env.PDB_DIR_BACKLOG_CAP) || 100_000;
   const dirLane = new Set<Promise<void>>();
   // Proton answered 429 (rate limit) recently: the lane shrinks to one worker
   // until a full cool-down passed without one, then opens up again.

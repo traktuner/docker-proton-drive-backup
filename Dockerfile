@@ -64,6 +64,7 @@ LABEL org.opencontainers.image.title="Proton Drive Backup" \
 # HOME stays on the writable /data volume so a read-only root and a non-root
 # `user:` both work. The Proton session lives in PROTON_DRIVE_CACHE_DIR
 # (/data/proton/auth-session.json, the same file the CLI-era releases used).
+# UV_THREADPOOL_SIZE: parallel stat() on NFS/SMB sources (libuv default is 4).
 ENV NODE_ENV=production \
     PORT=3000 \
     HOSTNAME=0.0.0.0 \
@@ -71,6 +72,7 @@ ENV NODE_ENV=production \
     LOCAL_ROOT=/sources \
     PROTON_DRIVE_CACHE_DIR=/data/proton \
     PROTON_RUNTIME=/app/dist-proton/runtime.mjs \
+    UV_THREADPOOL_SIZE=16 \
     CONFIG_DIR=/config \
     HOME=/data/proton
 

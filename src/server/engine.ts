@@ -199,12 +199,24 @@ export function describeUploadError(e: unknown): string {
       return 'the file changed while it was being uploaded';
     case 'DECRYPTION':
       return 'Drive metadata could not be decrypted';
+    case 'FOLDER_FULL':
+      return 'the Drive folder has reached Proton Drive\'s limit of items per folder — files in it are skipped (exclude this folder, or split it locally)';
+    case 'TOO_DEEP':
+      return 'folders are nested deeper than Proton Drive allows';
+    case 'FILE_TOO_LARGE':
+      return 'the file is larger than the Proton plan allows';
     default:
       return errMsg(e) || 'upload failed';
   }
 }
 
 const TRANSIENT = new Set(['NETWORK', 'RATE_LIMITED', 'SERVER', 'INTEGRITY', 'UNKNOWN']);
+
+/** Refusals that no retry will change: the whole folder is affected for the rest of the run. */
+function isPermanentFolderError(e: unknown): boolean {
+  const c = driveErrorCode(e);
+  return c === 'FOLDER_FULL' || c === 'TOO_DEEP';
+}
 
 /* ------------------------------------------------------------------ */
 /* Shared context: Drive folder resolution for one run                 */
@@ -218,6 +230,10 @@ class RunContext {
   private kids = new Map<string, Map<string, RemoteNode>>();
   setFolderUid = '';
   targetUid = '';
+  /** Folders this run created: known to be empty, no listing needed. */
+  private created = new Set<string>();
+  /** rel dir → permanent Drive refusal (folder full, too deep): skip without requests. */
+  private blocked = new Map<string, DriveError>();
 
   constructor(
     readonly drive: DriveService,
@@ -252,6 +268,28 @@ class RunContext {
     return m;
   }
 
+  /** The permanent refusal recorded for `rel` or one of its ancestors, if any. */
+  blockedError(rel: string): DriveError | null {
+    for (let d = rel; d && d !== '.'; d = path.posix.dirname(d)) {
+      const e = this.blocked.get(d);
+      if (e) return e;
+    }
+    return null;
+  }
+
+  block(rel: string, e: DriveError) {
+    this.blocked.set(rel, e);
+  }
+
+  wasCreated(uid: string): boolean {
+    return this.created.has(uid);
+  }
+
+  /** Record a node we just uploaded in the cached listing of its folder. */
+  noteChild(folderUid: string, node: RemoteNode) {
+    this.kids.get(folderUid)?.set(node.name ?? '', node);
+  }
+
   forgetDir(rel: string) {
     const uid = this.dirUids.get(rel);
     this.dirUids.delete(rel);
@@ -282,8 +320,15 @@ class RunContext {
     if (n && n.kind !== 'folder') throw new DriveError('NAME_CONFLICT', `a file named "${name}" is where a folder belongs`);
     if (!n) {
       if (!create || !this.write) return null;
-      n = await this.drive.createFolder(parent, name);
+      try {
+        n = await this.drive.createFolder(parent, name);
+      } catch (e) {
+        if (isPermanentFolderError(e)) this.blocked.set(rel, e as DriveError);
+        throw e;
+      }
       kids.set(name, n);
+      this.created.add(n.uid);
+      this.kids.set(n.uid, new Map());
     }
     if (this.write) catalog.upsertDir(this.spec.setId, rel, this.seenAt, n.uid);
     this.remember(rel, n.uid);
@@ -567,11 +612,18 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   const failedFiles: SkippedFile[] = [];
   const speed = makeSpeedMeter();
   let lastReport = 0;
-  const report = (current: string, force = false) => {
+  let scanned = 0;
+  const report = (where: string, force = false) => {
     const now = Date.now();
     if (!force && now - lastReport < 250) return;
     lastReport = now;
-    hooks.onProgress?.({ doneFiles, totalFiles: 0, doneBytes, totalBytes: 0, current, bytesPerSec: speed(doneBytes) });
+    // The UI prefixes "<n> uploaded · <bytes>"; the scan counters make a long walk
+    // over an unchanged (or already uploaded) tree visibly progress.
+    const parts = [`${scanned.toLocaleString('en')} checked`, `${unchangedCount.toLocaleString('en')} unchanged`];
+    if (adoptedCount) parts.push(`${adoptedCount.toLocaleString('en')} already on Drive`);
+    if (failedCount) parts.push(`${failedCount.toLocaleString('en')} skipped`);
+    if (where) parts.push(where);
+    hooks.onProgress?.({ doneFiles, totalFiles: 0, doneBytes, totalBytes: 0, current: parts.join(' · '), bytesPerSec: speed(doneBytes) });
   };
   const noteFailed = (rel: string, reason: string) => {
     failedCount++;
@@ -635,8 +687,14 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
 
   /** Same content on Drive as on disk? Reads the local file only when size (and, if asked, mtime) already match. */
   const sameContent = async (remote: RemoteNode, abs: string, size: number, mtimeMs: number, requireMtime: boolean) => {
-    if (remote.kind !== 'file' || remote.size !== size || !remote.sha1) return false;
-    if (requireMtime && (remote.mtimeMs === null || Math.abs(remote.mtimeMs - mtimeMs) > 2000)) return false;
+    if (remote.kind !== 'file' || remote.size !== size) return false;
+    const sameTime = remote.mtimeMs !== null && Math.abs(remote.mtimeMs - mtimeMs) <= 2000;
+    if (requireMtime && !sameTime) return false;
+    // Size + modification time equal: the same evidence the delta itself trusts
+    // (diffFile), so no full read — Drive stores the time the uploader claimed from
+    // this very file. Only a same-size file with a different time is hashed.
+    if (sameTime && !requireMtime) return true;
+    if (!remote.sha1) return false;
     return (await sha1File(abs)) === remote.sha1;
   };
 
@@ -658,9 +716,49 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
         };
       })(),
     };
+    const done = (how: 'adopted' | 'kept') => {
+      if (verdict === 'new') newCount--;
+      else changedCount--;
+      unchangedCount++;
+      if (how === 'adopted') adoptedCount++;
+      report('/' + relDir);
+    };
+    /**
+     * Drive already has a file with this name. Same size and modification time as
+     * on disk → it is this file (the same evidence the delta uses; e.g. uploaded by
+     * the CLI release or by a run that died before recording it): record, no read,
+     * no upload. Same size only → compare SHA-1 (one local read). Otherwise Add
+     * keeps Drive's copy and Backup/Mirror write a new revision of that node.
+     */
+    const handleExisting = async (ex: RemoteNode, parentUid: string): Promise<boolean> => {
+      if (ex.kind !== 'file') throw new DriveError('NAME_CONFLICT', `a folder named "${name}" already exists on Drive`);
+      if (await sameContent(ex, f.abs, f.size, f.mtimeMs, false)) {
+        record(f.rel, f.size, f.mtimeMs, ex.sha1, ex.uid);
+        done('adopted');
+        return true;
+      }
+      if (spec.mode === 'add') {
+        // Add never updates. Record what Drive has (NOT the local stat), so a
+        // later switch to Backup still sees the difference and uploads it.
+        record(f.rel, ex.size ?? -1, ex.mtimeMs ?? 0, ex.sha1, ex.uid);
+        done('kept');
+        return true;
+      }
+      const res = await drive.uploadRevision(ex.uid, f, opts);
+      finish(res, parentUid);
+      return true;
+    };
+    const finish = (res: { nodeUid: string; sha1: string }, parentUid: string) => {
+      record(f.rel, f.size, f.mtimeMs, res.sha1, res.nodeUid);
+      ctx.noteChild(parentUid, { uid: res.nodeUid, parentUid, name, kind: 'file', size: f.size, mtimeMs: f.mtimeMs, sha1: res.sha1, mediaType: null, trashed: false });
+      doneFiles++;
+    };
+
     for (let attempt = 1; ; attempt++) {
       try {
-        let parentUid = await ctx.dirUid(relDir, true);
+        const refused = ctx.blockedError(relDir);
+        if (refused) throw refused;
+        const parentUid = await ctx.dirUid(relDir, true);
         if (!parentUid) throw new DriveError('NOT_FOUND', 'parent folder missing');
         let nodeUid = cat?.nodeUid ?? null;
         if (verdict === 'changed' && !nodeUid) nodeUid = (await ctx.childMap(parentUid)).get(name)?.uid ?? null;
@@ -671,50 +769,35 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
             nodeUid = null; // gone or no longer ours where it was: upload as a new file
           } else if (await sameContent(remote, f.abs, f.size, f.mtimeMs, true)) {
             record(f.rel, f.size, f.mtimeMs, remote.sha1, remote.uid);
-            adoptedCount++;
-            changedCount--;
-            unchangedCount++;
+            done('adopted');
             return;
           }
         }
 
-        let res;
         if (nodeUid) {
-          res = await drive.uploadRevision(nodeUid, f, opts);
+          finish(await drive.uploadRevision(nodeUid, f, opts), parentUid);
         } else {
+          // One listing per folder (cached) instead of one failed upload per file:
+          // decisive after a CLI-era first upload that died before it was recorded.
+          if (!ctx.wasCreated(parentUid)) {
+            const ex = (await ctx.childMap(parentUid)).get(name);
+            if (ex && (await handleExisting(ex, parentUid))) return;
+          }
           try {
-            res = await drive.uploadNew(parentUid, name, f, opts);
+            finish(await drive.uploadNew(parentUid, name, f, opts), parentUid);
           } catch (e) {
             if (!(e instanceof Error) || driveErrorCode(e) !== 'NAME_CONFLICT') throw e;
             const c = e as DriveError;
             if (c.existingIsDraft) {
-              res = await drive.uploadNew(parentUid, name, f, { ...opts, overrideDraft: true });
+              finish(await drive.uploadNew(parentUid, name, f, { ...opts, overrideDraft: true }), parentUid);
             } else {
               const ex = c.existingUid ? await drive.getNode(c.existingUid) : null;
               if (!ex) throw e;
-              if (ex.kind !== 'file') throw new DriveError('NAME_CONFLICT', `a folder named "${name}" already exists on Drive`);
-              if (await sameContent(ex, f.abs, f.size, f.mtimeMs, false)) {
-                record(f.rel, f.size, f.mtimeMs, ex.sha1, ex.uid);
-                adoptedCount++;
-                if (verdict === 'new') newCount--;
-                else changedCount--;
-                unchangedCount++;
-                return;
-              }
-              if (spec.mode === 'add') {
-                // Add never updates. Record what Drive has (NOT the local stat), so a
-                // later switch to Backup still sees the difference and uploads it.
-                record(f.rel, ex.size ?? -1, ex.mtimeMs ?? 0, ex.sha1, ex.uid);
-                newCount--;
-                unchangedCount++;
-                return;
-              }
-              res = await drive.uploadRevision(ex.uid, f, opts);
+              await handleExisting(ex, parentUid);
+              return;
             }
           }
         }
-        record(f.rel, f.size, f.mtimeMs, res.sha1, res.nodeUid);
-        doneFiles++;
         // Changed while we read it? The catalog holds the digest of what was really
         // uploaded, so the next run sees the new mtime, hashes, and uploads again.
         const after = await fsp.stat(f.abs).catch(() => null);
@@ -729,6 +812,15 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
           return;
         }
         if (code === 'CANCELLED' || shouldCancel()) return;
+        if (isPermanentFolderError(e)) {
+          // Never retried, and every other file of this folder is skipped at once.
+          if (!ctx.blockedError(relDir)) {
+            ctx.block(relDir, e as DriveError);
+            log(`  ${relDir}: ${describeUploadError(e)}`);
+          }
+          noteFailed(f.rel, describeUploadError(e));
+          return;
+        }
         if (code === 'NOT_FOUND' && attempt === 1) {
           // A cached folder uid went stale (folder deleted on Drive): resolve again.
           ctx.forgetDir(relDir);
@@ -786,6 +878,8 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
         break outer;
       }
       if (sessionDead) break outer;
+      scanned++;
+      report('scanning');
       // Folders first (keeps empty folders mirrored).
       await drainDirs();
       removed?.seen(file.rel);
@@ -1120,8 +1214,11 @@ export async function verifySet(
         const local = abs ? await sha1File(abs).catch(() => null) : null;
         if (local && r.sha1 && local !== r.sha1) {
           contentMismatches++;
-          drop.push(row.rel);
           repaired++;
+          // Not dropped: size and time still match Drive, so a dropped row would be
+          // re-adopted. An impossible mtime forces the next run to compare SHA-1 and
+          // write a new revision of this node.
+          catalog.upsertFile(spec.setId, row.rel, row.size ?? 0, -1, r.sha1, catalog.maxSeenAt(spec.setId), r.uid);
           log(`  content differs: ${row.rel}`);
         }
       }

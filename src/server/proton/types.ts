@@ -42,6 +42,12 @@ export type DriveErrorCode =
   | 'INTEGRITY'
   | 'DECRYPTION'
   | 'QUOTA'
+  /** The Drive folder holds the maximum number of items Proton allows (200300). */
+  | 'FOLDER_FULL'
+  /** Folder nesting deeper than Proton allows (200301). */
+  | 'TOO_DEEP'
+  /** File larger than the account's plan allows (200003). */
+  | 'FILE_TOO_LARGE'
   | 'INVALID_NAME'
   | 'CANCELLED'
   | 'SERVER'

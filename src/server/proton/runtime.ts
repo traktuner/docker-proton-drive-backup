@@ -149,6 +149,11 @@ function mapError(e: unknown, fallback: DriveErrorCode = 'UNKNOWN'): DriveError 
   const err = e as { name?: string; message?: string; code?: number; statusCode?: number; existingNodeUid?: string; isUnfinishedUpload?: boolean };
   const msg = String(err?.message ?? e).slice(0, 300);
   const name = err?.name ?? '';
+  // Proton API codes (internal/apiService/errorCodes.ts): permanent, never retried.
+  if (err?.code === 200300) return new DriveError('FOLDER_FULL', msg, { cause: e });
+  if (err?.code === 200301) return new DriveError('TOO_DEEP', msg, { cause: e });
+  if (err?.code === 200003) return new DriveError('FILE_TOO_LARGE', msg, { cause: e });
+  if (err?.code === 200001 || err?.code === 200002 || err?.code === 200100) return new DriveError('QUOTA', msg, { cause: e });
   if (name === 'NodeWithSameNameExistsValidationError')
     return new DriveError('NAME_CONFLICT', msg, { existingUid: err.existingNodeUid, existingIsDraft: !!err.isUnfinishedUpload, cause: e });
   if (name === 'NotFoundAPIError' || err?.code === 2501) return new DriveError('NOT_FOUND', msg, { cause: e });

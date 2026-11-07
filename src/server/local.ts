@@ -113,6 +113,9 @@ const flush = async () => {
   await new Promise((r) => (wake = r));
 };
 const reason = (e) => (e && e.code) || 'unreadable';
+// Adaptive stat strategy (see recur): probe the first PROBES stats synchronously.
+const PROBES = 64, SLOW_NS = 150000, PARALLEL = 32;
+let slow = workerData.forceParallel ? true : null, probes = 0, probeNs = 0;
 async function recur(dir, rel) {
   let ents;
   try { ents = fs.readdirSync(dir, { withFileTypes: true }); }
@@ -123,15 +126,37 @@ async function recur(dir, rel) {
   batch.push(['d', rel, visible.filter((e) => e.isDirectory()).map((e) => e.name)]);
   if (visible.length === 0) batch.push(['e', rel]);
   const subdirs = [];
+  const files = [];
   for (const e of visible) {
     const abs = path.join(dir, e.name);
     const r = rel + '/' + e.name;
     if (e.isDirectory()) subdirs.push([abs, r]);
-    else if (e.isFile()) {
-      try { const s = fs.statSync(abs); batch.push(['f', r, abs, s.size, s.mtimeMs]); }
-      catch (err) { batch.push(['s', r, 'not readable (' + reason(err) + ')']); }
-      if (batch.length >= BATCH) await flush();
+    else if (e.isFile()) files.push([abs, r]);
+  }
+  // Local disks: synchronous stat (~8 µs). Network mounts (NFS/SMB): each stat is a
+  // round trip, so issue many at once. Decided by measuring the first stats.
+  for (let i = 0; i < files.length; ) {
+    const n = slow ? Math.min(PARALLEL, files.length - i) : 1;
+    const chunk = files.slice(i, i + n);
+    i += n;
+    let results;
+    if (n === 1) {
+      const t0 = process.hrtime.bigint();
+      try { results = [fs.statSync(chunk[0][0])]; } catch (err) { results = [err]; }
+      if (slow === null && ++probes <= PROBES) {
+        probeNs += Number(process.hrtime.bigint() - t0);
+        if (probes === PROBES) slow = probeNs / PROBES > SLOW_NS;
+      }
+    } else {
+      results = await Promise.all(chunk.map(([abs]) => fs.promises.stat(abs).catch((err) => err)));
     }
+    for (let k = 0; k < chunk.length; k++) {
+      const s = results[k];
+      const [abs, r] = chunk[k];
+      if (s instanceof Error) batch.push(['s', r, 'not readable (' + reason(s) + ')']);
+      else batch.push(['f', r, abs, s.size, s.mtimeMs]);
+    }
+    if (batch.length >= BATCH) await flush();
   }
   for (const [abs, r] of subdirs) await recur(abs, r);
   if (batch.length >= BATCH) await flush();
@@ -169,7 +194,7 @@ export async function* walkSourceStream(
   }
   if (!st.isDirectory()) return;
 
-  const worker = new Worker(SCAN_WORKER, { eval: true, workerData: { root: absPath, relBase, includeHidden } });
+  const worker = new Worker(SCAN_WORKER, { eval: true, workerData: { root: absPath, relBase, includeHidden, forceParallel: process.env.PDB_SCAN_FORCE_PARALLEL === '1' } });
   const queue: (unknown[][] | null)[] = [];
   let waiting: (() => void) | null = null;
   let failure: Error | null = null;

@@ -26,6 +26,14 @@ export class FakeDrive implements DriveService {
   bytesRead = 0;
   /** Fail the next N calls of an op with a code (consumed in order). */
   faults: { op: Op; code: DriveErrorCode; times: number; afterCommit?: boolean; match?: (name: string) => boolean }[] = [];
+  /** Proton's per-folder item limit (error 200300 → FOLDER_FULL); Infinity = off. */
+  maxChildren = Infinity;
+
+  private full(parentUid: string) {
+    let n = 0;
+    for (const x of this.nodes.values()) if (x.parentUid === parentUid && !x.trashed) n++;
+    if (n >= this.maxChildren) throw new DriveError('FOLDER_FULL', 'Folder limit reached');
+  }
 
   constructor() {
     this.nodes.set(this.rootUid, { uid: this.rootUid, parentUid: null, name: 'my-files', kind: 'folder', revisions: [], trashed: false });
@@ -155,6 +163,7 @@ export class FakeDrive implements DriveService {
     if (!p || p.trashed) throw new DriveError('NOT_FOUND', 'parent not found');
     const ex = this.childNamed(parentUid, name);
     if (ex) throw new DriveError('NAME_CONFLICT', 'exists', { existingUid: ex.uid });
+    this.full(parentUid);
     const buf = await this.read(file, o);
     const n = this.add(parentUid, name, 'file');
     const sha1 = createHash('sha1').update(buf).digest('hex');

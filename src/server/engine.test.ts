@@ -148,6 +148,40 @@ describe('upgrade from a CLI-era catalog (no node ids, no digests)', () => {
   });
 });
 
+describe('first SDK run after an interrupted CLI first upload (files on Drive, not in the catalog)', () => {
+  it('adopts them from one listing per folder: no upload, no conflict round trip, no file read', async () => {
+    const t = Date.now() - 3_600_000;
+    for (let d = 0; d < 3; d++) for (let i = 0; i < 20; i++) write(`y${d}/f${i}.jpg`, `photo ${d}-${i}`, t);
+    const spec = makeSet('mirror');
+    for (let d = 0; d < 3; d++) for (let i = 0; i < 20; i++) drive.putFile(remote(spec, `y${d}/f${i}.jpg`), `photo ${d}-${i}`, t);
+    write('y0/new.jpg', 'genuinely new', t);
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.adoptedCount).toBe(60);
+    expect(drive.calls.uploadNew).toBe(1); // only the genuinely new file
+    expect(drive.calls.uploadRevision + drive.calls.getNode).toBe(0); // no per-file node lookups
+    expect(drive.bytesRead).toBe('genuinely new'.length);
+    expect(catalog.countFiles(spec.setId)).toBe(61);
+  });
+});
+
+describe("Proton's per-folder item limit (200300)", () => {
+  it('is not retried; the rest of that folder is skipped at once, other folders continue', async () => {
+    for (let i = 0; i < 30; i++) write(`big/f${i}.bin`, `b${i}`);
+    for (let i = 0; i < 5; i++) write(`small/f${i}.bin`, `s${i}`);
+    const spec = makeSet('mirror');
+    drive.maxChildren = 10;
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(false);
+    expect(r.failedCount).toBe(20);
+    expect(r.failedFiles[0].reason).toMatch(/limit of items per folder/);
+    expect(drive.calls.uploadNew).toBe(10 + 1 + 5); // 10 fit, ONE refused attempt, then nothing more there
+    expect(drive.at(remote(spec, 'small/f4.bin'))).toBeDefined();
+    expect(r.deletionSkipped ?? '').not.toMatch(/never/); // failures block deletion (gate), as always
+  });
+});
+
 describe('crash between Drive confirmation and the SQLite commit', () => {
   it('a NEW file Drive already has is adopted, not uploaded twice', async () => {
     write('a.txt', 'payload');

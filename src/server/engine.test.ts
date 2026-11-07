@@ -207,6 +207,43 @@ describe('an existing Drive folder is listed once, ever', () => {
     expect(summary?.lastRel).toMatch(/\/graph$/);
   });
 
+  it('a listed folder is not listed again to find (or create) a subfolder, nor for CLI-era rows', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    for (let i = 0; i < 30; i++) {
+      write(`big/f${i}.jpg`, `p${i}`, t);
+      drive.putFile(remote(spec, `big/f${i}.jpg`), `p${i}`, t);
+    }
+    drive.putFile(remote(spec, 'big/sub/old.jpg'), 'o', t); // a subfolder already on Drive
+    write('big/new1.jpg', 'new one', t);
+    // A CLI-era row (no node uid, no digest) for a file the listing will see.
+    write('big/cli.jpg', 'cli', t);
+    drive.putFile(remote(spec, 'big/cli.jpg'), 'cli', t);
+    const cliRel = remote(spec, 'big/cli.jpg');
+    catalog.upsertFile(spec.setId, cliRel, 3, t, null, 1, null);
+    const r1 = await runSet(drive, spec); // lists "big" once (new1.jpg goes into it)
+    expect(r1.ok).toBe(true);
+    expect(catalog.getFile(spec.setId, cliRel)?.nodeUid).toBe(drive.at(remote(spec, 'big/cli.jpg'))!.uid); // remembered
+
+    const bigUid = drive.at(remote(spec, 'big'))!.uid;
+    let listedBig = 0;
+    const orig = drive.children.bind(drive);
+    drive.children = (uid: string) => {
+      if (uid === bigUid) listedBig++;
+      return orig(uid);
+    };
+    write('big/sub/fresh.jpg', 'fresh', t); // into the subfolder that exists on Drive
+    write('big/other/x.jpg', 'x', t); // into a subfolder that does not
+    write('big/cli.jpg', 'cli', t + 60_000); // same size, other mtime: compare digests
+    const subUid = drive.at(remote(spec, 'big/sub'))!.uid;
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(listedBig).toBe(0);
+    expect(drive.at(remote(spec, 'big/sub/fresh.jpg'))?.parentUid).toBe(subUid); // no second "sub"
+    expect(drive.at(remote(spec, 'big/other/x.jpg'))?.kind).toBe('file');
+    expect(drive.at(remote(spec, 'big/cli.jpg'))?.revisions).toHaveLength(1); // same content: no upload
+  });
+
   it('never adopts hidden files when the set excludes them', async () => {
     const t = Date.now() - 3_600_000;
     const spec = makeSet('backup');

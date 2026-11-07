@@ -386,6 +386,17 @@ class RunContext {
     return undefined;
   }
 
+  /**
+   * Like findIn, but never lists a folder that was fully listed before (listed_dirs):
+   * what that listing found is in the catalog, so an item that is neither there nor
+   * in this run's memory did not exist. A create that collides with an item made on
+   * Drive since then is resolved by the name-conflict handling (adopt, not duplicate).
+   */
+  async lookup(rel: string, name: string): Promise<RemoteNode | undefined> {
+    if (!catalog.isListed(this.spec.setId, rel)) return this.findIn(rel, name);
+    return this.cachedFind(rel, name, await this.folders(rel, false));
+  }
+
   /** Create folder `name` in local folder `rel`'s current Drive folder, overflowing when full. */
   async createIn(rel: string, name: string): Promise<RemoteNode> {
     for (let i = 0; i < 64; i++) {
@@ -515,7 +526,7 @@ class RunContext {
     const parent = await this.dirUid(parentRel, create);
     if (!parent) return null;
     const name = path.posix.basename(rel);
-    let n = await this.findIn(parentRel, name);
+    let n = await this.lookup(parentRel, name);
     if (n && n.kind !== 'folder') throw new DriveError('NAME_CONFLICT', `a file named "${name}" is where a folder belongs`);
     if (n && this.partOwner(n.uid)) throw new DriveError('NAME_CONFLICT', `"${name}" is the name of a continuation folder of this backup`);
     if (!n) {
@@ -804,8 +815,12 @@ class RemovedCollector {
 /* The run                                                              */
 /* ------------------------------------------------------------------ */
 
-/** Contexts of the runs in progress, per set (diagnostics only). */
-const activeRuns = new Map<string, RunContext>();
+/**
+ * Contexts of the runs in progress, per set (diagnostics only). On globalThis:
+ * Next.js can instantiate this module once per route bundle (see backup-lock.ts).
+ */
+const gRuns = globalThis as unknown as { __pdActiveRuns?: Map<string, RunContext> };
+const activeRuns = (gRuns.__pdActiveRuns ??= new Map<string, RunContext>());
 
 /** What running backups are doing on Drive right now (for /api/diagnostics). */
 export function engineActivity() {
@@ -859,15 +874,36 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   ctx.onChunk = async (uid, chunk) => {
     const rel = ctx.relOf(uid);
     if (!rel) return;
-    const cands = chunk.filter((n) => n.kind === 'file' && n.name && (spec.includeHidden || !n.name.startsWith('.')));
+    // Also remembered: the node of every row that has none yet (CLI-era rows) and of
+    // every local folder found on Drive — so no later lookup has to list this again.
+    const cands = chunk.filter((n) => n.name && (spec.includeHidden || !n.name.startsWith('.')));
+    const attach: { rel: string; kind: 'file' | 'dir'; n: RemoteNode }[] = [];
+    const dirs: { rel: string; n: RemoteNode }[] = [];
     const stats = await Promise.all(
       cands.map(async (n) => {
-        const fileRel = `${rel}/${n.name}`;
-        if (ctx.isExcluded(fileRel) || catalog.getFile(spec.setId, fileRel)) return null;
-        const abs = localAbsFor(spec, fileRel);
+        const childRel = `${rel}/${n.name}`;
+        if (ctx.isExcluded(childRel)) return null;
+        if (n.kind === 'folder') {
+          const row = catalog.getDir(spec.setId, childRel);
+          if (row) {
+            if (!row.nodeUid) attach.push({ rel: childRel, kind: 'dir', n });
+            return null;
+          }
+          if (ctx.partOwner(n.uid)) return null; // a continuation folder, not a local one
+          const abs = localAbsFor(spec, childRel);
+          const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+          if (st?.isDirectory()) dirs.push({ rel: childRel, n });
+          return null;
+        }
+        const row = catalog.getFile(spec.setId, childRel);
+        if (row) {
+          if (!row.nodeUid) attach.push({ rel: childRel, kind: 'file', n });
+          return null;
+        }
+        const abs = localAbsFor(spec, childRel);
         const st = abs ? await fsp.stat(abs).catch(() => null) : null;
         return st && st.isFile() && st.size === n.size && n.mtimeMs !== null && Math.abs(st.mtimeMs - n.mtimeMs) <= 2000
-          ? { fileRel, size: st.size, mtimeMs: st.mtimeMs, n }
+          ? { fileRel: childRel, size: st.size, mtimeMs: st.mtimeMs, n }
           : null;
       }),
     );
@@ -877,6 +913,8 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         record(x.fileRel, x.size, x.mtimeMs, x.n.sha1, x.n.uid);
         adoptedCount++;
       }
+      for (const a of attach) catalog.attachNode(spec.setId, a.rel, a.kind, a.n.uid, a.kind === 'file' ? a.n.sha1 : null);
+      for (const d of dirs) catalog.upsertDir(spec.setId, d.rel, seenAt, d.n.uid);
     });
   };
   ctx.onListing = (uid, count) => {
@@ -1035,7 +1073,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         if (!folders.length) throw new DriveError('NOT_FOUND', 'parent folder missing');
         const parentUid = folders[folders.length - 1]; // where new files go (the current part)
         let nodeUid = cat?.nodeUid ?? null;
-        if (verdict === 'changed' && !nodeUid) nodeUid = (await ctx.findIn(relDir, name))?.uid ?? null;
+        if (verdict === 'changed' && !nodeUid) nodeUid = (await ctx.lookup(relDir, name))?.uid ?? null;
 
         if (verdict === 'changed' && nodeUid) {
           const remote = await drive.getNode(nodeUid);
@@ -1189,8 +1227,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         let uid = cat!.nodeUid ?? null;
         try {
           if (!known) {
-            const parentUid = await ctx.dirUid(path.posix.dirname(file.rel), false);
-            uid ??= parentUid ? ((await ctx.childMap(parentUid)).get(path.posix.basename(file.rel))?.uid ?? null) : null;
+            uid ??= (await ctx.lookup(path.posix.dirname(file.rel), path.posix.basename(file.rel)))?.uid ?? null;
             const remote = uid ? await drive.getNode(uid) : null;
             known = remote && !remote.trashed ? remote.sha1 : null;
           }
@@ -1214,8 +1251,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         // (cached) instead of one request — or a full local read — per file. This is
         // also what CLI-era Add sets need after the upgrade: they had no catalog.
         try {
-          const parentUid = await ctx.dirUid(path.posix.dirname(file.rel), false);
-          const ex = parentUid ? (await ctx.childMap(parentUid)).get(path.posix.basename(file.rel)) : undefined;
+          const ex = await ctx.lookup(path.posix.dirname(file.rel), path.posix.basename(file.rel));
           if (ex && ex.kind === 'file') {
             // Record what Drive has (not the local stat): Backup would still see a difference.
             record(file.rel, ex.size ?? -1, ex.mtimeMs ?? 0, ex.sha1, ex.uid);

@@ -46,6 +46,8 @@ const SQL = {
        ON CONFLICT(set_id, rel) DO UPDATE SET seen_at = excluded.seen_at,
          node_uid = COALESCE(excluded.node_uid, backup_catalog.node_uid)`,
   setNodeUid: 'UPDATE backup_catalog SET node_uid = ? WHERE set_id = ? AND rel = ?',
+  attachNode: `UPDATE backup_catalog SET node_uid = ?, sha1 = COALESCE(sha1, ?)
+       WHERE set_id = ? AND rel = ? AND kind = ? AND node_uid IS NULL`,
   touch: 'UPDATE backup_catalog SET seen_at = ? WHERE set_id = ? AND rel = ?',
   stale: 'SELECT rel, kind, node_uid FROM backup_catalog WHERE set_id = ? AND seen_at < ? ORDER BY length(rel)',
   removeOne: 'DELETE FROM backup_catalog WHERE set_id = ? AND rel = ?',
@@ -116,6 +118,15 @@ export const catalog = {
   upsertDir(setId: string, rel: string, seenAt: number, nodeUid: string | null = null): void {
     ensure();
     stmt(SQL.upsertDir).run(setId, rel, seenAt, nodeUid);
+  },
+
+  /**
+   * A listing found the Drive node of a row that has none (CLI-era rows): remember
+   * it (and Drive's digest if we have none), so no later lookup has to list again.
+   */
+  attachNode(setId: string, rel: string, kind: 'file' | 'dir', nodeUid: string, sha1: string | null): void {
+    ensure();
+    stmt(SQL.attachNode).run(nodeUid, sha1, setId, rel, kind);
   },
 
   setNodeUid(setId: string, rel: string, nodeUid: string | null): void {

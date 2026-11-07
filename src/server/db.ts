@@ -234,15 +234,19 @@ function snapshotOnce(db: DatabaseSync) {
   const dest = preMigrationBackupPath();
   if (fs.existsSync(dest)) return;
   const tmp = `${dest}.tmp`;
-  fs.rmSync(tmp, { force: true });
+  const clean = () => {
+    for (const f of [tmp, `${tmp}-journal`, `${tmp}-wal`, `${tmp}-shm`]) fs.rmSync(f, { force: true });
+  };
+  clean(); // leftovers of a snapshot interrupted by a kill
   try {
     db.prepare('VACUUM INTO ?').run(tmp);
     fs.renameSync(tmp, dest);
+    clean();
     console.log(`[db] pre-migration snapshot written to ${dest}`);
   } catch (e) {
     // A full disk must not brick the upgrade: the migration itself is additive
     // and the old image can read the migrated file. Report and continue.
-    fs.rmSync(tmp, { force: true });
+    clean();
     console.warn('[db] could not write the pre-migration snapshot:', e instanceof Error ? e.message : e);
   }
 }

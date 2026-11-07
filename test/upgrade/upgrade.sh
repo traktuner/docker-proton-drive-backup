@@ -136,6 +136,7 @@ check "run history kept" bash -c "[ $(db 'SELECT COUNT(*) FROM backup_runs') -ge
 AUTH=$(api "$API/auth/status")
 check "session taken over (no new sign-in)" eq "$(echo "$AUTH" | jq -r .authenticated)" true
 check "account bound automatically on takeover" eq "$(echo "$AUTH" | jq -r .binding)" ok
+check "untouched CLI session kept as auth-session.pre-sdk.json (0600)" bash -c "cmp -s '$W/data.pre-upgrade/proton/auth-session.json' '$W/data/proton/auth-session.pre-sdk.json' && [ \"\$(stat -c %a '$W/data/proton/auth-session.pre-sdk.json')\" = 600 ]"
 
 log "C. First runs after the upgrade"
 # The scheduler's first tick is 10 s after boot; the due "Docs" slot must run once.
@@ -193,7 +194,7 @@ dc up -d >/dev/null 2>&1; wait_up
 check "after two kills and a restart the DB is migrated" eq "$(db 'PRAGMA user_version')" 1
 check "integrity_check ok" eq "$(db 'PRAGMA integrity_check')" ok
 check "no catalog row lost" eq "$(db 'SELECT COUNT(*) FROM backup_catalog')" "$ROWS"
-check "snapshot complete (no half-written temp file left)" bash -c "[ -s '$W/data/backup.db.pre-sdk.bak' ] && [ ! -e '$W/data/backup.db.pre-sdk.bak.tmp' ] && [ \"\$(sqlite3 -readonly '$W/data/backup.db.pre-sdk.bak' 'PRAGMA integrity_check')\" = ok ]"
+check "snapshot complete (no half-written temp file left)" bash -c "[ -s '$W/data/backup.db.pre-sdk.bak' ] && ! ls '$W/data' | grep -q 'pre-sdk.bak.tmp' && [ \"\$(sqlite3 -readonly '$W/data/backup.db.pre-sdk.bak' 'PRAGMA integrity_check')\" = ok ]"
 dc down >/dev/null 2>&1
 
 log "Summary ($OLD_IMAGE → $NEW_IMAGE)"

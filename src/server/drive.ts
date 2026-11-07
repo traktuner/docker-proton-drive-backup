@@ -379,7 +379,26 @@ export type BindingState = 'none' | 'ok' | 'confirm' | 'mismatch';
  */
 export function initAccountOrigin(sessionFileExists: boolean) {
   if (meta.get('account.origin') || meta.get('account.userId')) return;
-  meta.set('account.origin', meta.get('upgrade.fromCli') && sessionFileExists ? 'takeover' : 'login');
+  const takeover = !!meta.get('upgrade.fromCli') && sessionFileExists;
+  if (takeover) preserveCliSession();
+  meta.set('account.origin', takeover ? 'takeover' : 'login');
+}
+
+/**
+ * Keep the CLI's session exactly as the 0.x release left it, once. If Proton
+ * rejected that session under this app's identification, the account module
+ * removes auth-session.json — and a rollback to 0.x would then need a new sign-in.
+ * With this copy it does not (docs/UPGRADE.md). Never used by this release.
+ */
+function preserveCliSession() {
+  const src = path.join(SESSION_DIR, 'auth-session.json');
+  const dst = path.join(SESSION_DIR, 'auth-session.pre-sdk.json');
+  try {
+    if (!fs.existsSync(dst)) fs.copyFileSync(src, dst, fs.constants.COPYFILE_EXCL);
+    fs.chmodSync(dst, 0o600);
+  } catch (e) {
+    console.warn('[upgrade] could not keep a copy of the CLI session:', e instanceof Error ? e.message : e);
+  }
 }
 
 function noteAccount(acc: AccountInfo) {

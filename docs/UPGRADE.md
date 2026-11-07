@@ -76,5 +76,17 @@ Do not restore `backup.db.pre-sdk.bak` for a rollback. It predates every run
 since the upgrade, so the CLI release would upload those files again as new
 revisions. Use it only if the database itself is damaged.
 
-If the CLI release shows "session expired" after a rollback (for example because
-you signed out in 1.0), sign in again in its UI. Your sets are not affected.
+On its first start 1.0 also keeps the untouched 0.x session as
+`/data/proton/auth-session.pre-sdk.json`. You need it only in one case: 1.0 asked
+you to sign in again right after the upgrade (Proton did not accept the old session
+for this app) and you now roll back. Then, with the container stopped:
+
+```bash
+cp data/proton/auth-session.pre-sdk.json data/proton/auth-session.json
+```
+
+In every other case leave it alone — after 1.0 has refreshed the session, that
+copy holds an outdated, already invalidated refresh token. If the CLI release
+shows "session expired" after a rollback, sign in again in its UI. Your sets are
+not affected. Both files can be deleted once you stay on 1.x
+(`backup.db.pre-sdk.bak`, `auth-session.pre-sdk.json`).

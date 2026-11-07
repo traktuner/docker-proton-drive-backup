@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { formatBytes } from '@/lib/format';
+import { TEXT_SIZES, TEXT_SIZE_KEY, DEFAULT_TEXT_SIZE, applyTextSize, type TextSize } from '@/lib/text-size';
 
 interface Info {
   app: string;
@@ -61,13 +62,27 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="border-t border-white/[0.07] px-5 py-4">
-      <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[color:var(--muted)]">{title}</h3>
+      <h3 className="mb-2 text-[0.8125rem] font-semibold uppercase tracking-wide text-[color:var(--muted)]">{title}</h3>
       {children}
     </div>
   );
 }
 
 export default function Settings() {
+  const [textSize, setTextSize] = useState<TextSize>(DEFAULT_TEXT_SIZE);
+  useEffect(() => {
+    const v = document.documentElement.dataset.textSize as TextSize | undefined;
+    if (v && TEXT_SIZES.some((t) => t.id === v)) setTextSize(v);
+  }, []);
+  const chooseTextSize = (id: TextSize) => {
+    setTextSize(id);
+    applyTextSize(id);
+    try {
+      localStorage.setItem(TEXT_SIZE_KEY, id);
+    } catch {
+      /* private mode: applies for this visit only */
+    }
+  };
   const [open, setOpen] = useState(false);
   const [closing, setClosing] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -232,6 +247,34 @@ export default function Settings() {
               </button>
             </div>
 
+            {/* Display (accessibility) */}
+            <Section title="Display">
+              <div className="space-y-1.5">
+                <span className="block text-sm">Text size</span>
+                <div role="radiogroup" aria-label="Text size" className="grid grid-cols-4 gap-1.5">
+                  {TEXT_SIZES.map((t) => (
+                    <button
+                      key={t.id}
+                      role="radio"
+                      aria-checked={textSize === t.id}
+                      onClick={() => chooseTextSize(t.id)}
+                      className={`rounded-lg border px-2 py-2 text-center text-[0.8125rem] font-medium transition ${
+                        textSize === t.id
+                          ? 'border-[color:var(--accent)] bg-[color:var(--accent)]/10 text-[color:var(--text)]'
+                          : 'border-[color:var(--border)] text-[color:var(--muted)] hover:bg-[color:var(--panel-2)]'
+                      }`}
+                    >
+                      <span aria-hidden className="block leading-none" style={{ fontSize: `${t.pct / 100}em` }}>
+                        Aa
+                      </span>
+                      <span className="mt-1 block">{t.label}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[0.8125rem] text-[color:var(--muted)]">Applies to this browser. Builds on your browser&apos;s own font size.</p>
+              </div>
+            </Section>
+
             {/* Account */}
             <Section title="Account">
               <Row label="Signed in as">
@@ -250,7 +293,7 @@ export default function Settings() {
                 </span>
               </Row>
               {updates?.sdk.notices.map((n) => (
-                <p key={n.message} className={`text-[11px] ${n.kind === 'required' ? 'text-red-300' : 'text-amber-300'}`}>
+                <p key={n.message} className={`text-xs ${n.kind === 'required' ? 'text-red-300' : 'text-amber-300'}`}>
                   {n.message} Update the container image.
                 </p>
               ))}
@@ -268,7 +311,7 @@ export default function Settings() {
               <button
                 onClick={checkUpdates}
                 disabled={checking}
-                className="pbtn pbtn--ghost mt-2 px-3 py-1.5 text-xs text-[color:var(--muted)] hover:text-[color:var(--text)]"
+                className="pbtn pbtn--ghost mt-2 px-3 py-1.5 text-[0.8125rem] text-[color:var(--muted)] hover:text-[color:var(--text)]"
               >
                 {checking ? 'Checking…' : 'Check again'}
               </button>
@@ -292,7 +335,7 @@ export default function Settings() {
                     onChange={(e) => saveUploads({ concurrency: +e.target.value })}
                     className="prange mt-2 w-full"
                   />
-                  <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
+                  <p className="mt-1 text-xs leading-relaxed text-[color:var(--muted)]">
                     How many files upload at the same time (at most 5 — the Proton SDK&apos;s own limit, which
                     also caps the data in flight at 40 MiB). Small files profit most from more. Takes effect
                     during a running backup.
@@ -314,7 +357,7 @@ export default function Settings() {
                             className="w-24 rounded bg-white/[0.06] px-2 py-1 text-right text-sm tabular-nums outline-none focus:bg-white/[0.09]"
                             aria-label="Upload speed limit in KB/s"
                           />
-                          <span className="text-xs text-[color:var(--muted)]">KB/s</span>
+                          <span className="text-[0.8125rem] text-[color:var(--muted)]">KB/s</span>
                         </>
                       )}
                       <input
@@ -328,13 +371,13 @@ export default function Settings() {
                     </div>
                   </div>
                   {uploads.canShape ? (
-                    <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
+                    <p className="mt-1 text-xs leading-relaxed text-[color:var(--muted)]">
                       Caps how fast backups read files for upload, shared by all parallel uploads. Only
                       backup traffic is limited, never the web UI. Changes apply within a second, also
                       during a running backup.
                     </p>
                   ) : (
-                    <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
+                    <p className="mt-1 text-xs leading-relaxed text-amber-400/80">
                       Unavailable — {uploads.shapeReason} See “Hardening” in the README.
                     </p>
                   )}
@@ -381,22 +424,22 @@ export default function Settings() {
                           className="w-20 rounded bg-white/[0.06] px-2 py-1 text-right text-sm tabular-nums outline-none focus:bg-white/[0.09]"
                           aria-label="Maximum Mirror deletion percentage"
                         />
-                        <span className="text-xs text-[color:var(--muted)]">%</span>
+                        <span className="text-[0.8125rem] text-[color:var(--muted)]">%</span>
                       </div>
                     </div>
                   ) : (
-                    <p className="mt-2 text-[11px] leading-relaxed text-amber-400/80">
+                    <p className="mt-2 text-xs leading-relaxed text-amber-400/80">
                       The percentage guard is disabled. Intentional large Mirror deletions can proceed.
                     </p>
                   )}
 
-                  <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
+                  <p className="mt-1 text-xs leading-relaxed text-[color:var(--muted)]">
                     A Mirror run skips deletion when more than this share of its catalog disappears. The default is
                     30%. Missing sources and failed uploads always block deletion. Changes apply to the next run and
                     its preview.
                   </p>
                   {mirrorSafetyError && (
-                    <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--signal-danger)]">
+                    <p className="mt-1 text-xs leading-relaxed text-[color:var(--signal-danger)]">
                       {mirrorSafetyError}
                     </p>
                   )}
@@ -433,7 +476,7 @@ export default function Settings() {
 
             {/* About — versions live in the Updates section above to avoid duplication. */}
             <Section title="About">
-              <div className="flex gap-3 text-xs">
+              <div className="flex gap-3 text-[0.8125rem]">
                 <a
                   href="https://github.com/traktuner/docker-proton-drive-backup"
                   target="_blank"

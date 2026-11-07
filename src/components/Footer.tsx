@@ -28,7 +28,7 @@ export default function Footer() {
   const link = 'hover:underline decoration-dotted underline-offset-2';
 
   return (
-    <footer className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-t border-[color:var(--border)] px-4 py-2 text-center text-[11px] text-[color:var(--muted)]">
+    <footer className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-t border-[color:var(--border)] px-4 py-2 [padding-bottom:max(0.5rem,env(safe-area-inset-bottom))] text-center text-[0.6875rem] text-[color:var(--muted)]">
       <span>Proton Drive Backup</span>
       <span className="opacity-40">·</span>
       <span className="font-mono" title={v ? `App release ${v.app}, image ${v.imageTag}` : 'App release'}>

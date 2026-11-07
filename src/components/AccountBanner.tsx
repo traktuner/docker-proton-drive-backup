@@ -66,7 +66,7 @@ export default function AccountBanner() {
             Signed in as <strong>{email}</strong>. Confirm that your backup sets should write to this Proton account — backups wait until you do.
           </p>
           {st.targets && st.targets.length > 0 && (
-            <ul className="mt-1 list-inside list-disc text-xs text-[color:var(--muted)]">
+            <ul className="mt-1 list-inside list-disc text-[0.8125rem] text-[color:var(--muted)]">
               {st.targets.map((t) => (
                 <li key={t.name}>
                   {t.name} → Drive{t.target}
@@ -74,7 +74,7 @@ export default function AccountBanner() {
               ))}
             </ul>
           )}
-          <button disabled={busy} onClick={() => confirm(false)} className="pbtn pbtn--solid mt-2 px-3 py-1 text-xs">
+          <button disabled={busy} onClick={() => confirm(false)} className="pbtn pbtn--solid mt-2 px-3 py-1 text-[0.8125rem]">
             Use {email} for these backups
           </button>
         </>
@@ -83,8 +83,8 @@ export default function AccountBanner() {
           <p className="text-[color:var(--text)]">
             Signed in as <strong>{email}</strong>, but your backup sets belong to <strong>{st.boundEmail ?? 'another account'}</strong>. Nothing is written until this is resolved.
           </p>
-          <p className="mt-1 text-xs text-[color:var(--muted)]">Sign out and sign in with {st.boundEmail ?? 'the original account'}, or switch all sets to this account (they upload everything again).</p>
-          <button disabled={busy} onClick={() => confirm(true)} className="pbtn pbtn--danger mt-2 px-3 py-1 text-xs">
+          <p className="mt-1 text-[0.8125rem] text-[color:var(--muted)]">Sign out and sign in with {st.boundEmail ?? 'the original account'}, or switch all sets to this account (they upload everything again).</p>
+          <button disabled={busy} onClick={() => confirm(true)} className="pbtn pbtn--danger mt-2 px-3 py-1 text-[0.8125rem]">
             Switch all sets to {email}
           </button>
         </>

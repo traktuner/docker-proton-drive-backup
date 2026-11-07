@@ -60,6 +60,18 @@ export default function FilesPage() {
   const { toast } = useToast();
   const { status: authStatus, reconnect, reportAuthError } = useAuth();
   const [ready, setReady] = useState(false);
+  // "New backup set" folds away: open by default from tablet width up, closed on
+  // phones (the sets come first there). The user's choice is remembered.
+  const [creatorOpen, setCreatorOpen] = useState(true);
+  useEffect(() => {
+    const saved = localStorage.getItem('pdb.creatorOpen');
+    setCreatorOpen(saved != null ? saved === '1' : window.matchMedia('(min-width: 768px)').matches);
+  }, []);
+  const toggleCreator = () =>
+    setCreatorOpen((v) => {
+      localStorage.setItem('pdb.creatorOpen', v ? '0' : '1');
+      return !v;
+    });
 
   // Tri-state source selection: ticked roots, minus unticked descendants.
   const [roots, setRoots] = useState<Set<string>>(new Set());
@@ -400,8 +412,8 @@ export default function FilesPage() {
   const previewFolder = (subfolder.trim() || name).replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
 
   return (
-    <div className="flex min-h-screen flex-col lg:h-screen">
-      <header className="flex items-center justify-between gap-3 border-b border-[color:var(--border)] px-5 py-3">
+    <div className="flex min-h-dvh flex-col">
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-[color:var(--border)] bg-[color:var(--bg)]/80 px-4 py-3 backdrop-blur-md supports-[backdrop-filter]:bg-[color:var(--bg)]/65 sm:px-5 [padding-top:max(0.75rem,env(safe-area-inset-top))]">
         <div className="flex min-w-0 items-center gap-2.5">
           <span
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl"
@@ -458,12 +470,54 @@ export default function FilesPage() {
           <span className="animate-pulse">Connecting…</span>
         </div>
       ) : (
-        <>
-      {/* Dual panes - stacked & tall on mobile, side-by-side filling height on desktop.
-          lg:grid-rows-[minmax(0,1fr)] gives the single row a definite height so each
-          pane's lg:h-full resolves (without it the panes collapse to 0 at >=lg until a
-          resize forces reflow - GitHub #15). */}
-      <div className="grid grid-cols-1 gap-4 p-4 lg:min-h-0 lg:flex-1 lg:grid-cols-2 lg:grid-rows-[minmax(0,1fr)]">
+        <main className="mx-auto w-full max-w-[1680px] flex-1 space-y-4 p-3 sm:p-4 lg:space-y-5 lg:p-5">
+        <section aria-labelledby="sets-h" className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)]/40 p-3 sm:p-4">
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <h2 id="sets-h" className="text-sm font-semibold">Backup sets</h2>
+            <div className="flex items-center gap-1.5">
+              <a href="/api/config" download className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]">
+                Export
+              </a>
+              <label className="pbtn pbtn--ghost cursor-pointer px-2.5 py-1.5 text-[0.8125rem]">
+                Import
+                <input
+                  type="file"
+                  accept=".yaml,.yml,text/yaml"
+                  className="hidden"
+                  onChange={importConfig}
+                />
+              </label>
+            </div>
+          </div>
+          <div>
+            <BackupSets
+              refreshKey={refreshKey}
+              selectedSources={sources}
+              selectedSourceExcludes={selectedSourceExcludes}
+              localRoot={localRoot}
+              onSourcesAdded={consumeSelectedSources}
+            />
+          </div>
+        </section>
+        <section aria-labelledby="new-h" className="rounded-2xl border border-[color:var(--border)] bg-[color:var(--panel)]/40 p-3 sm:p-4">
+          <button
+            type="button"
+            onClick={toggleCreator}
+            aria-expanded={creatorOpen}
+            aria-controls="new-body"
+            className="-m-1 flex w-[calc(100%+0.5rem)] items-start justify-between gap-3 rounded-lg p-1 text-left hover:bg-[color:var(--interaction-default-hover)]"
+          >
+            <span className="min-w-0">
+              <h2 id="new-h" className="text-sm font-semibold">New backup set</h2>
+              <span className="mt-0.5 block text-[0.8125rem] text-[color:var(--muted)]">
+                1 · tick source folders &nbsp;2 · open the target folder on Drive &nbsp;3 · name it and create
+              </span>
+            </span>
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden className={`mt-0.5 shrink-0 text-[color:var(--muted)] transition-transform ${creatorOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+          <div id="new-body" hidden={!creatorOpen} className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2 lg:gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(22rem,0.9fr)]">
         <FilePane
           title="Local files"
           badge="Source"
@@ -481,20 +535,15 @@ export default function FilesPage() {
           onDelete={deleteDrive}
           onDeepRefresh={deepRefreshDrive}
         />
-      </div>
-
-      {/* Builder + sets */}
-      <div className="grid grid-cols-1 gap-4 border-t border-[color:var(--border)] p-4 lg:grid-cols-2">
-        <div className="rounded-xl border border-[color:var(--border)] p-4">
-          <h2 className="mb-4 text-sm font-semibold">New backup set</h2>
+        <div className="min-w-0 rounded-xl border border-[color:var(--border)] p-3 sm:p-4 md:col-span-2 xl:col-span-1">
+          <h3 className="mb-4 text-sm font-semibold">Options</h3>
           <div className="space-y-5">
             {/* Summary — what this set will do (the headline of the form) */}
             <div className="rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/40 p-3">
               {sources.length === 0 ? (
-                <p className="text-xs leading-relaxed text-[color:var(--muted)]">
-                  Tick folders in <span className="text-[color:var(--text)]">Local files</span> on the left,
-                  then pick a target by navigating{' '}
-                  <span className="text-[color:var(--text)]">Proton Drive</span> on the right.
+                <p className="text-[0.8125rem] leading-relaxed text-[color:var(--muted)]">
+                  Tick folders under <span className="text-[color:var(--text)]">Local files</span>, then open the
+                  target folder under <span className="text-[color:var(--text)]">Proton Drive</span>.
                 </p>
               ) : (
                 <>
@@ -505,7 +554,7 @@ export default function FilesPage() {
                     <span className="text-[color:var(--muted)]">→</span>
                     <span className="font-medium text-[color:var(--accent-2)]">{targetLabel}</span>
                   </div>
-                  <div className="tnum mt-1.5 flex items-center gap-2 text-xs text-[color:var(--muted)]">
+                  <div className="tnum mt-1.5 flex items-center gap-2 text-[0.8125rem] text-[color:var(--muted)]">
                     {estimate.counting && (
                       <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--accent)]" />
                     )}
@@ -525,23 +574,23 @@ export default function FilesPage() {
 
             {/* Name */}
             <div className="space-y-1.5">
-              <label className="block text-[11px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+              <label className="block text-xs font-medium uppercase tracking-wide text-[color:var(--muted)]">
                 Name
               </label>
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. Photos to Drive"
-                className="w-full pfield px-3 py-2 text-sm"
+                className="w-full pfield px-3 py-2 text-base sm:text-sm"
               />
               <input
                 value={subfolder}
                 onChange={(e) => setSubfolder(e.target.value)}
                 placeholder="Drive folder (optional — defaults to the set name)"
-                className="w-full pfield px-3 py-2 text-sm"
+                className="w-full pfield px-3 py-2 text-base sm:text-sm"
               />
               {(name.trim() || subfolder.trim()) && (
-                <p className="truncate text-[11px] text-[color:var(--muted)]">
+                <p className="truncate text-xs text-[color:var(--muted)]">
                   Saved to{' '}
                   <span className="text-[color:var(--accent-2)]">
                     {targetLabel}/{previewFolder}/…
@@ -553,7 +602,7 @@ export default function FilesPage() {
 
             {/* Mode */}
             <div className="space-y-2">
-              <label className="block text-[11px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+              <label className="block text-xs font-medium uppercase tracking-wide text-[color:var(--muted)]">
                 Mode
               </label>
               <div className="grid grid-cols-3 gap-2">
@@ -561,7 +610,7 @@ export default function FilesPage() {
                   <button
                     key={m}
                     onClick={() => setMode(m)}
-                    className={`rounded-lg border px-3 py-2 text-center text-xs font-medium transition ${
+                    className={`rounded-lg border px-3 py-2 text-center text-[0.8125rem] font-medium transition ${
                       mode === m
                         ? 'border-[color:var(--accent)] bg-[color:var(--accent)]/10 text-[color:var(--text)]'
                         : 'border-[color:var(--border)] text-[color:var(--muted)] hover:bg-[color:var(--panel-2)]'
@@ -573,14 +622,14 @@ export default function FilesPage() {
               </div>
               {/* Reserve the tallest description's height so switching modes
                   doesn't make the panel jump bigger/smaller. */}
-              <p className="min-h-[3.75rem] text-xs leading-relaxed text-[color:var(--muted)]">
+              <p className="min-h-[3.75rem] text-[0.8125rem] leading-relaxed text-[color:var(--muted)]">
                 {MODE_INFO[mode].desc}
               </p>
             </div>
 
             {/* Schedule */}
             <div className="space-y-2">
-              <label className="block text-[11px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+              <label className="block text-xs font-medium uppercase tracking-wide text-[color:var(--muted)]">
                 Schedule
               </label>
               <div className="flex flex-wrap items-center gap-2">
@@ -618,7 +667,7 @@ export default function FilesPage() {
                     onChange={(e) => setMinute(Math.min(59, Math.max(0, +e.target.value)))}
                     className="w-14 pfield px-2 py-1"
                   />
-                  <span className="text-xs text-[color:var(--muted)]">past the hour</span>
+                  <span className="text-[0.8125rem] text-[color:var(--muted)]">past the hour</span>
                 </span>
               )}
               {(schedule === 'daily' || schedule === 'weekly') && (
@@ -640,7 +689,7 @@ export default function FilesPage() {
                     onChange={(e) => setMinute(Math.min(59, Math.max(0, +e.target.value)))}
                     className="w-14 pfield px-2 py-1"
                   />
-                  <span className="text-xs text-[color:var(--muted)]">server time</span>
+                  <span className="text-[0.8125rem] text-[color:var(--muted)]">server time</span>
                 </span>
               )}
               </div>
@@ -650,12 +699,12 @@ export default function FilesPage() {
                 never need globs). Constant min-height so switching modes doesn't jump. */}
             <div className="min-h-[1.5rem]">
               {mode === 'add' ? (
-                <p className="pl-[18px] text-[11px] text-[color:var(--muted)]">
+                <p className="pl-[18px] text-xs text-[color:var(--muted)]">
                   Add mode uploads only new files — nothing to exclude.
                 </p>
               ) : (
                 <details className="group">
-                  <summary className="inline-flex cursor-pointer list-none select-none items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-[color:var(--muted)] hover:text-[color:var(--text)] [&::-webkit-details-marker]:hidden">
+                  <summary className="inline-flex cursor-pointer list-none select-none items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-[color:var(--muted)] hover:text-[color:var(--text)] [&::-webkit-details-marker]:hidden">
                     <svg
                       viewBox="0 0 24 24"
                       width="12"
@@ -677,26 +726,26 @@ export default function FilesPage() {
                     onChange={(e) => setExcludes(e.target.value)}
                     rows={2}
                     placeholder="Glob patterns, one per line (optional) — e.g. *.tmp or node_modules. Or untick items on the left."
-                    className="mt-2 w-full resize-y pfield px-3 py-2 text-xs"
+                    className="mt-2 w-full resize-y pfield px-3 py-2 text-[0.8125rem]"
                   />
                 </details>
               )}
             </div>
-            <label className="flex cursor-pointer items-center gap-2 pl-[2px] text-xs text-[color:var(--muted)]">
+            <label className="flex cursor-pointer items-center gap-2 pl-[2px] text-[0.8125rem] text-[color:var(--muted)]">
               <input
                 type="checkbox"
                 checked={skipThumbnails}
                 onChange={(e) => setSkipThumbnails(e.target.checked)}
-                className="accent-[color:var(--accent)]"
+                className="h-[1.1em] w-[1.1em] shrink-0 accent-[color:var(--accent)]"
               />
               Skip thumbnails on Drive (faster uploads, no previews)
             </label>
-            <label className="flex cursor-pointer items-center gap-2 pl-[2px] text-xs text-[color:var(--muted)]">
+            <label className="flex cursor-pointer items-center gap-2 pl-[2px] text-[0.8125rem] text-[color:var(--muted)]">
               <input
                 type="checkbox"
                 checked={includeHidden}
                 onChange={(e) => setIncludeHidden(e.target.checked)}
-                className="accent-[color:var(--accent)]"
+                className="h-[1.1em] w-[1.1em] shrink-0 accent-[color:var(--accent)]"
               />
               Include hidden files (dotfiles like .env, .config)
             </label>
@@ -705,37 +754,9 @@ export default function FilesPage() {
             </button>
           </div>
         </div>
-
-        <div className="rounded-xl border border-[color:var(--border)] p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-sm font-semibold">Backup sets</h2>
-            <div className="flex items-center gap-1.5">
-              <a href="/api/config" download className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs">
-                Export
-              </a>
-              <label className="pbtn pbtn--ghost cursor-pointer px-2.5 py-1.5 text-xs">
-                Import
-                <input
-                  type="file"
-                  accept=".yaml,.yml,text/yaml"
-                  className="hidden"
-                  onChange={importConfig}
-                />
-              </label>
-            </div>
           </div>
-          <div className="max-h-[38rem] overflow-auto pr-1">
-            <BackupSets
-              refreshKey={refreshKey}
-              selectedSources={sources}
-              selectedSourceExcludes={selectedSourceExcludes}
-              localRoot={localRoot}
-              onSourcesAdded={consumeSelectedSources}
-            />
-          </div>
-        </div>
-      </div>
-        </>
+        </section>
+        </main>
       )}
 
       <Footer />

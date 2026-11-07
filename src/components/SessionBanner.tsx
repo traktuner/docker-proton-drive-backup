@@ -53,7 +53,7 @@ export default function SessionBanner() {
       ) : (
         <button
           onClick={reconnect}
-          className="pbtn pbtn--solid shrink-0 px-3 py-1 text-xs"
+          className="pbtn pbtn--solid shrink-0 px-3 py-1 text-[0.8125rem]"
         >
           Reconnect
         </button>

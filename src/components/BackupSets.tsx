@@ -392,7 +392,7 @@ export default function BackupSets({
           </svg>
         </span>
         <p className="text-sm font-medium text-[color:var(--text)]">No backup sets yet</p>
-        <p className="mt-1 max-w-xs text-xs leading-relaxed text-[color:var(--muted)]">
+        <p className="mt-1 max-w-xs text-[0.8125rem] leading-relaxed text-[color:var(--muted)]">
           Tick folders in <span className="text-[color:var(--text)]">Local files</span>, choose a target in{' '}
           <span className="text-[color:var(--text)]">Proton Drive</span>, then create your first set above.
         </p>
@@ -400,13 +400,13 @@ export default function BackupSets({
     );
 
   return (
-    <ul className="space-y-2">
+    <ul className="grid grid-cols-1 items-start gap-2 xl:grid-cols-2">
       {sets.map((s) => {
         const editing = editId === s.id;
         return (
           <li
             key={s.id}
-            className="rounded-xl border border-[color:var(--border)] bg-[color:var(--panel-2)]/40 p-3 transition hover:border-[color:var(--border-strong)]"
+            className={`min-w-0 rounded-xl border border-[color:var(--border)] bg-[color:var(--panel-2)]/40 p-3 transition hover:border-[color:var(--border-strong)] ${editing ? 'xl:col-span-2' : ''}`}
           >
             {editing ? (
               <div className="space-y-2">
@@ -416,7 +416,7 @@ export default function BackupSets({
                   className="w-full pfield px-2 py-1 text-sm"
                 />
                 <div className="space-y-1">
-                  <label className="block text-[10px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+                  <label className="block text-[0.6875rem] font-medium uppercase tracking-wide text-[color:var(--muted)]">
                     Drive folder
                   </label>
                   <input
@@ -425,7 +425,7 @@ export default function BackupSets({
                     placeholder="Drive subfolder"
                     className="w-full pfield px-2 py-1 text-sm"
                   />
-                  <p className="truncate text-[11px] text-[color:var(--muted)]">
+                  <p className="truncate text-xs text-[color:var(--muted)]">
                     Files go to{' '}
                     <span className="text-[color:var(--accent-2)]">
                       {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizePreview(draft.targetSubfolder ?? '')}/…
@@ -446,32 +446,32 @@ export default function BackupSets({
                   return (
                     <div className="space-y-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5">
                       <div className="flex items-center justify-between gap-2">
-                        <label className="text-[10px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+                        <label className="text-[0.6875rem] font-medium uppercase tracking-wide text-[color:var(--muted)]">
                           Sources
                         </label>
-                        <span className="text-[10px] text-[color:var(--signal-success)]">no existing re-uploads</span>
+                        <span className="text-[0.6875rem] text-[color:var(--signal-success)]">no existing re-uploads</span>
                       </div>
-                      <ul className="max-h-24 space-y-1 overflow-y-auto font-mono text-[11px] text-[color:var(--text)]">
+                      <ul className="max-h-24 space-y-1 overflow-y-auto font-mono text-xs text-[color:var(--text)]">
                         {existing.map((source) => (
                           <li key={source} className="break-all rounded bg-black/10 px-2 py-1">
                             {sourceLabel(source, localRoot)}
                           </li>
                         ))}
                       </ul>
-                      <p className="text-[11px] leading-relaxed text-[color:var(--muted)]">
+                      <p className="text-xs leading-relaxed text-[color:var(--muted)]">
                         Existing sources stay attached and cannot be removed here. Select separate folders in Local files,
                         then add them below. Unchanged files will not be re-uploaded.
                       </p>
                       {selectedSources.length === 0 ? (
-                        <p className="text-[11px] text-[color:var(--muted)]">No new source selected in Local files.</p>
+                        <p className="text-xs text-[color:var(--muted)]">No new source selected in Local files.</p>
                       ) : (
                         <div className="space-y-1.5">
-                          <p className="text-[11px] text-[color:var(--muted)]">
+                          <p className="text-xs text-[color:var(--muted)]">
                             {additions.length} new source{additions.length === 1 ? '' : 's'} selected
                             {extraExcludes.length > 0 ? ` · ${extraExcludes.length} exclusion patterns` : ''}
                           </p>
                           {blocked > 0 && (
-                            <p className="text-[11px]" style={{ color: 'var(--signal-warning)' }}>
+                            <p className="text-xs" style={{ color: 'var(--signal-warning)' }}>
                               {blocked} selection{blocked === 1 ? '' : 's'} already belong to or overlap this set.
                             </p>
                           )}
@@ -479,7 +479,7 @@ export default function BackupSets({
                             type="button"
                             onClick={() => addSources(s, additions, extraExcludes)}
                             disabled={addingSources || additions.length === 0}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
                           >
                             {addingSources && (
                               <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--accent)]" />
@@ -488,7 +488,7 @@ export default function BackupSets({
                               ? 'Checking sources…'
                               : `Add ${additions.length || ''} selected source${additions.length === 1 ? '' : 's'} now`}
                           </button>
-                          <p className="text-[10px] leading-relaxed text-[color:var(--muted)]">
+                          <p className="text-[0.6875rem] leading-relaxed text-[color:var(--muted)]">
                             This action applies immediately. Cancel below only discards the other form changes.
                           </p>
                         </div>
@@ -496,7 +496,7 @@ export default function BackupSets({
                     </div>
                   );
                 })()}
-                <div className="flex flex-wrap items-center gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2 text-[0.8125rem]">
                   <select
                     value={draft.mode}
                     onChange={(e) => setDraft((d) => ({ ...d, mode: e.target.value as BackupSet['mode'] }))}
@@ -574,32 +574,32 @@ export default function BackupSets({
                     }
                     rows={2}
                     placeholder="Exclude patterns, one per line"
-                    className="w-full resize-y pfield px-2 py-1 text-xs"
+                    className="w-full resize-y pfield px-2 py-1 text-[0.8125rem]"
                   />
                 )}
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--muted)]">
+                <label className="flex cursor-pointer items-center gap-2 text-[0.8125rem] text-[color:var(--muted)]">
                   <input
                     type="checkbox"
                     checked={!!draft.skipThumbnails}
                     onChange={(e) => setDraft((d) => ({ ...d, skipThumbnails: e.target.checked }))}
-                    className="accent-[color:var(--accent)]"
+                    className="h-[1.1em] w-[1.1em] shrink-0 accent-[color:var(--accent)]"
                   />
                   Skip thumbnails on Drive
                 </label>
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--muted)]">
+                <label className="flex cursor-pointer items-center gap-2 text-[0.8125rem] text-[color:var(--muted)]">
                   <input
                     type="checkbox"
                     checked={!!draft.includeHidden}
                     onChange={(e) => setDraft((d) => ({ ...d, includeHidden: e.target.checked }))}
-                    className="accent-[color:var(--accent)]"
+                    className="h-[1.1em] w-[1.1em] shrink-0 accent-[color:var(--accent)]"
                   />
                   Include hidden files (dotfiles)
                 </label>
                 <div className="flex gap-2">
-                  <button onClick={saveEdit} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
+                  <button onClick={saveEdit} className="pbtn pbtn--solid px-3 py-1.5 text-[0.8125rem]">
                     Save
                   </button>
-                  <button onClick={() => setEditId(null)} className="pbtn pbtn--ghost px-3 py-1.5 text-xs">
+                  <button onClick={() => setEditId(null)} className="pbtn pbtn--ghost px-3 py-1.5 text-[0.8125rem]">
                     Cancel
                   </button>
                 </div>
@@ -610,17 +610,17 @@ export default function BackupSets({
                 <div className="min-w-0">
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="truncate font-medium">{s.name}</span>
-                    <span className="shrink-0 rounded px-1.5 py-0.5 text-[11px]" style={statusStyle(s.lastStatus)}>
+                    <span className="shrink-0 rounded px-1.5 py-0.5 text-xs" style={statusStyle(s.lastStatus)}>
                       {s.lastStatus}
                     </span>
                   </div>
-                  <p className="mt-1 truncate text-xs text-[color:var(--muted)]">
+                  <p className="mt-1 truncate text-[0.8125rem] text-[color:var(--muted)]">
                     {s.sourcePaths.length} source{s.sourcePaths.length > 1 ? 's' : ''} →{' '}
                     <span className="text-[color:var(--accent-2)]">
                       {targetLabel(s.targetPath)}/{s.targetSubfolder}
                     </span>
                   </p>
-                  <p className="mt-0.5 text-xs text-[color:var(--muted)]">
+                  <p className="mt-0.5 text-[0.8125rem] text-[color:var(--muted)]">
                     {MODE_LABEL[s.mode]} · {scheduleLabel(s)}
                     {s.schedule !== 'off' &&
                       s.nextRunAt &&
@@ -645,7 +645,7 @@ export default function BackupSets({
                     const message = last?.message ?? s.lastMessage ?? undefined;
                     const tip = `${status}${when ? ` · ${relTime(when)}` : ''}${message ? ` · ${message}` : ''}`;
                     return (
-                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-[color:var(--muted)]">
+                      <div className="mt-1.5 flex items-center gap-1.5 text-xs text-[color:var(--muted)]">
                         <span
                           className="h-1.5 w-1.5 shrink-0 cursor-help rounded-full"
                           style={{ background: RUN_DOT[status] }}
@@ -672,7 +672,7 @@ export default function BackupSets({
                           <div className="pd-indeterminate" />
                         )}
                       </div>
-                      <p className="tnum mt-1 truncate text-[11px] text-[color:var(--muted)]">
+                      <p className="tnum mt-1 truncate text-xs text-[color:var(--muted)]">
                         {s.progress.totalBytes
                           ? `${s.progress.doneFiles}/${s.progress.totalFiles} files · ${formatBytes(s.progress.doneBytes)}/${formatBytes(s.progress.totalBytes)}`
                           : `${s.progress.doneFiles.toLocaleString()} uploaded · ${formatBytes(s.progress.doneBytes)}`}
@@ -683,7 +683,7 @@ export default function BackupSets({
                     </div>
                   ) : (
                     s.lastMessage && (
-                      <p className="mt-1 truncate text-xs text-[color:var(--muted)]" title={s.lastMessage}>
+                      <p className="mt-1 truncate text-[0.8125rem] text-[color:var(--muted)]" title={s.lastMessage}>
                         {s.lastMessage}
                       </p>
                     )
@@ -702,7 +702,7 @@ export default function BackupSets({
                         <button
                           type="button"
                           onClick={() => setOpenSplits((o) => ({ ...o, [s.id]: !o[s.id] }))}
-                          className="inline-flex items-center gap-1 text-[11px] text-[color:var(--muted)] hover:underline"
+                          className="inline-flex items-center gap-1 text-xs text-[color:var(--muted)] hover:underline"
                           aria-expanded={open}
                         >
                           <span aria-hidden>{open ? '▾' : '▸'}</span>
@@ -710,7 +710,7 @@ export default function BackupSets({
                           {sp.length >= 50 ? '+' : ''} large folder{sp.length === 1 ? '' : 's'} split on Drive
                         </button>
                         {open && (
-                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-[11px]">
+                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-xs">
                             <p className="text-[color:var(--muted)]">
                               Proton Drive allows a limited number of items per folder (about 30,000). Everything is backed up: what does not fit
                               continues in “&lt;folder&gt; · part 2”, “· part 3”, … right next to it. A restore needs all parts.
@@ -744,7 +744,7 @@ export default function BackupSets({
                         <button
                           type="button"
                           onClick={() => setOpenSkips((o) => ({ ...o, [s.id]: !o[s.id] }))}
-                          className="inline-flex items-center gap-1 text-[11px] hover:underline"
+                          className="inline-flex items-center gap-1 text-xs hover:underline"
                           style={{ color: 'var(--signal-warning)' }}
                           aria-expanded={open}
                         >
@@ -753,7 +753,7 @@ export default function BackupSets({
                           {more ? '+' : ''} file{sk.length === 1 ? '' : 's'} skipped
                         </button>
                         {open && (
-                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-[11px]">
+                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-xs">
                             <p className="text-[color:var(--muted)]">
                               Skipped — everything else was backed up, and a backup is never paused or stopped for these:
                             </p>
@@ -776,7 +776,7 @@ export default function BackupSets({
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
                   {confirmDel === s.id ? (
-                    <span className="flex items-center gap-1.5 text-xs">
+                    <span className="flex items-center gap-1.5 text-[0.8125rem]">
                       <span className="text-[color:var(--muted)]">Delete?</span>
                       <button
                         onClick={() => {
@@ -799,7 +799,7 @@ export default function BackupSets({
                           <button
                             onClick={() => pause(s.id)}
                             disabled={pausing.has(s.id) || cancelling.has(s.id)}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
                             style={{ color: 'var(--signal-warning)' }}
                             title="Pause now and resume later (continues from where it left off)"
                           >
@@ -811,7 +811,7 @@ export default function BackupSets({
                           <button
                             onClick={() => cancel(s.id)}
                             disabled={cancelling.has(s.id) || pausing.has(s.id)}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
                             style={{ color: 'var(--signal-danger)' }}
                           >
                             {cancelling.has(s.id) && (
@@ -821,14 +821,14 @@ export default function BackupSets({
                           </button>
                         </>
                       ) : (
-                        <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
+                        <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-[0.8125rem]">
                           {s.lastStatus === 'paused' ? 'Resume' : 'Run'}
                         </button>
                       )}
                       <button
                         onClick={() => startEdit(s)}
                         disabled={s.lastStatus === 'running'}
-                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
                         title={s.lastStatus === 'running' ? 'Pause or cancel this backup before editing it' : 'Edit backup set'}
                       >
                         Edit
@@ -837,7 +837,7 @@ export default function BackupSets({
                         <button
                           onClick={() => preview(s.id)}
                           disabled={s.lastStatus === 'running' || previewing.has(s.id)}
-                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
                           title="Dry run — show what the next backup would upload, and (mirror) which Drive files it would delete, without changing anything"
                         >
                           {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
@@ -846,7 +846,7 @@ export default function BackupSets({
                       <button
                         onClick={(e) => verify(s.id, e.shiftKey)}
                         disabled={s.lastStatus === 'running' || verifying.has(s.id)}
-                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
                         title="Reconcile the catalog against Drive — re-upload anything deleted or changed there. Shift-click: also compare every file's content (SHA-1) with Drive (reads all files)."
                       >
                         {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
@@ -857,7 +857,7 @@ export default function BackupSets({
                             if (window.confirm('A source is empty or no longer a mounted share. Apply the deletions this causes (items go to the Drive trash)? Only do this if you changed the folder on purpose — not if a NAS share is offline.'))
                               void fetch(`/api/backup-sets/${s.id}/run?confirmSources=1`, { method: 'POST' }).then(load);
                           }}
-                          className="pbtn pbtn--danger px-2.5 py-1.5 text-xs"
+                          className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
                           title="Confirm that the empty source was emptied on purpose and apply the deletions once"
                         >
                           Apply deletions
@@ -866,7 +866,7 @@ export default function BackupSets({
                       <button
                         onClick={() => setConfirmDel(s.id)}
                         disabled={s.lastStatus === 'running'}
-                        className="pbtn pbtn--danger px-2.5 py-1.5 text-xs"
+                        className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
                       >
                         Delete
                       </button>
@@ -878,7 +878,7 @@ export default function BackupSets({
                 (() => {
                   const p = previews[s.id];
                   return (
-                    <div className="mt-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5 text-xs">
+                    <div className="mt-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5 text-[0.8125rem]">
                       <div className="flex items-center justify-between">
                         <span className="font-medium text-[color:var(--text)]">Preview · nothing was changed</span>
                         <button
@@ -905,7 +905,7 @@ export default function BackupSets({
                               {p.wouldDeleteCount.toLocaleString()} item{p.wouldDeleteCount === 1 ? '' : 's'} on Drive
                               would be deleted (gone locally):
                             </p>
-                            <ul className="mt-1 max-h-32 space-y-0.5 overflow-auto pr-1 font-mono text-[11px] text-[color:var(--muted)]">
+                            <ul className="mt-1 max-h-32 space-y-0.5 overflow-auto pr-1 font-mono text-xs text-[color:var(--muted)]">
                               {p.wouldDelete.map((r) => (
                                 <li key={r} className="truncate" title={r}>
                                   {r}

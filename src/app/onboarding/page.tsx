@@ -124,7 +124,7 @@ export default function Onboarding() {
               You&apos;ll be sent to Proton to sign in securely in your browser. The session is
               stored inside the container - no password is ever handled here.
             </p>
-            <p className="-mt-4 mb-6 text-xs leading-relaxed text-[color:var(--muted)]">
+            <p className="-mt-4 mb-6 text-[0.8125rem] leading-relaxed text-[color:var(--muted)]">
               This is a third-party application not officially supported by Proton.
             </p>
             <button

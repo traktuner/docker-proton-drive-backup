@@ -49,7 +49,7 @@ export default function StorageBar() {
       <div className="h-1.5 w-28 overflow-hidden rounded-full" style={{ background: 'var(--background-strong)' }}>
         <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: color }} />
       </div>
-      <span className="tnum text-xs">
+      <span className="tnum text-[0.8125rem]">
         <span className="text-[color:var(--text-norm)]">{fmt(q.driveUsed)}</span>
         <span className="text-[color:var(--text-weak)]"> / {fmt(q.maxSpace)}</span>
       </span>

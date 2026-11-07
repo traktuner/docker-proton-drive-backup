@@ -150,6 +150,13 @@ input[type='number']::-webkit-outer-spin-button {
       box-shadow 0.15s var(--ease-out-quint),
       opacity 0.15s var(--ease-out-quint);
   }
+  /* Touch screens: every button is a comfortable target (~40 px), desktop stays compact. */
+  @media (pointer: coarse) {
+    .pbtn {
+      min-height: 2.5rem;
+      min-width: 2.5rem;
+    }
+  }
   .pbtn:disabled {
     opacity: 0.5;
     pointer-events: none;

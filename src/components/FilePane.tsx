@@ -212,12 +212,12 @@ export default function FilePane({
   const showSkeleton = firstLoad || (refreshing && entries.length === 0);
 
   return (
-    <div className="flex h-[65vh] min-h-0 flex-col rounded-xl border border-[color:var(--border)] lg:h-full">
+    <div className="flex h-[clamp(15rem,48dvh,30rem)] min-h-0 min-w-0 flex-col rounded-xl border border-[color:var(--border)] xl:h-auto xl:min-h-[28rem] xl:[contain:size]">
       {/* Header */}
       <div className="flex items-center justify-between gap-2 border-b border-[color:var(--border)] px-4 py-3">
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold">{title}</span>
-          <span className="rounded-md bg-[color:var(--panel-2)] px-2 py-0.5 text-[11px] text-[color:var(--muted)]">
+          <span className="rounded-md bg-[color:var(--panel-2)] px-2 py-0.5 text-xs text-[color:var(--muted)]">
             {badge}
           </span>
         </div>
@@ -238,7 +238,7 @@ export default function FilePane({
             <RefreshIcon spinning={refreshing} />
           </button>
           {onNewFolder && (
-            <button onClick={() => setCreating((v) => !v)} className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs">
+            <button onClick={() => setCreating((v) => !v)} className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]">
               + Folder
             </button>
           )}
@@ -246,7 +246,7 @@ export default function FilePane({
       </div>
 
       {/* Breadcrumb */}
-      <div className="flex flex-wrap items-center gap-1 border-b border-[color:var(--border)] px-4 py-2 text-xs text-[color:var(--muted)]">
+      <div className="flex flex-wrap items-center gap-1 border-b border-[color:var(--border)] px-4 py-2 text-[0.8125rem] text-[color:var(--muted)]">
         <button onClick={() => breadcrumbTo(-1)} className="hover:text-[color:var(--text)]">
           {rootLabel}
         </button>
@@ -281,7 +281,7 @@ export default function FilePane({
             </button>
           </div>
           {folderError && (
-            <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs text-red-300">
+            <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-[0.8125rem] text-red-300">
               {folderError}
             </p>
           )}
@@ -354,7 +354,7 @@ export default function FilePane({
                   </button>
 
                   {isPending ? (
-                    <span className="flex items-center gap-2 text-xs">
+                    <span className="flex items-center gap-2 text-[0.8125rem]">
                       <span className="text-[color:var(--muted)]">Delete?</span>
                       <button
                         onClick={() => confirmDelete(entry)}
@@ -370,7 +370,7 @@ export default function FilePane({
                     </span>
                   ) : (
                     <>
-                      <span className="shrink-0 text-xs text-[color:var(--muted)]">
+                      <span className="shrink-0 text-[0.8125rem] text-[color:var(--muted)]">
                         {entry.type === 'file' && entry.size != null ? formatBytes(entry.size) : ''}
                       </span>
                       {onDelete && (

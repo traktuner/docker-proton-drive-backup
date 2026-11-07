@@ -468,7 +468,13 @@ export function confirmBinding(acc: AccountInfo, rebind: boolean): void {
  */
 export async function writeGate(): Promise<string | null> {
   if (!(await isAuthenticated())) return 'Proton session expired — reconnect to Proton Drive to resume backups. Your backup set is unchanged.';
-  const acc = await currentAccount();
+  let acc: AccountInfo | null;
+  try {
+    acc = await currentAccount();
+  } catch {
+    // Unknown account = no write. The run is reported, and retried by the schedule.
+    return 'Could not reach Proton to confirm the account — nothing was written; the next run retries.';
+  }
   const st = bindingState(acc);
   if (st === 'confirm') return 'Confirm the Proton account for your backup sets (banner at the top) before backups write to Drive.';
   if (st === 'mismatch') return `Signed in as ${acc?.email ?? 'another account'}, but these backup sets belong to ${boundEmail() ?? 'a different account'}. Nothing was written.`;

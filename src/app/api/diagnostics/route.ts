@@ -1,6 +1,7 @@
 import { runtime, uploadsBusy } from '@/server/drive';
 import { catalog } from '@/server/catalog';
 import { engineActivity } from '@/server/engine';
+import { gcStats } from '@/server/gc-stats';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,6 +14,8 @@ export async function GET() {
     uptimeS: Math.round(process.uptime()),
     busy: uploadsBusy(),
     memory: { rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers },
+    // liveHeap = heap right after the latest major GC (what is really in use).
+    gc: gcStats(),
     cpu: process.cpuUsage(),
     requests: rt.requestStats(),
     caches: rt.cacheStats(),

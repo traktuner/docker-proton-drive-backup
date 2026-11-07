@@ -385,8 +385,7 @@ class RunContext {
       } finally {
         this.activeListings.delete(folderUid);
       }
-      this.kids.set(folderUid, map);
-      while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
+      this.rememberKids(folderUid, map);
       return map;
     })();
     this.listing.set(folderUid, p);
@@ -395,6 +394,12 @@ class RunContext {
     } finally {
       if (this.listing.get(folderUid) === p) this.listing.delete(folderUid);
     }
+  }
+
+  /** Cache a folder's children for this run (LRU, 256 folders). */
+  private rememberKids(uid: string, map: Map<string, RemoteNode>) {
+    this.kids.set(uid, map);
+    while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
   }
 
   /** Node uids of the continuation folders of local folder `rel`, in part order. */
@@ -442,7 +447,7 @@ class RunContext {
         const n = await this.drive.createFolder(into, name);
         this.kids.get(into)?.set(name, n);
         this.created.add(n.uid);
-        this.kids.set(n.uid, new Map());
+        this.rememberKids(n.uid, new Map());
         return n;
       } catch (e) {
         if (driveErrorCode(e) !== 'FOLDER_FULL') throw e;
@@ -480,7 +485,7 @@ class RunContext {
         }
         const made = parentRel === null ? await this.drive.createFolder(this.targetUid, name) : await this.createIn(parentRel, name);
         this.created.add(made.uid);
-        this.kids.set(made.uid, new Map());
+        this.rememberKids(made.uid, new Map());
         this.addPart(rel, n, made.uid);
         return made.uid;
       }

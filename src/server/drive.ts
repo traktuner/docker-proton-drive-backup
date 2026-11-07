@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { backupSets, meta } from './db';
+import { startGcStats } from './gc-stats';
 import {
   driveErrorCode,
   DriveError,
@@ -13,6 +14,8 @@ import {
   type RemoteNode,
   type Versions,
 } from './proton/types';
+
+startGcStats(); // diagnostics: live heap after major GCs, from process start
 
 /**
  * App-side facade over the Proton SDK runtime (src/server/proton/runtime.ts,

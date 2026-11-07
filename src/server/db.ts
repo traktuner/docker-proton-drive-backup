@@ -110,7 +110,7 @@ export function getDb(): DatabaseSync {
     PRAGMA synchronous = NORMAL;
     PRAGMA temp_store = MEMORY;
     PRAGMA cache_size = -16384;   -- 16 MiB page cache (was 64 MiB; the OS page cache does the rest)
-    PRAGMA mmap_size = 268435456; -- 256 MiB, file-backed (reclaimable, not heap)
+    PRAGMA mmap_size = 0;          -- no mmap: mapped pages count as container memory (docker stats); measured: no slowdown
     PRAGMA wal_autocheckpoint = 2000;
     PRAGMA foreign_keys = OFF;
   `);

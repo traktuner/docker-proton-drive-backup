@@ -166,6 +166,22 @@ describe('first SDK run after an interrupted CLI first upload (files on Drive, n
   });
 });
 
+describe('one listing per existing Drive folder, even with parallel uploads into it', () => {
+  it('parallel new files in a folder that already exists on Drive share a single listing', async () => {
+    const spec = makeSet('backup');
+    for (let i = 0; i < 40; i++) write(`dir/f${i}.txt`, `n${i}`);
+    drive.mkdirp(remote(spec, 'dir'));
+    for (let i = 0; i < 200; i++) drive.putFile(remote(spec, `dir/old${i}.txt`), 'x');
+    drive.listDelayMs = 30; // a slow listing overlaps with the next parallel upload
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.newCount).toBe(40);
+    // root + target + set folder + source chain + 'dir' — but 'dir' exactly once.
+    expect(drive.calls.children).toBeLessThanOrEqual(6);
+  });
+});
+
 describe("Proton's per-folder item limit (200300)", () => {
   it('is not retried; the rest of that folder is skipped at once, other folders continue', async () => {
     for (let i = 0; i < 30; i++) write(`big/f${i}.bin`, `b${i}`);

@@ -228,6 +228,10 @@ class RunContext {
   private dirUids = new Map<string, string>();
   /** folder uid → children by name, for this run (bounded LRU). */
   private kids = new Map<string, Map<string, RemoteNode>>();
+  /** Listings in progress: parallel uploads into one folder share ONE listing. */
+  private listing = new Map<string, Promise<Map<string, RemoteNode>>>();
+  /** Called while a large folder is being listed (progress for the UI). */
+  onListing?: (folderUid: string, count: number) => void;
   setFolderUid = '';
   targetUid = '';
   /** Folders this run created: known to be empty, no listing needed. */
@@ -261,11 +265,26 @@ class RunContext {
       this.kids.set(folderUid, m);
       return m;
     }
-    m = new Map();
-    for await (const n of this.drive.children(folderUid)) if (n.name !== null) m.set(n.name, n);
-    this.kids.set(folderUid, m);
-    while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
-    return m;
+    const pending = this.listing.get(folderUid);
+    if (pending && !fresh) return pending;
+    const p = (async () => {
+      const map = new Map<string, RemoteNode>();
+      for await (const n of this.drive.children(folderUid)) {
+        if (n.name === null) continue;
+        // Only what decisions need: keeps a 100k-entry folder at a few MiB.
+        map.set(n.name, { uid: n.uid, parentUid: n.parentUid, name: n.name, kind: n.kind, size: n.size, mtimeMs: n.mtimeMs, sha1: n.sha1, mediaType: null, trashed: false });
+        if (map.size % 1000 === 0) this.onListing?.(folderUid, map.size);
+      }
+      this.kids.set(folderUid, map);
+      while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
+      return map;
+    })();
+    this.listing.set(folderUid, p);
+    try {
+      return await p;
+    } finally {
+      if (this.listing.get(folderUid) === p) this.listing.delete(folderUid);
+    }
   }
 
   /** The permanent refusal recorded for `rel` or one of its ancestors, if any. */
@@ -613,6 +632,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   const speed = makeSpeedMeter();
   let lastReport = 0;
   let scanned = 0;
+  ctx.onListing = (_uid, count) => report(`reading a large Drive folder (${count.toLocaleString('en')} items so far)`);
   const report = (where: string, force = false) => {
     const now = Date.now();
     if (!force && now - lastReport < 250) return;

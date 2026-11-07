@@ -28,6 +28,8 @@ export class FakeDrive implements DriveService {
   faults: { op: Op; code: DriveErrorCode; times: number; afterCommit?: boolean; match?: (name: string) => boolean }[] = [];
   /** Proton's per-folder item limit (error 200300 → FOLDER_FULL); Infinity = off. */
   maxChildren = Infinity;
+  /** Latency of a folder listing (real listings take seconds for big folders). */
+  listDelayMs = 0;
 
   private full(parentUid: string) {
     let n = 0;
@@ -131,6 +133,7 @@ export class FakeDrive implements DriveService {
     this.fault('children');
     const p = this.nodes.get(folderUid);
     if (!p || p.kind !== 'folder') throw new DriveError('NOT_FOUND', 'folder not found');
+    if (this.listDelayMs) await new Promise((r) => setTimeout(r, this.listDelayMs));
     for (const n of [...this.nodes.values()]) if (n.parentUid === folderUid && !n.trashed) yield this.view(n);
   }
 

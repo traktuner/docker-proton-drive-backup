@@ -16,8 +16,8 @@ const g = globalThis as unknown as { __pdAborts?: Map<string, AbortController> }
 const aborts = g.__pdAborts ?? (g.__pdAborts = new Map());
 
 export interface RunRequest {
-  /** One-shot confirmation that an empty mirror source was emptied on purpose. */
-  allowEmptySource?: boolean;
+  /** One-shot confirmation of the sources' current state (emptied / remounted on purpose). */
+  confirmSources?: boolean;
 }
 
 export async function runBackupSet(id: string, req: RunRequest = {}): Promise<void> {
@@ -70,7 +70,7 @@ async function doRun(id: string, req: RunRequest): Promise<void> {
       excludes: set.excludes,
       skipThumbnails: set.skipThumbnails,
       includeHidden: set.includeHidden,
-      allowEmptySource: req.allowEmptySource,
+      confirmSources: req.confirmSources,
     };
     const result = await runSet(await drive(), spec, {
       log,

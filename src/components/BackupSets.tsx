@@ -808,11 +808,11 @@ export default function BackupSets({
                       >
                         {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
                       </button>
-                      {s.mode === 'mirror' && s.lastStatus === 'error' && /is empty — if you emptied it on purpose/.test(s.lastMessage ?? '') && (
+                      {s.mode === 'mirror' && s.lastStatus === 'error' && /confirm (the deletion )?in the set's row/.test(s.lastMessage ?? '') && (
                         <button
                           onClick={() => {
-                            if (window.confirm('The source folder is empty. Move every file of this set on Drive to the Drive trash? (Only do this if you emptied the folder on purpose — not if a NAS share is offline.)'))
-                              void fetch(`/api/backup-sets/${s.id}/run?allowEmptySource=1`, { method: 'POST' }).then(load);
+                            if (window.confirm('A source is empty or no longer a mounted share. Apply the deletions this causes (items go to the Drive trash)? Only do this if you changed the folder on purpose — not if a NAS share is offline.'))
+                              void fetch(`/api/backup-sets/${s.id}/run?confirmSources=1`, { method: 'POST' }).then(load);
                           }}
                           className="pbtn pbtn--danger px-2.5 py-1.5 text-xs"
                           title="Confirm that the empty source was emptied on purpose and apply the deletions once"

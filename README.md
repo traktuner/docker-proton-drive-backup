@@ -176,7 +176,9 @@ skipped, with the reason shown, when:
 - a source path is missing, or a source that was a mounted share last time is now
   a plain directory of the container (NAS offline, empty mountpoint left behind);
 - a source is completely **empty** although it held files last time — if you
-  emptied it on purpose, **Apply deletions** in the set's row confirms it once;
+  emptied it (or changed the mounts) on purpose, **Apply deletions** in the set's
+  row confirms it once. The "last time" reference is only updated by a run whose
+  sources looked fine, so an offline share never becomes the new normal;
 - any upload failed or a file was unreadable in this run;
 - more than the configured share of the catalog would be removed (Settings →
   Mirror safety; default 30%, can be disabled — the other gates cannot).
@@ -337,7 +339,7 @@ All routes are unauthenticated (see [Security](#security)).
 | GET/POST | `/api/backup-sets` | list / create backup sets |
 | PATCH/DELETE | `/api/backup-sets/:id` | update / delete a set |
 | POST | `/api/backup-sets/:id/source-paths` | safely add source roots to a stopped set |
-| POST | `/api/backup-sets/:id/run` · `/cancel` · `/pause` | run / cancel / pause a set (`run?allowEmptySource=1` confirms an emptied Mirror source once) |
+| POST | `/api/backup-sets/:id/run` · `/cancel` · `/pause` | run / cancel / pause a set (`run?confirmSources=1` confirms an emptied or re-mounted Mirror source once) |
 | POST | `/api/backup-sets/:id/verify` · `/dry-run` | reconcile with Drive (`?content=1`: also compare SHA-1 of every file) / preview |
 | POST | `/api/auth/confirm` | confirm the signed-in account for the backup sets |
 | GET | `/api/drive/revisions?path=` | revisions of a Drive file |

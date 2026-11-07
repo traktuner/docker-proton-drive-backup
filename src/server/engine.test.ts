@@ -203,8 +203,21 @@ describe('mirror safety', () => {
     const r = await runSet(drive, spec);
     expect(r.deletionSkipped).toMatch(/is empty/);
     expect(drive.calls.trash).toBe(0);
-    const r2 = await runSet(drive, { ...spec, allowEmptySource: true });
+    const r2 = await runSet(drive, { ...spec, confirmSources: true });
     expect(r2.deletedCount).toBe(10);
+  });
+
+  it('an offline share stays blocked on EVERY run until confirmed (its state never becomes the reference)', async () => {
+    setMirrorSafetyConfig({ enabled: false, deleteSafetyPct: 0.3 });
+    const spec = await seeded(5);
+    backupSets.setSourceMarks(spec.setId, { [src]: { mounted: true, nonEmpty: true } });
+    for (const f of fs.readdirSync(src)) fs.rmSync(path.join(src, f), { recursive: true }); // empty mountpoint left behind
+    for (let i = 0; i < 3; i++) {
+      const r = await runSet(drive, spec);
+      expect(r.deletionSkipped).toMatch(/no longer a mounted share/);
+    }
+    expect(drive.calls.trash).toBe(0);
+    expect(backupSets.get(spec.setId)!.sourceMarks[src]).toEqual({ mounted: true, nonEmpty: true });
   });
 
   it('a source that was a mount and is now a plain directory blocks deletion', async () => {

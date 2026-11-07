@@ -85,8 +85,9 @@ export interface RunSpec {
   excludes?: string[];
   skipThumbnails?: boolean;
   includeHidden?: boolean;
-  /** One-shot: the user confirmed that a now-empty source really was emptied. */
-  allowEmptySource?: boolean;
+  /** One-shot: the user confirmed the sources' current state (emptied on purpose,
+   *  mounts changed on purpose); it becomes the new reference. */
+  confirmSources?: boolean;
 }
 
 export interface RunHooks {
@@ -451,25 +452,34 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
   return out;
 }
 
-/** Gates that must ALL pass before anything is deleted. Returns the reason to skip, or null. */
-async function deletionGate(
-  spec: RunSpec,
-  marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }>,
-  failedCount: number,
-  staleCount: number,
-  total: number,
-  pct: number | null,
-): Promise<string | null> {
+type MarksNow = Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }>;
+
+/**
+ * Do the sources look like they did after the last good run? Returns why not, or
+ * null. An offline NAS share typically leaves its mountpoint behind as an EMPTY
+ * directory of the parent filesystem: "was a mount, is not" and "had files, is
+ * empty" both block deletion until the user confirms the new state once
+ * (`confirmSources`). The reference state is only updated after a run whose
+ * sources passed this check (or were confirmed) — never from an offline state.
+ */
+function sourceProblem(spec: RunSpec, marksNow: MarksNow): string | null {
   const before = backupSets.get(spec.setId)?.sourceMarks ?? {};
   for (const abs of spec.sourcePaths) {
     const now = marksNow[abs];
-    if (!now?.exists) return `source "${relToLocalRoot(abs) || abs}" is missing on disk (mount offline?)`;
+    const name = relToLocalRoot(abs) || abs;
+    if (!now?.exists) return `source "${name}" is missing on disk (mount offline?)`;
+    if (spec.confirmSources) continue;
     const prev: SourceMark | undefined = before[abs];
-    if (prev?.mounted && !now.mounted) return `source "${relToLocalRoot(abs) || abs}" is no longer a mounted share (NAS offline?)`;
-    if (!now.nonEmpty && (prev?.nonEmpty ?? true) && !spec.allowEmptySource) {
-      return `source "${relToLocalRoot(abs) || abs}" is empty — if you emptied it on purpose, confirm the deletion in the set's menu`;
-    }
+    if (prev?.mounted && !now.mounted) return `source "${name}" is no longer a mounted share (NAS offline?) — if you changed the mounts on purpose, confirm in the set's row`;
+    if (!now.nonEmpty && (prev?.nonEmpty ?? true)) return `source "${name}" is empty — if you emptied it on purpose, confirm the deletion in the set's row`;
   }
+  return null;
+}
+
+/** Gates that must ALL pass before anything is deleted. Returns the reason to skip, or null. */
+function deletionGate(spec: RunSpec, marksNow: MarksNow, failedCount: number, staleCount: number, total: number, pct: number | null): string | null {
+  const src = sourceProblem(spec, marksNow);
+  if (src) return src;
   if (failedCount > 0) return `${failedCount} file(s) failed to upload — "gone locally" can't be trusted until uploads succeed`;
   if (pct !== null && total > 0 && staleCount / total > pct) {
     return `${staleCount}/${total} entries (>${Math.round(pct * 100)}%) would be removed`;
@@ -590,7 +600,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   if (bindErr) return result(bindErr);
 
   // 2. Sources (also the mount marks the mirror gate compares against next time).
-  const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
+  const marksNow: MarksNow = {};
   for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
   // A missing source must never look like a successful "0 uploaded" run.
   const missingSources = spec.sourcePaths.filter((abs) => !marksNow[abs].exists);
@@ -849,7 +859,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   if (spec.mode === 'mirror' && !cancelled) {
     const stale = removed!.removed;
     if (stale.length || missingSources.length) {
-      deletionSkipped = await deletionGate(spec, marksNow, failedCount, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+      deletionSkipped = deletionGate(spec, marksNow, failedCount, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
       if (deletionSkipped) {
         log(`Safety: ${deletionSkipped} — deletion skipped.`);
       } else {
@@ -863,8 +873,9 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   }
 
   // Remember how the sources looked, for the next run's mount check — but only after
-  // a run that saw them intact, so an offline share can never become the reference.
-  if (!cancelled && Object.values(marksNow).every((m) => m.exists && (m.nonEmpty || spec.allowEmptySource || !m.mounted))) {
+  // a run that saw them intact (or a confirmed change), so an offline share can
+  // never become the reference.
+  if (!cancelled && sourceProblem(spec, marksNow) === null) {
     const marks: Record<string, SourceMark> = {};
     for (const [abs, m] of Object.entries(marksNow)) marks[abs] = { mounted: m.mounted, nonEmpty: m.nonEmpty };
     backupSets.setSourceMarks(spec.setId, marks);
@@ -965,10 +976,10 @@ export async function previewSet(drive: DriveService, spec: RunSpec, shouldCance
   let deletionWouldSkip: string | null = null;
   if (removed && removed.removed.length) {
     const stale = removed.removed;
-    const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
+    const marksNow: MarksNow = {};
     for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
     // Same gates as the live run; an unreadable entry counts like a failed upload.
-    deletionWouldSkip = await deletionGate(spec, marksNow, unreadable, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+    deletionWouldSkip = deletionGate(spec, marksNow, unreadable, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
     if (!deletionWouldSkip) {
       const target = await ctx.resolvePath(spec.targetPath);
       const set = backupSets.get(spec.setId);

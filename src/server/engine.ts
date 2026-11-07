@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, promises as fsp } from 'node:fs';
 import { walkSourceStream, relToLocalRoot, sourceMark } from './local';
 import { catalog, diffFile, type CatalogEntry, type CatalogFile } from './catalog';
-import { backupSets, getDb, type SourceMark } from './db';
+import { backupSets, type SourceMark } from './db';
 import { getUploadConfig } from './upload-config';
 import { getMirrorSafetyConfig } from './mirror-safety';
 import { mediaTypeFor } from './mime';
@@ -365,11 +365,8 @@ interface DeletionOutcome {
 async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: () => boolean, log: (m: string) => void): Promise<DeletionOutcome> {
   const out: DeletionOutcome = { deleted: 0, wouldDelete: [], wouldDeleteCount: 0, kept: [], failed: 0, sessionDead: false };
   const { spec, drive } = ctx;
-  const staleSet = new Map(stale.map((e) => [e.rel, e]));
   const dropRows = (rel: string) => {
-    if (!ctx.write) return;
-    const gone = stale.filter((s) => s.rel === rel || s.rel.startsWith(rel + '/')).map((s) => s.rel);
-    catalog.remove(spec.setId, gone);
+    if (ctx.write) catalog.removeTree(spec.setId, rel);
   };
   const batch: { uid: string; rel: string }[] = [];
   const flush = async () => {
@@ -396,7 +393,7 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
     for (const child of (await ctx.childMap(dirUid, true)).values()) {
       const rel = `${dirRel}/${child.name}`;
       const kind = child.kind === 'folder' ? 'dir' : 'file';
-      const known = staleSet.get(rel) ?? (kind === 'dir' ? catalog.getDir(spec.setId, rel) : catalog.getFile(spec.setId, rel));
+      const known = kind === 'dir' ? catalog.getDir(spec.setId, rel) : catalog.getFile(spec.setId, rel);
       if (!known) return true;
       if (child.kind === 'folder' && (await hasForeign(child.uid, rel))) return true;
     }
@@ -428,9 +425,9 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
     if (e.kind === 'dir' && (await hasForeign(node.uid, e.rel))) {
       out.kept.push({ rel: e.rel, reason: 'contains files this backup did not upload' });
       log(`  kept folder ${e.rel}: it contains items this backup did not upload; trashing only ours`);
-      for (const child of stale) {
-        if (path.posix.dirname(child.rel) === e.rel) await visit(child);
-      }
+      // Only the items we uploaded go, one by one. The removed folder's own
+      // catalog children ARE what this backup uploaded there.
+      for (const child of catalog.children(spec.setId, e.rel)) await visit({ rel: child.rel, kind: child.kind, nodeUid: child.nodeUid });
       if (ctx.write) catalog.upsertDir(spec.setId, e.rel, ctx.seenAt, node.uid); // the folder stays
       return;
     }
@@ -478,6 +475,55 @@ async function deletionGate(
     return `${staleCount}/${total} entries (>${Math.round(pct * 100)}%) would be removed`;
   }
   return null;
+}
+
+/**
+ * Finds what was removed locally, one folder at a time, WITHOUT writing anything:
+ * when the scan enters a folder it reports the folder's subfolder names, then its
+ * files; when the next folder starts, the previous folder's catalog children
+ * (parent index) are compared with what was seen. Memory is one folder's names.
+ * Excluded entries are still walked and therefore count as present (= kept);
+ * unreadable ones count as present too (and block deletion via the failure gate).
+ * The same collector feeds the live run and the dry run.
+ */
+class RemovedCollector {
+  readonly removed: CatalogEntry[] = [];
+  private cur: { rel: string; files: Set<string>; dirs: Set<string> } | null = null;
+  constructor(private readonly setId: string) {}
+  enter(rel: string, subdirs: string[] | null) {
+    this.finish();
+    // An unreadable folder (null) is never diffed: nothing below it is "gone".
+    this.cur = subdirs === null ? null : { rel, files: new Set(), dirs: new Set(subdirs) };
+  }
+  /** Name of `rel` if it is a direct child of the current folder (hot path: no path.* calls). */
+  private child(rel: string): string | null {
+    const c = this.cur;
+    if (!c) return null;
+    const n = c.rel.length;
+    if (rel.length <= n + 1 || rel.charCodeAt(n) !== 47 || !rel.startsWith(c.rel)) return null;
+    return rel.indexOf('/', n + 1) === -1 ? rel.slice(n + 1) : null;
+  }
+  seen(rel: string) {
+    const name = this.child(rel);
+    if (name !== null) this.cur!.files.add(name);
+  }
+  unreadable(rel: string) {
+    const name = this.child(rel);
+    if (name !== null) {
+      this.cur!.files.add(name);
+      this.cur!.dirs.add(name);
+    }
+  }
+  finish() {
+    const c = this.cur;
+    this.cur = null;
+    if (!c) return;
+    const cut = c.rel.length + 1;
+    for (const row of catalog.childNames(this.setId, c.rel)) {
+      const name = row.rel.slice(cut);
+      if (!(row.kind === 'file' ? c.files.has(name) : c.dirs.has(name))) this.removed.push({ rel: row.rel, kind: row.kind, nodeUid: row.node_uid });
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -546,6 +592,8 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   // 2. Sources (also the mount marks the mirror gate compares against next time).
   const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
   for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
+  // A missing source must never look like a successful "0 uploaded" run.
+  const missingSources = spec.sourcePaths.filter((abs) => !marksNow[abs].exists);
 
   // 3. Upload pool: bounded files in flight (live-tunable), shared speed limit.
   let capAt = 0;
@@ -684,23 +732,8 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
     }
   };
 
-  // 4. Walk + diff. "Seen" marks for mirror are buffered and flushed in one transaction.
-  const touchBuf: string[] = [];
-  const seenDirs = new Set<string>();
-  const flushTouches = () => {
-    if (touchBuf.length === 0) return;
-    catalog.touchMany(spec.setId, touchBuf.splice(0), seenAt);
-  };
-  const touch = (rel: string) => {
-    touchBuf.push(rel);
-    let dir = path.posix.dirname(rel);
-    while (dir && dir !== '.' && !seenDirs.has(dir)) {
-      seenDirs.add(dir);
-      touchBuf.push(dir);
-      dir = path.posix.dirname(dir);
-    }
-    if (touchBuf.length >= 2000) flushTouches();
-  };
+  // 4. Walk + diff. Mirror finds local removals per folder (no per-file writes).
+  const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
   const pendingDirs: string[] = [];
   const drainDirs = async () => {
     while (pendingDirs.length && !sessionDead) {
@@ -720,11 +753,11 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
     const relBase = relBaseFor(spec.subfolder, abs);
     for await (const file of walkSourceStream(abs, relBase, {
       includeHidden: spec.includeHidden,
-      onSkip: noteFailed,
-      onDir: (rel) => {
-        if (ctx.isExcluded(rel) && rel !== relBase) return;
-        touch(rel);
+      onSkip: (rel, reason) => {
+        removed?.unreadable(rel);
+        noteFailed(rel, reason);
       },
+      onDir: (rel, subdirs) => removed?.enter(rel, subdirs),
       // Folders are created on demand for the files in them; only truly EMPTY local
       // folders are created explicitly, so they are mirrored too.
       onEmptyDir: (rel) => {
@@ -739,10 +772,8 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
       if (sessionDead) break outer;
       // Folders first (keeps empty folders mirrored).
       await drainDirs();
-      if (ctx.isExcluded(file.rel)) {
-        touch(file.rel);
-        continue;
-      }
+      removed?.seen(file.rel);
+      if (ctx.isExcluded(file.rel)) continue; // excluded = left alone (and kept on Drive)
       const cat = catalog.getFile(spec.setId, file.rel);
       let verdict = diffFile(file, cat);
       if (spec.mode === 'add' && cat) verdict = 'unchanged'; // add never updates
@@ -796,7 +827,6 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
       }
       if (verdict === 'unchanged') {
         unchangedCount++;
-        touch(file.rel);
         continue;
       }
       if (verdict === 'new') newCount++;
@@ -804,11 +834,11 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
       await schedule(() => processFile(file, verdict as 'new' | 'changed', cat));
     }
     if (cancelled || sessionDead) break;
+    removed?.finish();
     await drainDirs();
   }
   await Promise.all(inflight);
   if (shouldCancel()) cancelled = true;
-  flushTouches(); // MUST precede stale(): an unflushed mark would look like a deletion
   report('', true);
 
   if (sessionDead) return result(SESSION_EXPIRED_MSG);
@@ -817,8 +847,8 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
   let deletedCount = 0;
   let deletionSkipped: string | null = null;
   if (spec.mode === 'mirror' && !cancelled) {
-    const stale = catalog.stale(spec.setId, seenAt).filter((s) => s.rel === spec.subfolder || s.rel.startsWith(ctx.prefix));
-    if (stale.length) {
+    const stale = removed!.removed;
+    if (stale.length || missingSources.length) {
       deletionSkipped = await deletionGate(spec, marksNow, failedCount, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
       if (deletionSkipped) {
         log(`Safety: ${deletionSkipped} — deletion skipped.`);
@@ -840,6 +870,7 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
     backupSets.setSourceMarks(spec.setId, marks);
   }
 
+  for (const abs of missingSources) noteFailed(relToLocalRoot(abs) || abs, 'source folder is missing on disk (NAS share offline?) — nothing from it was backed up');
   const parts = [`${doneFiles} uploaded`, `${unchangedCount} unchanged`];
   if (adoptedCount) parts.push(`${adoptedCount} already on Drive`);
   if (spec.mode === 'mirror' && !cancelled && !deletionSkipped) parts.push(`${deletedCount} removed`);
@@ -885,96 +916,71 @@ export interface PreviewResult {
 
 /**
  * What a run would do — the SAME scan, exclusions, verdicts and deletion planner
- * as runSet, with every write replaced by counting. It reads from Drive only for
- * the items a mirror run would delete (identity and foreign-content checks, same
- * as the live run) and never writes the catalog: "seen" marks go to a TEMP table.
+ * as runSet (including the per-folder removal diff), with every write replaced by
+ * counting. It reads from Drive only for the items a mirror run would delete
+ * (identity and foreign-content checks, same as the live run).
  */
 export async function previewSet(drive: DriveService, spec: RunSpec, shouldCancel: () => boolean = () => false): Promise<PreviewResult> {
   const mirrorCfg = getMirrorSafetyConfig();
   const DELETE_SAFETY_PCT = mirrorCfg.enabled ? mirrorCfg.deleteSafetyPct : null;
   const ctx = new RunContext(drive, { ...spec }, 0, false);
-  const db = getDb();
-  db.exec('CREATE TEMP TABLE IF NOT EXISTS preview_seen (rel TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM temp.preview_seen;');
-  const ins = db.prepare('INSERT OR IGNORE INTO temp.preview_seen (rel) VALUES (?)');
-  const seenDirs = new Set<string>();
-  const touch = (rel: string) => {
-    ins.run(rel);
-    let dir = path.posix.dirname(rel);
-    while (dir && dir !== '.' && !seenDirs.has(dir)) {
-      seenDirs.add(dir);
-      ins.run(dir);
-      dir = path.posix.dirname(dir);
-    }
-  };
-
+  const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
+  let unreadable = 0;
   let newCount = 0;
   let changedCount = 0;
   let unchangedCount = 0;
   let wouldUploadBytes = 0;
-  db.exec('BEGIN');
-  try {
-    for (const abs of spec.sourcePaths) {
-      const relBase = relBaseFor(spec.subfolder, abs);
-      for await (const file of walkSourceStream(abs, relBase, {
-        includeHidden: spec.includeHidden,
-        onDir: (rel) => {
-          if (!ctx.isExcluded(rel) || rel === relBase) touch(rel);
-        },
-      })) {
-        if (shouldCancel()) break;
-        touch(file.rel);
-        if (ctx.isExcluded(file.rel)) continue;
-        const cat = catalog.getFile(spec.setId, file.rel);
-        let verdict = diffFile(file, cat);
-        if (spec.mode === 'add' && cat) verdict = 'unchanged';
-        if (verdict === 'hash') {
-          const local = cat!.sha1 ? await sha1File(file.abs).catch(() => null) : null;
-          verdict = local && local === cat!.sha1 ? 'unchanged' : 'changed';
-        }
-        if (verdict === 'unchanged') unchangedCount++;
-        else {
-          if (verdict === 'new') newCount++;
-          else changedCount++;
-          wouldUploadBytes += file.size;
-        }
+  for (const abs of spec.sourcePaths) {
+    const relBase = relBaseFor(spec.subfolder, abs);
+    for await (const file of walkSourceStream(abs, relBase, {
+      includeHidden: spec.includeHidden,
+      onDir: (rel, subdirs) => removed?.enter(rel, subdirs),
+      onSkip: (rel) => {
+        unreadable++;
+        removed?.unreadable(rel);
+      },
+    })) {
+      if (shouldCancel()) break;
+      removed?.seen(file.rel);
+      if (ctx.isExcluded(file.rel)) continue;
+      const cat = catalog.getFile(spec.setId, file.rel);
+      let verdict = diffFile(file, cat);
+      if (spec.mode === 'add' && cat) verdict = 'unchanged';
+      if (verdict === 'hash') {
+        const local = cat!.sha1 ? await sha1File(file.abs).catch(() => null) : null;
+        verdict = local && local === cat!.sha1 ? 'unchanged' : 'changed';
+      }
+      if (verdict === 'unchanged') unchangedCount++;
+      else {
+        if (verdict === 'new') newCount++;
+        else changedCount++;
+        wouldUploadBytes += file.size;
       }
     }
-  } finally {
-    db.exec('COMMIT');
+    removed?.finish();
   }
 
   let wouldDelete: string[] = [];
   let wouldDeleteCount = 0;
   let deletionWouldSkip: string | null = null;
-  if (spec.mode === 'mirror') {
-    const stale = (
-      db
-        .prepare(
-          `SELECT c.rel, c.kind, c.node_uid FROM backup_catalog c
-           WHERE c.set_id = ? AND (c.rel = ? OR (c.rel > ? AND c.rel < ?))
-             AND NOT EXISTS (SELECT 1 FROM temp.preview_seen s WHERE s.rel = c.rel)
-           ORDER BY length(c.rel)`,
-        )
-        .all(spec.setId, spec.subfolder, spec.subfolder + '/', spec.subfolder + '0') as { rel: string; kind: 'file' | 'dir'; node_uid: string | null }[]
-    ).map((r) => ({ rel: r.rel, kind: r.kind, nodeUid: r.node_uid }));
-    if (stale.length) {
-      const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
-      for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
-      deletionWouldSkip = await deletionGate(spec, marksNow, 0, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
-      if (!deletionWouldSkip) {
-        const target = await ctx.resolvePath(spec.targetPath);
-        const set = backupSets.get(spec.setId);
-        ctx.targetUid = target?.uid ?? '';
-        ctx.setFolderUid = set?.folderUid ?? (target ? ((await ctx.childMap(target.uid)).get(spec.subfolder)?.uid ?? '') : '');
-        if (ctx.setFolderUid) {
-          const plan = await planAndDelete(ctx, stale, shouldCancel, () => {});
-          wouldDelete = plan.wouldDelete;
-          wouldDeleteCount = plan.wouldDeleteCount;
-        }
+  if (removed && removed.removed.length) {
+    const stale = removed.removed;
+    const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
+    for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
+    // Same gates as the live run; an unreadable entry counts like a failed upload.
+    deletionWouldSkip = await deletionGate(spec, marksNow, unreadable, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+    if (!deletionWouldSkip) {
+      const target = await ctx.resolvePath(spec.targetPath);
+      const set = backupSets.get(spec.setId);
+      ctx.targetUid = target?.uid ?? '';
+      ctx.setFolderUid = set?.folderUid ?? (target ? ((await ctx.childMap(target.uid)).get(spec.subfolder)?.uid ?? '') : '');
+      if (ctx.setFolderUid) {
+        const plan = await planAndDelete(ctx, stale, shouldCancel, () => {});
+        wouldDelete = plan.wouldDelete;
+        wouldDeleteCount = plan.wouldDeleteCount;
       }
     }
   }
-  db.exec('DELETE FROM temp.preview_seen');
 
   const wouldUploadCount = newCount + changedCount;
   const parts = [`${wouldUploadCount} to upload`, `${unchangedCount} unchanged`];

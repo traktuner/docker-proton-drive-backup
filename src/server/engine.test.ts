@@ -217,6 +217,16 @@ describe('mirror safety', () => {
     expect(drive.calls.trash).toBe(0);
   });
 
+  it('a missing source is reported as a failure, never as a successful "0 uploaded" backup', async () => {
+    write('a.txt', 'a');
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    fs.rmSync(src, { recursive: true });
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/missing on disk/);
+  });
+
   it('a missing source path blocks deletion', async () => {
     const spec = await seeded(3);
     fs.rmSync(src, { recursive: true });

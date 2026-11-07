@@ -56,9 +56,12 @@ const SQL = {
   eachFile: "SELECT rel, size, sha1, mtime_ms, node_uid FROM backup_catalog WHERE set_id = ? AND kind = 'file'",
   eachEntry: 'SELECT rel, kind, node_uid FROM backup_catalog WHERE set_id = ?',
   dirs: "SELECT rel, node_uid FROM backup_catalog WHERE set_id = ? AND kind = 'dir' ORDER BY rel",
-  // Everything strictly below `prefix/` — a range scan on the (set_id, rel) primary
-  // key ('/' + 1 = '0'), so it never touches unrelated rows.
-  below: 'SELECT rel, kind, size, mtime_ms, sha1, node_uid FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ?',
+  // Direct children of a folder via the expression index idx_catalog_parent
+  // (rtrim(rel, replace(rel,'/','')) is rel up to and including its last '/').
+  children:
+    "SELECT rel, kind, size, mtime_ms, sha1, node_uid FROM backup_catalog WHERE set_id = ? AND rtrim(rel, replace(rel, '/', '')) = ?",
+  childNames: "SELECT rel, kind, node_uid FROM backup_catalog WHERE set_id = ? AND rtrim(rel, replace(rel, '/', '')) = ?",
+  removeTree: 'DELETE FROM backup_catalog WHERE set_id = ? AND (rel = ? OR (rel > ? AND rel < ?))',
   anyBelow: 'SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ? LIMIT 1',
 } as const;
 
@@ -205,26 +208,34 @@ export const catalog = {
     }));
   },
 
-  /** Direct children of `dirRel` (files and dirs). Range scan on the primary key. */
+  /** Direct children of `dirRel` (files and dirs), via the parent index. */
   children(
     setId: string,
     dirRel: string,
   ): { rel: string; kind: 'file' | 'dir'; size: number | null; mtimeMs: number | null; sha1: string | null; nodeUid: string | null }[] {
     ensure();
-    const rows = stmt(SQL.below).all(setId, dirRel + '/', dirRel + '0') as {
-      rel: string;
-      kind: 'file' | 'dir';
-      size: number | null;
-      mtime_ms: number | null;
-      sha1: string | null;
-      node_uid: string | null;
-    }[];
-    const out = [];
-    for (const r of rows) {
-      if (r.rel.indexOf('/', dirRel.length + 1) !== -1) continue; // deeper descendant
-      out.push({ rel: r.rel, kind: r.kind, size: r.size, mtimeMs: r.mtime_ms, sha1: r.sha1, nodeUid: r.node_uid });
-    }
-    return out;
+    return (
+      stmt(SQL.children).all(setId, dirRel + '/') as {
+        rel: string;
+        kind: 'file' | 'dir';
+        size: number | null;
+        mtime_ms: number | null;
+        sha1: string | null;
+        node_uid: string | null;
+      }[]
+    ).map((r) => ({ rel: r.rel, kind: r.kind, size: r.size, mtimeMs: r.mtime_ms, sha1: r.sha1, nodeUid: r.node_uid }));
+  },
+
+  /** Direct children, minimal columns (hot path of the per-folder removal diff). */
+  childNames(setId: string, dirRel: string): { rel: string; kind: 'file' | 'dir'; node_uid: string | null }[] {
+    ensure();
+    return stmt(SQL.childNames).all(setId, dirRel + '/') as { rel: string; kind: 'file' | 'dir'; node_uid: string | null }[];
+  },
+
+  /** Remove an entry and everything below it (range delete on the primary key). */
+  removeTree(setId: string, rel: string): void {
+    ensure();
+    stmt(SQL.removeTree).run(setId, rel, rel + '/', rel + '0');
   },
 
   /** Whether anything is recorded strictly below `dirRel/`. */

@@ -71,8 +71,12 @@ export interface WalkOptions {
    * deletion pass from mistaking an unreadable-but-present file for "gone").
    */
   onSkip?: (rel: string, reason: string) => void;
-  /** Called for every directory the walk enters (rel), including the source root. */
-  onDir?: (rel: string) => void;
+  /**
+   * Called for every directory the walk enters (rel), including the source root,
+   * with the names of its (visible) subdirectories — or null if it is unreadable.
+   * The directory's files are yielded after this call and before any subdirectory.
+   */
+  onDir?: (rel: string, subdirs: string[] | null) => void;
   /** Called for a directory that has no (non-hidden) entries at all. */
   onEmptyDir?: (rel: string) => void;
 }
@@ -110,11 +114,13 @@ const flush = async () => {
 };
 const reason = (e) => (e && e.code) || 'unreadable';
 async function recur(dir, rel) {
-  batch.push(['d', rel]);
   let ents;
   try { ents = fs.readdirSync(dir, { withFileTypes: true }); }
-  catch (e) { batch.push(['s', rel, 'folder not readable (' + reason(e) + ')']); return; }
+  catch (e) { batch.push(['d', rel, null], ['s', rel, 'folder not readable (' + reason(e) + ')']); return; }
   const visible = includeHidden ? ents : ents.filter((e) => !e.name.startsWith('.'));
+  // A folder is announced with the names of its subfolders; its files follow
+  // before any subfolder is entered (the engine diffs one folder at a time).
+  batch.push(['d', rel, visible.filter((e) => e.isDirectory()).map((e) => e.name)]);
   if (visible.length === 0) batch.push(['e', rel]);
   const subdirs = [];
   for (const e of visible) {
@@ -189,7 +195,7 @@ export async function* walkSourceStream(
             yield { rel: it[1] as string, abs: it[2] as string, size: it[3] as number, mtimeMs: it[4] as number };
             break;
           case 'd':
-            onDir?.(it[1] as string);
+            onDir?.(it[1] as string, it[2] as string[] | null);
             break;
           case 'e':
             onEmptyDir?.(it[1] as string);

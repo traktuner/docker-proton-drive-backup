@@ -216,6 +216,9 @@ function migrate(db: DatabaseSync) {
     if (!sets.has('folder_uid')) db.exec('ALTER TABLE backup_sets ADD COLUMN folder_uid TEXT');
     if (!sets.has('source_marks')) db.exec('ALTER TABLE backup_sets ADD COLUMN source_marks TEXT');
     db.exec(`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    // Direct children of a folder (per-folder diff for mirror, verify). An index on
+    // an expression of built-in functions: CLI-era releases maintain it unknowingly.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_catalog_parent ON backup_catalog (set_id, rtrim(rel, replace(rel, '/', '')))`);
     // Remember that this DB came from a CLI-era release (decides session takeover).
     if (v === 0 && hasData) db.prepare('INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)').run('upgrade.fromCli', String(Date.now()));
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);

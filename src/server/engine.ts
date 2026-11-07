@@ -212,6 +212,18 @@ export function describeUploadError(e: unknown): string {
 
 const TRANSIENT = new Set(['NETWORK', 'RATE_LIMITED', 'SERVER', 'INTEGRITY', 'UNKNOWN']);
 
+/**
+ * Name of the N-th continuation folder of a local folder ("<name> · part N", at most
+ * 255 bytes). Proton refuses more than ~30,000 items per folder (API 200300); the
+ * items that do not fit go to these sibling folders, recorded in drive_parts.
+ */
+export function partName(name: string, n: number): string {
+  const suffix = ` · part ${n}`;
+  let base = name;
+  while (Buffer.byteLength(base + suffix) > 255) base = base.slice(0, -1);
+  return base + suffix;
+}
+
 /** Refusals that no retry will change: the whole folder is affected for the rest of the run. */
 function isPermanentFolderError(e: unknown): boolean {
   const c = driveErrorCode(e);
@@ -238,6 +250,10 @@ class RunContext {
   private created = new Set<string>();
   /** rel dir → permanent Drive refusal (folder full, too deep): skip without requests. */
   private blocked = new Map<string, DriveError>();
+  /** rel dir → node uids of its continuation folders (part 2, 3, …), cached from drive_parts. */
+  private partsCache = new Map<string, string[]>();
+  /** Overflow in progress per rel: parallel uploads into a full folder create ONE new part. */
+  private overflowing = new Map<string, Promise<string>>();
 
   constructor(
     readonly drive: DriveService,
@@ -287,6 +303,98 @@ class RunContext {
     }
   }
 
+  /** Node uids of the continuation folders of local folder `rel`, in part order. */
+  partUids(rel: string): string[] {
+    let p = this.partsCache.get(rel);
+    if (!p) {
+      p = catalog.parts(this.spec.setId, rel).map((x) => x.nodeUid);
+      this.partsCache.set(rel, p);
+    }
+    return p;
+  }
+
+  /** Every Drive folder holding local folder `rel`: the folder itself, then its parts. */
+  async folders(rel: string, create: boolean): Promise<string[]> {
+    const primary = await this.dirUid(rel, create);
+    return primary ? [primary, ...this.partUids(rel)] : [];
+  }
+
+  /** Item `name` of local folder `rel`, looked up across all of its Drive folders. */
+  async findIn(rel: string, name: string): Promise<RemoteNode | undefined> {
+    for (const uid of await this.folders(rel, false)) {
+      const hit = (await this.childMap(uid)).get(name);
+      if (hit) return hit;
+    }
+    return undefined;
+  }
+
+  /** Create folder `name` in local folder `rel`'s current Drive folder, overflowing when full. */
+  async createIn(rel: string, name: string): Promise<RemoteNode> {
+    for (let i = 0; i < 64; i++) {
+      const fl = await this.folders(rel, true);
+      const into = fl[fl.length - 1];
+      try {
+        const n = await this.drive.createFolder(into, name);
+        this.kids.get(into)?.set(name, n);
+        this.created.add(n.uid);
+        this.kids.set(n.uid, new Map());
+        return n;
+      } catch (e) {
+        if (driveErrorCode(e) !== 'FOLDER_FULL') throw e;
+        await this.overflow(rel, into);
+      }
+    }
+    throw new DriveError('FOLDER_FULL', `too many continuation folders for ${rel}`);
+  }
+
+  /**
+   * Local folder `rel`'s Drive folder `fullUid` was refused as full: return the next
+   * continuation folder, creating (or, if the index was lost, rediscovering by name)
+   * "<name> · part N" next to it. Shared by all parallel uploads into that folder.
+   */
+  overflow(rel: string, fullUid: string): Promise<string> {
+    const pending = this.overflowing.get(rel);
+    if (pending) return pending;
+    const p = (async () => {
+      const fl = await this.folders(rel, true);
+      const last = fl[fl.length - 1];
+      if (last !== fullUid) return last; // another upload already moved on
+      if (!this.write) throw new DriveError('FOLDER_FULL', 'folder full (dry run)');
+      const isSetFolder = rel === this.spec.subfolder;
+      const parentRel = isSetFolder ? null : path.posix.dirname(rel) === '.' ? this.spec.subfolder : path.posix.dirname(rel);
+      const base = path.posix.basename(rel);
+      for (let n = this.partUids(rel).length + 2; n < 10_000; n++) {
+        const name = partName(base, n);
+        const sibling = parentRel === null ? `${name}` : `${parentRel}/${name}`;
+        const ex = parentRel === null ? (await this.childMap(this.targetUid)).get(name) : await this.findIn(parentRel, name);
+        if (ex) {
+          // A real local folder of that name is in the catalog: not ours, skip the number.
+          if (ex.kind !== 'folder' || catalog.getDir(this.spec.setId, sibling)) continue;
+          this.addPart(rel, n, ex.uid); // a part from an earlier run (index rebuilt)
+          return ex.uid;
+        }
+        const made = parentRel === null ? await this.drive.createFolder(this.targetUid, name) : await this.createIn(parentRel, name);
+        this.created.add(made.uid);
+        this.kids.set(made.uid, new Map());
+        this.addPart(rel, n, made.uid);
+        return made.uid;
+      }
+      throw new DriveError('FOLDER_FULL', `too many continuation folders for ${rel}`);
+    })();
+    this.overflowing.set(rel, p);
+    return p.finally(() => this.overflowing.delete(rel));
+  }
+
+  private addPart(rel: string, n: number, uid: string) {
+    catalog.addPart(this.spec.setId, rel, n, uid);
+    this.partsCache.delete(rel);
+  }
+
+  /** If `uid` is a continuation folder: the local folder it belongs to. */
+  partOwner(uid: string): string | null {
+    return catalog.partOwner(this.spec.setId, uid)?.rel ?? null;
+  }
+
   /** The permanent refusal recorded for `rel` or one of its ancestors, if any. */
   blockedError(rel: string): DriveError | null {
     for (let d = rel; d && d !== '.'; d = path.posix.dirname(d)) {
@@ -330,24 +438,22 @@ class RunContext {
       this.remember(rel, row.nodeUid);
       return row.nodeUid;
     }
-    const parentRel = path.posix.dirname(rel);
-    const parent = await this.dirUid(parentRel === '.' ? this.spec.subfolder : parentRel, create);
+    const parentRel0 = path.posix.dirname(rel);
+    const parentRel = parentRel0 === '.' ? this.spec.subfolder : parentRel0;
+    const parent = await this.dirUid(parentRel, create);
     if (!parent) return null;
     const name = path.posix.basename(rel);
-    const kids = await this.childMap(parent);
-    let n = kids.get(name);
+    let n = await this.findIn(parentRel, name);
     if (n && n.kind !== 'folder') throw new DriveError('NAME_CONFLICT', `a file named "${name}" is where a folder belongs`);
+    if (n && this.partOwner(n.uid)) throw new DriveError('NAME_CONFLICT', `"${name}" is the name of a continuation folder of this backup`);
     if (!n) {
       if (!create || !this.write) return null;
       try {
-        n = await this.drive.createFolder(parent, name);
+        n = await this.createIn(parentRel, name);
       } catch (e) {
         if (isPermanentFolderError(e)) this.blocked.set(rel, e as DriveError);
         throw e;
       }
-      kids.set(name, n);
-      this.created.add(n.uid);
-      this.kids.set(n.uid, new Map());
     }
     if (this.write) catalog.upsertDir(this.spec.setId, rel, this.seenAt, n.uid);
     this.remember(rel, n.uid);
@@ -459,14 +565,18 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
     }
   };
 
-  /** Does the remote folder contain anything that is not in our catalog? */
-  const hasForeign = async (dirUid: string, dirRel: string): Promise<boolean> => {
-    for (const child of (await ctx.childMap(dirUid, true)).values()) {
-      const rel = `${dirRel}/${child.name}`;
-      const kind = child.kind === 'folder' ? 'dir' : 'file';
-      const known = kind === 'dir' ? catalog.getDir(spec.setId, rel) : catalog.getFile(spec.setId, rel);
-      if (!known) return true;
-      if (child.kind === 'folder' && (await hasForeign(child.uid, rel))) return true;
+  /** Does any Drive folder of local folder `dirRel` contain anything not in our catalog? */
+  const hasForeign = async (dirRel: string, uids: string[]): Promise<boolean> => {
+    for (const dirUid of uids) {
+      for (const child of (await ctx.childMap(dirUid, true)).values()) {
+        // Continuation folders of a subfolder are ours; they are checked with it.
+        if (child.kind === 'folder' && ctx.partOwner(child.uid)) continue;
+        const rel = `${dirRel}/${child.name}`;
+        const kind = child.kind === 'folder' ? 'dir' : 'file';
+        const known = kind === 'dir' ? catalog.getDir(spec.setId, rel) : catalog.getFile(spec.setId, rel);
+        if (!known) return true;
+        if (child.kind === 'folder' && (await hasForeign(rel, [child.uid, ...ctx.partUids(rel)]))) return true;
+      }
     }
     return false;
   };
@@ -474,26 +584,28 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
   const visit = async (e: CatalogEntry): Promise<void> => {
     if (cancelled() || out.sessionDead) return;
     if (e.rel === spec.subfolder) return; // never the set folder itself
-    const parentRel = path.posix.dirname(e.rel);
-    const parentUid = await ctx.dirUid(parentRel === '.' ? spec.subfolder : parentRel, false);
+    const parentRel0 = path.posix.dirname(e.rel);
+    const parentRel = parentRel0 === '.' ? spec.subfolder : parentRel0;
+    const parentFolders = await ctx.folders(parentRel, false);
     const name = path.posix.basename(e.rel);
-    if (!parentUid) {
+    if (!parentFolders.length) {
       dropRows(e.rel); // the parent is already gone on Drive
       return;
     }
-    const uid = e.nodeUid ?? (await ctx.childMap(parentUid)).get(name)?.uid ?? null;
+    const uid = e.nodeUid ?? (await ctx.findIn(parentRel, name))?.uid ?? null;
     const node = uid ? await drive.getNode(uid) : null;
     if (!node || node.trashed) {
       dropRows(e.rel); // already gone — nothing to do
       return;
     }
-    if (node.parentUid !== parentUid || node.name !== name || (node.kind === 'folder') !== (e.kind === 'dir')) {
+    if (!parentFolders.includes(node.parentUid ?? '') || node.name !== name || (node.kind === 'folder') !== (e.kind === 'dir')) {
       out.kept.push({ rel: e.rel, reason: 'changed on Drive by someone else' });
       log(`  kept ${e.rel}: it was moved, renamed or replaced on Drive`);
       dropRows(e.rel); // no longer ours to manage
       return;
     }
-    if (e.kind === 'dir' && (await hasForeign(node.uid, e.rel))) {
+    const parts = e.kind === 'dir' ? ctx.partUids(e.rel) : [];
+    if (e.kind === 'dir' && (await hasForeign(e.rel, [node.uid, ...parts]))) {
       out.kept.push({ rel: e.rel, reason: 'contains files this backup did not upload' });
       log(`  kept folder ${e.rel}: it contains items this backup did not upload; trashing only ours`);
       // Only the items we uploaded go, one by one. The removed folder's own
@@ -505,6 +617,14 @@ async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: 
     out.wouldDeleteCount++;
     if (out.wouldDelete.length < 500) out.wouldDelete.push(e.rel);
     if (!ctx.write) return;
+    // A removed folder's continuation folders go with it, each identity-checked
+    // (still where it was created, still named "<name> · part N").
+    for (const [i, partUid] of parts.entries()) {
+      const pn = await drive.getNode(partUid);
+      if (pn && !pn.trashed && parentFolders.includes(pn.parentUid ?? '') && pn.name === partName(name, i + 2)) {
+        batch.push({ uid: partUid, rel: e.rel });
+      }
+    }
     batch.push({ uid: node.uid, rel: e.rel });
     if (batch.length >= 50) await flush();
   };
@@ -774,18 +894,20 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
       doneFiles++;
     };
 
+    let overflows = 0;
     for (let attempt = 1; ; attempt++) {
       try {
         const refused = ctx.blockedError(relDir);
         if (refused) throw refused;
-        const parentUid = await ctx.dirUid(relDir, true);
-        if (!parentUid) throw new DriveError('NOT_FOUND', 'parent folder missing');
+        const folders = await ctx.folders(relDir, true);
+        if (!folders.length) throw new DriveError('NOT_FOUND', 'parent folder missing');
+        const parentUid = folders[folders.length - 1]; // where new files go (the current part)
         let nodeUid = cat?.nodeUid ?? null;
-        if (verdict === 'changed' && !nodeUid) nodeUid = (await ctx.childMap(parentUid)).get(name)?.uid ?? null;
+        if (verdict === 'changed' && !nodeUid) nodeUid = (await ctx.findIn(relDir, name))?.uid ?? null;
 
         if (verdict === 'changed' && nodeUid) {
           const remote = await drive.getNode(nodeUid);
-          if (!remote || remote.trashed || remote.parentUid !== parentUid || remote.kind !== 'file') {
+          if (!remote || remote.trashed || !folders.includes(remote.parentUid ?? '') || remote.kind !== 'file') {
             nodeUid = null; // gone or no longer ours where it was: upload as a new file
           } else if (await sameContent(remote, f.abs, f.size, f.mtimeMs, true)) {
             record(f.rel, f.size, f.mtimeMs, remote.sha1, remote.uid);
@@ -799,13 +921,21 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
         } else {
           // One listing per folder (cached) instead of one failed upload per file:
           // decisive after a CLI-era first upload that died before it was recorded.
-          if (!ctx.wasCreated(parentUid)) {
-            const ex = (await ctx.childMap(parentUid)).get(name);
+          if (!folders.every((uid) => ctx.wasCreated(uid))) {
+            const ex = await ctx.findIn(relDir, name);
             if (ex && (await handleExisting(ex, parentUid))) return;
           }
           try {
             finish(await drive.uploadNew(parentUid, name, f, opts), parentUid);
           } catch (e) {
+            if (driveErrorCode(e) === 'FOLDER_FULL' && overflows++ < 64) {
+              // Proton's per-folder limit: continue in "<folder> · part N" (not a retry).
+              const next = await ctx.overflow(relDir, parentUid);
+              log(`  ${relDir}: Drive folder full — continuing in a continuation folder`);
+              void next;
+              attempt--;
+              continue;
+            }
             if (!(e instanceof Error) || driveErrorCode(e) !== 'NAME_CONFLICT') throw e;
             const c = e as DriveError;
             if (c.existingIsDraft) {
@@ -1203,7 +1333,9 @@ export async function verifySet(
   log('Scanning Drive…');
   while (stack.length && !cancelled()) {
     const { rel, uid } = stack.pop()!;
-    const remote = await ctx.childMap(uid, true);
+    // The folder and its continuation folders ("· part N") together hold `rel`.
+    const remote = new Map<string, RemoteNode>();
+    for (const u of [uid, ...ctx.partUids(rel)]) for (const [k, v] of await ctx.childMap(u, true)) if (!remote.has(k)) remote.set(k, v);
     const seen = new Set<string>();
     for (const row of catalog.children(spec.setId, rel)) {
       if (cancelled()) break;
@@ -1216,8 +1348,7 @@ export async function verifySet(
           stack.push({ rel: row.rel, uid: r.uid });
         } else {
           // Folder gone on Drive: everything below it must be uploaded again.
-          drop.push(row.rel);
-          for (const d of catalog.children(spec.setId, row.rel)) drop.push(d.rel);
+          catalog.removeTree(spec.setId, row.rel);
           repaired++;
         }
         continue;
@@ -1244,7 +1375,7 @@ export async function verifySet(
       }
       if (drop.length >= 1000) flushDrop();
     }
-    for (const name of remote.keys()) if (!seen.has(name)) foreign++;
+    for (const [name, n] of remote) if (!seen.has(name) && !(n.kind === 'folder' && ctx.partOwner(n.uid))) foreign++;
     if (cancelled()) break;
   }
   if (cancelled()) return empty('Cancelled');

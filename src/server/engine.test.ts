@@ -182,19 +182,102 @@ describe('one listing per existing Drive folder, even with parallel uploads into
   });
 });
 
-describe("Proton's per-folder item limit (200300)", () => {
-  it('is not retried; the rest of that folder is skipped at once, other folders continue', async () => {
-    for (let i = 0; i < 30; i++) write(`big/f${i}.bin`, `b${i}`);
-    for (let i = 0; i < 5; i++) write(`small/f${i}.bin`, `s${i}`);
+describe("Proton's per-folder item limit (200300): continuation folders", () => {
+  const names = (spec: RunSpec, rel: string) =>
+    [...drive.nodes.values()].filter((n) => n.parentUid === drive.at(remote(spec, rel))?.uid && !n.trashed).map((n) => n.name).sort();
+
+  it('puts what does not fit into "<folder> · part N" next to it; nothing is skipped; re-runs are no-ops', async () => {
+    for (let i = 0; i < 30; i++) write(`big/f${String(i).padStart(2, '0')}.bin`, `b${i}`);
+    for (let i = 0; i < 3; i++) write(`small/f${i}.bin`, `s${i}`);
     const spec = makeSet('mirror');
     drive.maxChildren = 10;
     const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.failedCount).toBe(0);
+    expect(r.newCount).toBe(33);
+    expect(names(spec, '')).toEqual(['big', 'big · part 2', 'big · part 3', 'small']);
+    expect(drive.at(remote(spec, 'big · part 3'))!.uid).toBeTruthy();
+    const total = ['big', 'big · part 2', 'big · part 3'].reduce((n, d) => n + names(spec, d).length, 0);
+    expect(total).toBe(30);
+
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.unchangedCount).toBe(33);
+    expect(drive.calls.uploadNew + drive.calls.createFolder + drive.calls.trash).toBe(0);
+
+    // A changed file that lives in part 3 becomes a revision of that node.
+    const inPart3 = names(spec, 'big · part 3')[0];
+    const node = drive.at(remote(spec, `big · part 3/${inPart3}`))!;
+    write(`big/${inPart3}`, 'changed!', Date.now() + 5000);
+    const r3 = await runSet(drive, spec);
+    expect(r3.changedCount).toBe(1);
+    expect(node.revisions).toHaveLength(2);
+  });
+
+  it('a subfolder of a full folder is created in the current part', async () => {
+    for (let i = 0; i < 10; i++) write(`big/f${i}.bin`, `b${i}`);
+    write('big/sub/inner.txt', 'i');
+    const spec = makeSet('backup');
+    drive.maxChildren = 10;
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    const where = ['big', 'big · part 2'].find((d) => names(spec, d).includes('sub'));
+    expect(where).toBeDefined();
+    expect(drive.at(remote(spec, `${where}/sub/inner.txt`))).toBeDefined();
+  });
+
+  it('mirror trashes files inside parts and a removed folder together with its parts; parts are never "foreign"', async () => {
+    setMirrorSafetyConfig({ enabled: false, deleteSafetyPct: 0.3 });
+    for (let i = 0; i < 25; i++) write(`big/f${String(i).padStart(2, '0')}.bin`, `b${i}`);
+    write('keep.txt', 'k');
+    const spec = makeSet('mirror');
+    drive.maxChildren = 10;
+    await runSet(drive, spec);
+    const inPart2 = names(spec, 'big · part 2')[0];
+    fs.rmSync(path.join(src, 'big', inPart2));
+    const preview = await previewSet(drive, spec);
+    const r = await runSet(drive, spec);
+    expect(r.deletedCount).toBe(1);
+    expect(preview.wouldDeleteCount).toBe(1);
+    expect(drive.at(remote(spec, `big · part 2/${inPart2}`))).toBeUndefined();
+
+    fs.rmSync(path.join(src, 'big'), { recursive: true });
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(names(spec, '')).toEqual(['keep.txt']);
+  });
+
+  it('rediscovers parts by name when the index is lost — no duplicate parts', async () => {
+    for (let i = 0; i < 25; i++) write(`big/f${String(i).padStart(2, '0')}.bin`, `b${i}`);
+    const spec = makeSet('backup');
+    drive.maxChildren = 10;
+    await runSet(drive, spec);
+    getDb().exec('DELETE FROM drive_parts');
+    for (let i = 0; i < 8; i++) write(`big/new${i}.bin`, `n${i}`);
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    // part 3 had 5 free slots, the other 3 went to a new part 4; parts 2/3 were reused.
+    expect(names(spec, '').filter((n) => n.startsWith('big'))).toEqual(['big', 'big · part 2', 'big · part 3', 'big · part 4']);
+  });
+
+  it('verify sees files in parts and does not count parts as foreign', async () => {
+    for (let i = 0; i < 15; i++) write(`big/f${i}.bin`, `b${i}`);
+    const spec = makeSet('backup');
+    drive.maxChildren = 10;
+    await runSet(drive, spec);
+    const v = await verifySet(drive, spec);
+    expect(v.repaired).toBe(0);
+    expect(v.foreign).toBe(0);
+    expect(v.checked).toBe(15);
+  });
+
+  it('nesting too deep stays a clear, permanent skip', async () => {
+    write('a/b.txt', 'x');
+    const spec = makeSet('backup');
+    drive.faults.push({ op: 'createFolder', code: 'TOO_DEEP', times: 99, match: (nm) => nm === 'a' });
+    const r = await runSet(drive, spec);
     expect(r.ok).toBe(false);
-    expect(r.failedCount).toBe(20);
-    expect(r.failedFiles[0].reason).toMatch(/limit of items per folder/);
-    expect(drive.calls.uploadNew).toBe(10 + 1 + 5); // 10 fit, ONE refused attempt, then nothing more there
-    expect(drive.at(remote(spec, 'small/f4.bin'))).toBeDefined();
-    expect(r.deletionSkipped ?? '').not.toMatch(/never/); // failures block deletion (gate), as always
+    expect(r.failedFiles[0].reason).toMatch(/nested deeper/);
   });
 });
 

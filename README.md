@@ -188,6 +188,15 @@ backup uploaded, in the same place and under the same name. A folder that contai
 anything this backup did not upload is kept; only our files inside it are trashed.
 **Preview** (dry run) uses the same scan and the same rules.
 
+**Folders with more items than Proton allows.** Proton Drive accepts about 30,000
+items per folder (API error 200300, "folder limit reached"). When a backed-up
+folder reaches that limit, the rest of its files go into a folder next to it,
+`<name> · part 2` (then `· part 3`, …). Nothing is skipped, existing folders are
+never reorganised, and runs, revisions, Mirror and Verify treat a folder and its
+parts as one. Restoring through Proton Drive's web app: copy the contents of the
+parts back into one folder. The mapping is stored in the database; if it is lost,
+the parts are found again by their names.
+
 **The set's Drive folder** is identified by its node, not its name: renamed on
 Drive → followed; moved, deleted, or replaced by a new folder with the same name →
 the run stops without writing and tells you. **Verify** re-checks the set (and, if

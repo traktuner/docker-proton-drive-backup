@@ -81,11 +81,13 @@ let _db: DatabaseSync | null = null;
  *
  *  0  every CLI-era release (tables created ad hoc, columns added in place)
  *  1  SDK release: Drive node ids in the catalog, per-set Drive bindings and the
- *     app_meta key/value table. Purely ADDITIVE, so a CLI-era image can still open
+ *     app_meta key/value table.
+ *  2  drive_parts: continuation folders ("<name> · part N") for local folders
+ *     with more items than Proton allows in one Drive folder. Purely ADDITIVE, so a CLI-era image can still open
  *     the same file after a rollback (it ignores columns and tables it does not
  *     know, and every one of its statements names its columns explicitly).
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Path of the one-time pre-migration snapshot next to the DB. */
 export function preMigrationBackupPath(): string {
@@ -219,6 +221,15 @@ function migrate(db: DatabaseSync) {
     // Direct children of a folder (per-folder diff for mirror, verify). An index on
     // an expression of built-in functions: CLI-era releases maintain it unknowingly.
     db.exec(`CREATE INDEX IF NOT EXISTS idx_catalog_parent ON backup_catalog (set_id, rtrim(rel, replace(rel, '/', '')))`);
+    // v2: continuation folders. rel = the LOCAL folder (catalog dir rel), part >= 2.
+    db.exec(`CREATE TABLE IF NOT EXISTS drive_parts (
+      set_id   TEXT    NOT NULL,
+      rel      TEXT    NOT NULL,
+      part     INTEGER NOT NULL,
+      node_uid TEXT    NOT NULL,
+      PRIMARY KEY (set_id, rel, part)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_parts_uid ON drive_parts (set_id, node_uid)');
     // Remember that this DB came from a CLI-era release (decides session takeover).
     if (v === 0 && hasData) db.prepare('INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)').run('upgrade.fromCli', String(Date.now()));
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -508,6 +519,10 @@ export const backupSets = {
          WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
       ).run(newSub, oldSub.length + 1, id, oldSub, likePattern);
       db.prepare('UPDATE backup_sets SET target_subfolder = ? WHERE id = ?').run(newSub, id);
+      db.prepare(
+        `UPDATE drive_parts SET rel = ? || substr(rel, ?)
+         WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
+      ).run(newSub, oldSub.length + 1, id, oldSub, likePattern);
     });
   },
 
@@ -529,6 +544,7 @@ export const backupSets = {
   resetAllBindings(): void {
     tx(() => {
       getDb().exec('DELETE FROM backup_catalog');
+      getDb().exec('DELETE FROM drive_parts');
       getDb().exec('UPDATE backup_sets SET folder_uid = NULL, source_marks = NULL');
     });
   },

@@ -62,6 +62,11 @@ const SQL = {
     "SELECT rel, kind, size, mtime_ms, sha1, node_uid FROM backup_catalog WHERE set_id = ? AND rtrim(rel, replace(rel, '/', '')) = ?",
   childNames: "SELECT rel, kind, node_uid FROM backup_catalog WHERE set_id = ? AND rtrim(rel, replace(rel, '/', '')) = ?",
   removeTree: 'DELETE FROM backup_catalog WHERE set_id = ? AND (rel = ? OR (rel > ? AND rel < ?))',
+  removePartsTree: 'DELETE FROM drive_parts WHERE set_id = ? AND (rel = ? OR (rel > ? AND rel < ?))',
+  parts: 'SELECT part, node_uid FROM drive_parts WHERE set_id = ? AND rel = ? ORDER BY part',
+  addPart: 'INSERT OR REPLACE INTO drive_parts (set_id, rel, part, node_uid) VALUES (?, ?, ?, ?)',
+  partOwner: 'SELECT rel, part FROM drive_parts WHERE set_id = ? AND node_uid = ?',
+  clearParts: 'DELETE FROM drive_parts WHERE set_id = ?',
   anyBelow: 'SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ? LIMIT 1',
 } as const;
 
@@ -144,6 +149,7 @@ export const catalog = {
   clear(setId: string): void {
     ensure();
     stmt(SQL.clear).run(setId);
+    stmt(SQL.clearParts).run(setId);
   },
 
   count(setId: string): number {
@@ -236,6 +242,27 @@ export const catalog = {
   removeTree(setId: string, rel: string): void {
     ensure();
     stmt(SQL.removeTree).run(setId, rel, rel + '/', rel + '0');
+    stmt(SQL.removePartsTree).run(setId, rel, rel + '/', rel + '0');
+  },
+
+  /**
+   * Continuation folders of local folder `rel` (part >= 2), in order. Used when a
+   * local folder holds more items than Proton allows in one Drive folder.
+   */
+  parts(setId: string, rel: string): { part: number; nodeUid: string }[] {
+    ensure();
+    return (stmt(SQL.parts).all(setId, rel) as { part: number; node_uid: string }[]).map((r) => ({ part: r.part, nodeUid: r.node_uid }));
+  },
+
+  addPart(setId: string, rel: string, part: number, nodeUid: string): void {
+    ensure();
+    stmt(SQL.addPart).run(setId, rel, part, nodeUid);
+  },
+
+  /** Which local folder a Drive node is a continuation folder of, if any. */
+  partOwner(setId: string, nodeUid: string): { rel: string; part: number } | null {
+    ensure();
+    return (stmt(SQL.partOwner).get(setId, nodeUid) as { rel: string; part: number } | undefined) ?? null;
   },
 
   /** Whether anything is recorded strictly below `dirRel/`. */

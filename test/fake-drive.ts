@@ -147,6 +147,7 @@ export class FakeDrive implements DriveService {
       if (ex.kind === 'folder') return this.view(ex);
       throw new DriveError('NAME_CONFLICT', 'exists', { existingUid: ex.uid });
     }
+    this.full(parentUid);
     return this.view(this.add(parentUid, name, 'folder'));
   }
 

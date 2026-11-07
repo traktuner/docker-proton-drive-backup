@@ -459,10 +459,11 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   // Bounded: memory does not grow with the number of Drive items a run touches.
   // Sized from a production run: listing a huge folder decrypts every node (and its
   // key); the app keeps what it needs itself, so the SDK caches only need the
-  // working set (folders, recent nodes). Keys are the heavy entries.
+  // working set (folders, recent nodes). Keys are the heavy entries (OpenPGP key
+  // objects, measured in production): listing only needs the parent folder's key.
   const envInt = (k: string) => (Number(process.env[k]) > 0 ? Number(process.env[k]) : undefined);
   const entitiesCache = new LruCache<string>(opts.entityCacheSize ?? envInt('PDB_ENTITY_CACHE') ?? 5_000);
-  const cryptoCache = new LruCache<unknown>(opts.cryptoCacheSize ?? envInt('PDB_CRYPTO_CACHE') ?? 1_000);
+  const cryptoCache = new LruCache<unknown>(opts.cryptoCacheSize ?? envInt('PDB_CRYPTO_CACHE') ?? 200);
   const sdk = new ProtonDriveClient({
     httpClient: httpClient as never,
     entitiesCache: entitiesCache as never,

@@ -130,9 +130,9 @@ echo "  sets=$(echo "$SETS_BEFORE" | wc -l) catalog=[$CAT_BEFORE] runs=$RUNS_BEF
 log "B. Upgrade: same compose file, same /data, only the image changes"
 M0=$(mark)
 use_image "$NEW_IMAGE"
-check "migration ran once" bash -c "docker logs pdbupgrade 2>&1 | grep -c 'schema migrated 0 -> 1' | grep -qx 1"
+check "migration ran once" bash -c "docker logs pdbupgrade 2>&1 | grep -c 'schema migrated 0 -> 2' | grep -qx 1"
 check "pre-migration snapshot is a consistent, unmigrated DB" bash -c "[ \"\$(sqlite3 -readonly '$W/data/backup.db.pre-sdk.bak' 'PRAGMA integrity_check; PRAGMA user_version;' | tr '\n' ' ')\" = 'ok 0 ' ]"
-check "schema version is 1" eq "$(db 'PRAGMA user_version')" 1
+check "schema version is 2" eq "$(db 'PRAGMA user_version')" 2
 check "all sets, schedules and excludes unchanged" eq "$(db "SELECT id||'|'||name||'|'||mode||'|'||schedule||'|'||schedule_hour||'|'||schedule_minute||'|'||schedule_dow||'|'||COALESCE(excludes,'') FROM backup_sets ORDER BY id")" "$SETS_BEFORE"
 check "catalog rows unchanged" eq "$(db "SELECT set_id||':'||COUNT(*) FROM backup_catalog GROUP BY set_id ORDER BY set_id")" "$CAT_BEFORE"
 check "run history kept" bash -c "[ $(db 'SELECT COUNT(*) FROM backup_runs') -ge $RUNS_BEFORE ]"
@@ -194,7 +194,7 @@ for delay in 1.0 2.0; do
   echo "  killed after ${delay}s: user_version=$(db 'PRAGMA user_version') snapshot=$(ls "$W/data" | grep -c 'pre-sdk.bak$' || true) tmp=$(ls "$W/data" | grep -c 'pre-sdk.bak.tmp' || true)"
 done
 dc up -d >/dev/null 2>&1; wait_up
-check "after two kills and a restart the DB is migrated" eq "$(db 'PRAGMA user_version')" 1
+check "after two kills and a restart the DB is migrated" eq "$(db 'PRAGMA user_version')" 2
 check "integrity_check ok" eq "$(db 'PRAGMA integrity_check')" ok
 check "no catalog row lost" eq "$(db 'SELECT COUNT(*) FROM backup_catalog')" "$ROWS"
 check "snapshot complete (no half-written temp file left)" bash -c "[ -s '$W/data/backup.db.pre-sdk.bak' ] && ! ls '$W/data' | grep -q 'pre-sdk.bak.tmp' && [ \"\$(sqlite3 -readonly '$W/data/backup.db.pre-sdk.bak' 'PRAGMA integrity_check')\" = ok ]"

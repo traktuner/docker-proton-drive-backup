@@ -261,7 +261,7 @@ describe('an existing Drive folder is listed once, ever', () => {
 describe('many empty folders (a photo library\'s internals) do not stall the scan', () => {
   it('creates them in parallel, each exactly once, reports progress, and an unchanged re-run creates none', async () => {
     for (let i = 0; i < 60; i++) fs.mkdirSync(path.join(src, `lib/private/c${i % 6}/e${i}`), { recursive: true });
-    write('z-after.txt', 'scanned after the empty folders');
+    write('zz/after.txt', 'scanned after the empty folders');
     const spec = makeSet('mirror');
     let active = 0;
     let peak = 0;
@@ -279,11 +279,20 @@ describe('many empty folders (a photo library\'s internals) do not stall the sca
         active--;
       }
     };
+    let foldersAtUpload = -1;
+    const origUp = drive.uploadNew.bind(drive);
+    drive.uploadNew = (async (...a: Parameters<FakeDrive['uploadNew']>) => {
+      foldersAtUpload = made.size;
+      return origUp(...a);
+    }) as FakeDrive['uploadNew'];
     const seen: string[] = [];
     const r = await runSet(drive, spec, { onProgress: (p) => seen.push(p.current) });
     expect(r.ok).toBe(true);
     expect(r.newCount).toBe(1);
     expect(peak).toBeGreaterThan(1); // not one request after the other
+    // The scan went on to the file while the folders were still being created.
+    expect(foldersAtUpload).toBeGreaterThanOrEqual(0);
+    expect(foldersAtUpload).toBeLessThan(30);
     expect([...made.values()].every((c) => c === 1)).toBe(true); // shared parents created once
     for (let i = 0; i < 60; i++) expect(drive.at(remote(spec, `lib/private/c${i % 6}/e${i}`))?.kind).toBe('folder');
     expect(seen.some((c) => /\d+ empty folders created/.test(c))).toBe(true);

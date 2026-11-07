@@ -1170,22 +1170,33 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
   // 4. Walk + diff. Mirror finds local removals per folder (no per-file writes).
   const removed = spec.mode === 'mirror' ? new RemovedCollector(spec.setId) : null;
   const pendingDirs: string[] = [];
-  // Empty folders go through the same parallel pool as uploads: thousands of them
-  // (a photo library's internals) no longer stall the scan one request at a time.
-  const drainDirs = async () => {
+  // Empty folders are created in their own background lane while the scan and the
+  // uploads go on: thousands of them (a photo library's internals) take a while at
+  // ~0.5 s per request, and nothing else depends on them. The scan only waits when
+  // the backlog gets very large (memory bound).
+  const DIR_LANE = 4;
+  const DIR_BACKLOG_CAP = 20_000;
+  const dirLane = new Set<Promise<void>>();
+  const dirWorker = async () => {
     while (pendingDirs.length && !sessionDead && !shouldCancel()) {
       const rel = pendingDirs.shift()!;
-      await schedule(async () => {
-        try {
-          await ctx.dirUid(rel, true);
-          emptyDirsMade++;
-          report('creating empty folders');
-        } catch (e) {
-          if (driveErrorCode(e) === 'UNAUTHENTICATED') sessionDead = true;
-          else noteFailed(rel, describeUploadError(e));
-        }
-      });
+      try {
+        await ctx.dirUid(rel, true);
+        emptyDirsMade++;
+        report('');
+      } catch (e) {
+        if (driveErrorCode(e) === 'UNAUTHENTICATED') sessionDead = true;
+        else noteFailed(rel, describeUploadError(e));
+      }
     }
+  };
+  const drainDirs = async (all = false) => {
+    while (dirLane.size < DIR_LANE && pendingDirs.length) {
+      const w: Promise<void> = dirWorker().finally(() => dirLane.delete(w));
+      dirLane.add(w);
+    }
+    while (pendingDirs.length > (all ? 0 : DIR_BACKLOG_CAP) && dirLane.size) await Promise.race(dirLane);
+    if (all) await Promise.all(dirLane);
   };
 
   log('Comparing against catalog…');
@@ -1213,8 +1224,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
       if (sessionDead) break outer;
       scanned++;
       report('scanning');
-      // Folders first (keeps empty folders mirrored).
-      await drainDirs();
+      if (pendingDirs.length) await drainDirs(); // starts the lane; waits only over the cap
       removed?.seen(file.rel);
       if (ctx.isExcluded(file.rel)) continue; // excluded = left alone (and kept on Drive)
       const cat = catalog.getFile(spec.setId, file.rel);
@@ -1277,7 +1287,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
     }
     if (cancelled || sessionDead) break;
     removed?.finish();
-    await drainDirs();
+    await drainDirs(true);
   }
   await Promise.all(inflight);
   if (shouldCancel()) cancelled = true;

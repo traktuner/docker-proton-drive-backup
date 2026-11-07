@@ -15,6 +15,7 @@ import type { ProtonRuntime } from '@/server/proton/types';
 const ROOT = path.resolve(__dirname, '..');
 const UPSTREAM = JSON.parse(fs.readFileSync(path.join(ROOT, 'src/server/proton/vendor/UPSTREAM.json'), 'utf8'));
 let createRuntime: (o: unknown) => Promise<ProtonRuntime>;
+let mapError: (e: unknown) => { code: string };
 let LruCache: new <T>(max: number) => {
   setEntity(k: string, v: T, tags?: string[]): Promise<void>;
   getEntity(k: string): Promise<T>;
@@ -25,7 +26,7 @@ let LruCache: new <T>(max: number) => {
 
 beforeAll(async () => {
   execFileSync(process.execPath, [path.join(ROOT, 'scripts/build-proton.mjs')], { cwd: ROOT, stdio: 'pipe' });
-  ({ createRuntime, LruCache } = await import(pathToFileURL(path.join(ROOT, 'dist-proton/runtime.mjs')).href));
+  ({ createRuntime, LruCache, mapError } = await import(pathToFileURL(path.join(ROOT, 'dist-proton/runtime.mjs')).href));
 }, 120_000);
 
 describe('SDK runtime bundle', () => {
@@ -83,5 +84,17 @@ describe('LruCache (replaces the SDK MemoryCache: bounded, O(1))', () => {
     for (let i = 0; i < 200_000; i++) await c.setEntity(`node-${i}`, 'v', [`parent-${i % 100}`]);
     expect(c.size).toBeLessThanOrEqual(20_000);
     expect(performance.now() - t0).toBeLessThan(3000);
+  });
+});
+
+describe('Proton API error codes → permanent DriveError codes', () => {
+  it('classifies the folder item limit, nesting, size and quota codes (never "transient")', () => {
+    const v = (code: number, message = 'x') => ({ name: 'ValidationError', code, message });
+    expect(mapError(v(200300, 'Ordnerlimit erreicht.')).code).toBe('FOLDER_FULL');
+    expect(mapError(v(200301)).code).toBe('TOO_DEEP');
+    expect(mapError(v(200003)).code).toBe('FILE_TOO_LARGE');
+    expect(mapError(v(200001)).code).toBe('QUOTA');
+    expect(mapError({ name: 'Error', message: 'wrapped', cause: { code: 200300 } }).code).toBe('FOLDER_FULL');
+    expect(mapError({ name: 'NotFoundAPIError', code: 2501, message: 'gone' }).code).toBe('NOT_FOUND');
   });
 });

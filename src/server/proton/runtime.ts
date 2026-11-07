@@ -144,12 +144,15 @@ class Credentials implements SessionCredentials {
 /* Error mapping                                                             */
 /* ------------------------------------------------------------------------ */
 
-function mapError(e: unknown, fallback: DriveErrorCode = 'UNKNOWN'): DriveError {
+export function mapError(e: unknown, fallback: DriveErrorCode = 'UNKNOWN'): DriveError {
   if ((e as { name?: string })?.name === 'DriveError') return e as DriveError;
   const err = e as { name?: string; message?: string; code?: number; statusCode?: number; existingNodeUid?: string; isUnfinishedUpload?: boolean };
   const msg = String(err?.message ?? e).slice(0, 300);
   const name = err?.name ?? '';
   // Proton API codes (internal/apiService/errorCodes.ts): permanent, never retried.
+  // Also look one level into `cause`, in case an SDK layer wrapped the API error.
+  const apiCode = typeof err?.code === 'number' ? err.code : (err as { cause?: { code?: unknown } })?.cause?.code;
+  if (apiCode === 200300 || apiCode === 200301 || apiCode === 200003) err.code = apiCode as number;
   if (err?.code === 200300) return new DriveError('FOLDER_FULL', msg, { cause: e });
   if (err?.code === 200301) return new DriveError('TOO_DEEP', msg, { cause: e });
   if (err?.code === 200003) return new DriveError('FILE_TOO_LARGE', msg, { cause: e });

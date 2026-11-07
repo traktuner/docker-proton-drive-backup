@@ -18,7 +18,7 @@
 # current tokens (refresh tokens are single-use). Settings: 3 parallel uploads,
 # thumbnails off (the data has no images), 2 CPUs / 2 GiB, no network shaping.
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 . "$ROOT/test/bench/lib.sh"
 LABEL=$1 IMAGE=$2 KIND=$3
 DATASET=${DATASET:-/tmp/pdb-bench-data}

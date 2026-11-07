@@ -8,7 +8,7 @@
 #                                          signed-in idle), PHASE_S (default 180)
 # Prints: label | tabs | cpu_s per phase | mem_avg_mib | mem_max_mib | anon_avg_mib
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 . "$ROOT/test/bench/lib.sh"
 IMAGE=$1
 LABEL=${2:-$1}

@@ -9,7 +9,7 @@
 #
 #   test/bench/catalog-scale.sh [N]   (env: OLD_IMAGE NEW_IMAGE CPUS MEM WORK)
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 . "$ROOT/test/bench/lib.sh"
 N=${1:-1000000}
 OLD_IMAGE=${OLD_IMAGE:-ghcr.io/traktuner/docker-proton-drive-backup:0.9.0-21}

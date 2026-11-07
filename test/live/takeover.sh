@@ -11,7 +11,7 @@
 # Results are printed; a rejected session is reported (then the user signs in
 # once in the new UI — the jobs are untouched either way).
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 OLD_IMAGE=${OLD_IMAGE:-ghcr.io/traktuner/docker-proton-drive-backup:0.9.0-21}
 NEW_IMAGE=${NEW_IMAGE:-pdb:sdk}
 PORT=${PORT:-13110}

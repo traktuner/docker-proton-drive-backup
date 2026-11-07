@@ -15,7 +15,7 @@
 #   7. move the test folder to the Drive trash (unless KEEP=1).
 # Nothing outside the test folder is touched.
 set -euo pipefail
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 IMAGE=${IMAGE:-pdb:sdk}
 PORT=${PORT:-13100}
 W=${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/pdb-live-XXXXXX")}

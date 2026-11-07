@@ -426,8 +426,11 @@ Dockerfile · docker-compose.yml · docker-entrypoint.sh
 
 ## Notable changes
 
-Newest first. Image tags are `<appVersion>-<revision>` (0.x tags followed the
-bundled CLI version); these are app-level highlights, not per-tag notes.
+Newest first; full notes per version are on the
+[Releases page](https://github.com/traktuner/docker-proton-drive-backup/releases).
+Image tags: `1.2.3` (exact), `1.2` (patch updates), `1` (all 1.x), `latest`
+(newest release); `main` and `<sha>` are untested builds of the main branch.
+0.x tags were `<cliVersion>-<revision>`.
 
 - **1.0: Proton Drive SDK instead of the CLI** - one process instead of one CLI
   process per operation; every changed file is read once (the CLI read it twice,

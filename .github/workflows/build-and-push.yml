@@ -6,12 +6,7 @@ on:
     tags: ['v*.*.*']
   pull_request:
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g., v0.1.0)'
-        required: false
-        type: string
+  workflow_dispatch: # preview build of any branch: tags <branch> and <sha>
 
 env:
   REGISTRY: ghcr.io
@@ -21,12 +16,55 @@ permissions:
   contents: read
   packages: write
 
+# Tag scheme (docs/RELEASING.md):
+#   git tag vX.Y.Z  -> images X.Y.Z, X.Y, X, latest (+ X.Y.Z-1 so 0.x update checks
+#                      notice it) and a GitHub Release from docs/releases/vX.Y.Z.md
+#   vX.Y.Z-rc.N     -> image X.Y.Z-rc.N only, GitHub pre-release
+#   push to main    -> main, <sha>          (never latest)
+#   manual dispatch -> <branch>, <sha>      (previews)
 jobs:
+  # A release tag must match package.json and come with its release notes —
+  # checked before anything is built or pushed.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.k.outputs.kind }}
+      image_tag: ${{ steps.k.outputs.image_tag }}
+      version: ${{ steps.k.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Classify the build and compute the image tag
+        id: k
+        run: |
+          V=$(node -p "require('./package.json').version")
+          SHA=$(git rev-parse --short=7 HEAD)
+          REF="${GITHUB_REF}"
+          if [[ "$REF" == refs/tags/v* ]]; then
+            TAG="${REF#refs/tags/}"
+            if [ "${TAG#v}" != "$V" ]; then
+              echo "::error::tag $TAG does not match package.json version $V"; exit 1
+            fi
+            if [ ! -s "docs/releases/$TAG.md" ]; then
+              echo "::error::docs/releases/$TAG.md (release notes) is missing"; exit 1
+            fi
+            if [[ "$TAG" == *-* ]]; then KIND=prerelease; else KIND=release; fi
+            IMAGE_TAG="$V"
+          elif [ "$REF" = "refs/heads/main" ]; then
+            KIND=edge; IMAGE_TAG="$V-edge.$SHA"
+          else
+            KIND=preview; IMAGE_TAG="$V-preview.$SHA"
+          fi
+          echo "kind=$KIND" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "$KIND build, image tag $IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
+
   # Build each arch on its OWN native runner (amd64 on ubuntu-latest, arm64 on the
   # free public-repo ubuntu-24.04-arm runner) and push it BY DIGEST (no tag). No
   # QEMU emulation, so the Next.js build runs at full speed on both. The `merge`
   # job below stitches the two digests into one multi-arch manifest under the tags.
   build:
+    needs: guard
     strategy:
       fail-fast: false
       matrix:
@@ -37,8 +75,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0 # full history for the revision count (IMAGE_TAG build-arg)
 
       - name: Prepare platform pair
         run: |
@@ -55,17 +91,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Compute version-revision tag
+      - name: SDK pin
         id: cliv
         run: |
-          # App release from package.json; Debian-style revision = commits since it
-          # was set. "<appVersion>-<revision>" keeps the tag shape the update check
-          # of already-installed containers parses (1.0.0-1 > 0.9.0-21).
-          V=$(node -p "require('./package.json').version")
-          BUMP=$(git log -1 --format=%H -S"\"version\": \"$V\"" -- package.json || true)
-          if [ -n "$BUMP" ]; then REV=$(( $(git rev-list --count "$BUMP"..HEAD) + 1 )); else REV=1; fi
-          echo "tag=$V-$REV" >> "$GITHUB_OUTPUT"
-          echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "sdk=$(node -p "require('./src/server/proton/vendor/UPSTREAM.json').sdkVersion")" >> "$GITHUB_OUTPUT"
           echo "sdkcommit=$(node -p "require('./src/server/proton/vendor/UPSTREAM.json').commit")" >> "$GITHUB_OUTPUT"
 
@@ -80,8 +108,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: |
             APP_VERSION=${{ github.sha }}
-            IMAGE_TAG=${{ steps.cliv.outputs.tag }}
-            APP_RELEASE=${{ steps.cliv.outputs.version }}
+            IMAGE_TAG=${{ needs.guard.outputs.image_tag }}
+            APP_RELEASE=${{ needs.guard.outputs.version }}
             SDK_VERSION=${{ steps.cliv.outputs.sdk }}
             SDK_COMMIT=${{ steps.cliv.outputs.sdkcommit }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
@@ -108,14 +136,9 @@ jobs:
   # real tags here (the only place tags are set). Skipped on PRs (nothing pushed).
   merge:
     runs-on: ubuntu-latest
-    needs: build
+    needs: [guard, build]
     if: github.event_name != 'pull_request'
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0 # for the revision-count raw tag below
-
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
@@ -133,28 +156,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Compute version-revision tag
-        id: cliv
-        run: |
-          V=$(node -p "require('./package.json').version")
-          BUMP=$(git log -1 --format=%H -S"\"version\": \"$V\"" -- package.json || true)
-          if [ -n "$BUMP" ]; then REV=$(( $(git rev-list --count "$BUMP"..HEAD) + 1 )); else REV=1; fi
-          echo "tag=$V-$REV" >> "$GITHUB_OUTPUT"
-
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=ref,event=branch
+            # releases and release candidates (git tag vX.Y.Z / vX.Y.Z-rc.N)
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ needs.guard.outputs.kind == 'release' }}
+            type=semver,pattern={{major}},enable=${{ needs.guard.outputs.kind == 'release' && !startsWith(github.ref_name, 'v0.') }}
+            type=raw,value=latest,enable=${{ needs.guard.outputs.kind == 'release' }}
+            # 0.x containers only understand "<version>-<revision>" in their update check
+            type=raw,value=${{ needs.guard.outputs.version }}-1,enable=${{ needs.guard.outputs.kind == 'release' }}
+            # main ("main") and previews ("<branch>"), plus "<sha>" for every pushed build
+            type=ref,event=branch
             type=sha,prefix=
-            # <appVersion>-<revision> image tag so Renovate sees new releases even
-            # on default-branch builds (git-tag pushes from CI don't trigger).
-            type=raw,value=${{ steps.cliv.outputs.tag }},enable={{is_default_branch}}
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
@@ -164,4 +182,27 @@ jobs:
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
       - name: Inspect image
-        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest || true
+        run: docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$(jq -r '.tags[0] | split(":")[1]' <<< "$DOCKER_METADATA_OUTPUT_JSON") || true
+
+  # The GitHub Release (user-facing notes), only after the image is published.
+  release:
+    runs-on: ubuntu-latest
+    needs: [guard, merge]
+    if: needs.guard.outputs.kind == 'release' || needs.guard.outputs.kind == 'prerelease'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          KIND: ${{ needs.guard.outputs.kind }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "docs/releases/$TAG.md"
+          elif [ "$KIND" = prerelease ]; then
+            gh release create "$TAG" --verify-tag --prerelease --title "$TAG" --notes-file "docs/releases/$TAG.md"
+          else
+            gh release create "$TAG" --verify-tag --latest --title "$TAG" --notes-file "docs/releases/$TAG.md"
+          fi

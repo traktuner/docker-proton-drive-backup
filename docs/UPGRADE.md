@@ -17,9 +17,11 @@ backup sets stay exactly as they are.
    docker compose pull && docker compose up -d
    ```
 
-   If you pin a version tag, change it to `1.0.0-<n>` first. Tags keep the
-   `<version>-<revision>` shape, so Renovate and the in-app update check see the
-   new release.
+   If you pin a version tag, change it first: `:1` follows all 1.x releases,
+   `:1.0` only 1.0.x fixes, `:1.0.0` exactly this release. Containers on `:latest`
+   get it with the pull. (From 1.0 on, tags are plain versions; the 0.x shape
+   `<version>-<revision>` is published once more as `1.0.0-1`, only so that 0.x
+   containers show the update.)
 3. Open the web UI. Expected result:
    - all backup sets, schedules, excludes and the run history are there;
    - you are still signed in — the session in `/data/proton/auth-session.json`

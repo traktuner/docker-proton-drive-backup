@@ -36,7 +36,7 @@ interface MirrorSafetyCfg {
 }
 interface Updates {
   sdk: { current: string; notices: { kind: string; message: string }[] };
-  container: { current: string; latest: string | null; updateAvailable: boolean };
+  container: { current: string; latest: string | null; updateAvailable: boolean; releaseUrl?: string | null };
 }
 
 const fmt = (n: number) => formatBytes(n, 'precise');
@@ -303,7 +303,17 @@ export default function Settings() {
                 {!updates ? (
                   <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
                 ) : updates.container.updateAvailable ? (
-                  <span className="text-amber-300">update available - {updates.container.latest}</span>
+                  <span className="text-amber-300">
+                    update available - {updates.container.latest}
+                    {updates.container.releaseUrl && (
+                      <>
+                        {' · '}
+                        <a href={updates.container.releaseUrl} target="_blank" rel="noreferrer" className="underline">
+                          what&apos;s new
+                        </a>
+                      </>
+                    )}
+                  </span>
                 ) : updates.container.latest ? (
                   <span className="text-emerald-300">{updates.container.current} · up to date</span>
                 ) : (

@@ -211,7 +211,6 @@ const TRANSIENT = new Set(['NETWORK', 'RATE_LIMITED', 'SERVER', 'INTEGRITY', 'UN
 /* ------------------------------------------------------------------ */
 
 class RunContext {
-  readonly prefix: string;
   readonly isExcluded: (rel: string) => boolean;
   /** rel dir → node uid, for this run (bounded; the catalog persists them). */
   private dirUids = new Map<string, string>();
@@ -226,10 +225,17 @@ class RunContext {
     readonly seenAt: number,
     readonly write: boolean,
   ) {
-    this.prefix = `${spec.subfolder}/`;
     const ex = makeExcluder(spec.excludes ?? []);
-    // Exclude globs are authored relative to LOCAL_ROOT (no subfolder prefix).
-    this.isExcluded = (rel) => ex(rel.startsWith(this.prefix) ? rel.slice(this.prefix.length) : rel);
+    // Exclude globs are authored relative to LOCAL_ROOT (no subfolder prefix). The
+    // prefix is read live: a run may follow a rename of the set folder.
+    this.isExcluded = (rel) => {
+      const prefix = this.prefix;
+      return ex(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
+    };
+  }
+
+  get prefix(): string {
+    return `${this.spec.subfolder}/`;
   }
 
   async childMap(folderUid: string, fresh = false): Promise<Map<string, RemoteNode>> {
@@ -832,7 +838,8 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
             sessionDead = true;
             break outer;
           }
-          throw e;
+          // Listing failed (network…): fall through — the upload's own name-conflict
+          // handling still decides "exists" correctly, file by file.
         }
       }
       if (verdict === 'unchanged') {

@@ -332,6 +332,22 @@ describe('target folder identity', () => {
     expect(drive.calls.uploadNew + drive.calls.uploadRevision).toBe(0);
   });
 
+  it('after following a rename, excludes still apply in the same run', async () => {
+    write('keep.txt', 'k');
+    // A PATH pattern (relative to the sources root): basename patterns would hide the bug.
+    const spec = makeSet('backup', { excludes: [`src${n}/cache/**`] });
+    await runSet(drive, spec);
+    drive.at(spec.subfolder)!.name = 'Moved';
+    write('cache/junk.tmp', 'j');
+    write('new.txt', 'n');
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.newCount).toBe(1);
+    const base = remote({ ...spec, subfolder: 'Moved' }, '').replace(/\/$/, '');
+    expect(drive.at(base + '/cache/junk.tmp')).toBeUndefined();
+    expect(drive.at(base + '/new.txt')).toBeDefined();
+  });
+
   it('a missing target folder stops the run without uploading', async () => {
     write('a.txt', 'a');
     const spec = makeSet('backup', { targetPath: '/my-files/Nope' });

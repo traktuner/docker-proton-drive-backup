@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 import path from 'node:path';
 
 /**
@@ -82,17 +83,65 @@ function skipReason(e: unknown): string {
 }
 
 /**
+ * The scanner thread. Synchronous readdir/stat are ~12x cheaper in CPU than the
+ * promise-based calls (measured: 8 µs vs 95 µs per file, which made an unchanged
+ * run over 1M files cost 157 s of CPU), but they block — so they run in a worker
+ * thread, never on the thread that serves the UI. A NAS share that hangs blocks
+ * only this worker. Entries travel in batches with one batch in flight
+ * (backpressure: the worker waits for "next"), so memory stays bounded no matter
+ * how fast the disk is compared to the uploads.
+ *
+ * Kept as source text (eval worker) so it needs no separate build artefact.
+ */
+const SCAN_WORKER = `
+const { parentPort, workerData } = require('node:worker_threads');
+const fs = require('node:fs');
+const path = require('node:path');
+const { root, relBase, includeHidden } = workerData;
+const BATCH = 512;
+let batch = [];
+let wake = null;
+parentPort.on('message', () => { const w = wake; wake = null; if (w) w(); });
+const flush = async () => {
+  if (!batch.length) return;
+  const out = batch; batch = [];
+  parentPort.postMessage(out);
+  await new Promise((r) => (wake = r));
+};
+const reason = (e) => (e && e.code) || 'unreadable';
+async function recur(dir, rel) {
+  batch.push(['d', rel]);
+  let ents;
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch (e) { batch.push(['s', rel, 'folder not readable (' + reason(e) + ')']); return; }
+  const visible = includeHidden ? ents : ents.filter((e) => !e.name.startsWith('.'));
+  if (visible.length === 0) batch.push(['e', rel]);
+  const subdirs = [];
+  for (const e of visible) {
+    const abs = path.join(dir, e.name);
+    const r = rel + '/' + e.name;
+    if (e.isDirectory()) subdirs.push([abs, r]);
+    else if (e.isFile()) {
+      try { const s = fs.statSync(abs); batch.push(['f', r, abs, s.size, s.mtimeMs]); }
+      catch (err) { batch.push(['s', r, 'not readable (' + reason(err) + ')']); }
+      if (batch.length >= BATCH) await flush();
+    }
+  }
+  for (const [abs, r] of subdirs) await recur(abs, r);
+  if (batch.length >= BATCH) await flush();
+}
+(async () => { await recur(root, relBase); await flush(); parentPort.postMessage(null); })();
+`;
+
+/**
  * Streaming walk of all files under an absolute source path: yields one file at
  * a time instead of building the full array. Each file's `rel` is `relBase` plus
- * its path inside the source, mirroring how it will be laid out on Drive. The
- * caller controls `relBase` (e.g. "<set-folder>/<source-rel-to-LOCAL_ROOT>") so
- * the destination structure is preserved and same-named folders never collide;
- * it defaults to the source basename for backward compatibility. Hidden dotfiles
- * are skipped unless `opts.includeHidden` is set; unreadable entries are reported
- * via `opts.onSkip` instead of being dropped silently. This is what keeps the
- * catalog engine's memory bounded — a 4-million-file source never materialises as a
- * 4-million-element array/Map. Directories are not yielded; the engine derives
- * needed parent folders from each file's rel path.
+ * its path inside the source, mirroring how it will be laid out on Drive. Hidden
+ * dotfiles are skipped unless `opts.includeHidden` is set; unreadable entries are
+ * reported via `opts.onSkip` instead of being dropped silently. Directories are
+ * reported via onDir (before their content) and onEmptyDir. Memory is bounded by
+ * one batch; the filesystem work happens in a worker thread (see SCAN_WORKER).
+ * Files of a directory come before its subdirectories.
  */
 export async function* walkSourceStream(
   absPath: string,
@@ -114,35 +163,46 @@ export async function* walkSourceStream(
   }
   if (!st.isDirectory()) return;
 
-  async function* recur(dir: string, relPrefix: string): AsyncGenerator<WalkedFile> {
-    onDir?.(relPrefix);
-    let ents;
-    try {
-      ents = await fs.readdir(dir, { withFileTypes: true });
-    } catch (e) {
-      onSkip?.(relPrefix, `folder not readable (${skipReason(e)})`);
-      return;
-    }
-    if (onEmptyDir && !ents.some((e) => includeHidden || !e.name.startsWith('.'))) onEmptyDir(relPrefix);
-    for (const e of ents) {
-      if (!includeHidden && e.name.startsWith('.')) continue;
-      const childAbs = path.join(dir, e.name);
-      const childRel = `${relPrefix}/${e.name}`;
-      if (e.isDirectory()) {
-        yield* recur(childAbs, childRel);
-      } else if (e.isFile()) {
-        let s;
-        try {
-          s = await fs.stat(childAbs);
-        } catch (err) {
-          onSkip?.(childRel, `not readable (${skipReason(err)})`); // surface, don't drop silently
-          continue;
+  const worker = new Worker(SCAN_WORKER, { eval: true, workerData: { root: absPath, relBase, includeHidden } });
+  const queue: (unknown[][] | null)[] = [];
+  let waiting: (() => void) | null = null;
+  let failure: Error | null = null;
+  worker.on('message', (m) => {
+    queue.push(m);
+    waiting?.();
+  });
+  worker.on('error', (e) => {
+    failure = e;
+    waiting?.();
+  });
+  try {
+    for (;;) {
+      while (queue.length === 0 && !failure) await new Promise<void>((r) => (waiting = r));
+      waiting = null;
+      if (failure) throw failure;
+      const items = queue.shift()!;
+      if (items === null) return;
+      worker.postMessage(0); // let the worker fill the next batch while we work on this one
+      for (const it of items) {
+        switch (it[0]) {
+          case 'f':
+            yield { rel: it[1] as string, abs: it[2] as string, size: it[3] as number, mtimeMs: it[4] as number };
+            break;
+          case 'd':
+            onDir?.(it[1] as string);
+            break;
+          case 'e':
+            onEmptyDir?.(it[1] as string);
+            break;
+          case 's':
+            onSkip?.(it[1] as string, it[2] as string);
+            break;
         }
-        yield { abs: childAbs, rel: childRel, size: s.size, mtimeMs: s.mtimeMs };
       }
     }
+  } finally {
+    void worker.terminate(); // also on early exit (cancel) — never leaks a scanner
   }
-  yield* recur(absPath, relBase);
 }
 
 export async function listLocal(relPath: string): Promise<LocalEntry[]> {

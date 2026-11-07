@@ -277,6 +277,8 @@ function semaphore(n: number) {
 /* Runtime                                                                   */
 /* ------------------------------------------------------------------------ */
 
+let cryptoReady = false;
+
 export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime> {
   const log = opts.log ?? (() => {});
   const baseUrl = opts.baseUrl || 'drive-api.proton.me';
@@ -288,8 +290,12 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
     log('warn', message);
   };
 
-  CryptoApi.init({});
-  CryptoProxy.setEndpoint(new CryptoApi(), (endpoint) => endpoint.clearKeyStore());
+  if (!cryptoReady) {
+    // Process-wide singleton in @protontech/crypto: initialise exactly once.
+    CryptoApi.init({});
+    CryptoProxy.setEndpoint(new CryptoApi(), (endpoint) => endpoint.clearKeyStore());
+    cryptoReady = true;
+  }
 
   const sessionFile = new SessionFile(opts.sessionDir);
   const credentials = new Credentials(sessionFile);

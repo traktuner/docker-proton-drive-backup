@@ -46,7 +46,7 @@ const tag = `js/v${version}`;
 // Shallow clone of exactly the release tag.
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'proton-sdk-'));
 console.log(`sdk:update: fetching ${tag} from ${REPO}`);
-sh('git', ['clone', '--quiet', '--depth', '1', '--branch', tag, REPO, work]);
+sh('git', ['-c', 'advice.detachedHead=false', 'clone', '--quiet', '--depth', '1', '--branch', tag, REPO, work]);
 const commit = sh('git', ['-C', work, 'rev-parse', 'HEAD']);
 
 const upstreamSdk = readJson(path.join(work, 'client/js/package.json'));

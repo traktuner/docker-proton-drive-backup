@@ -21,13 +21,15 @@ services:
     # VOLUMES
     # ---------------------------------------------------------------------------
     volumes:
-      # (1) /data — REQUIRED, READ-WRITE. Holds the Proton session, the SQLite job
-      #     database and the CLI cache. Must be writable and persistent: without
-      #     it you'd lose your login and all backup sets on every restart.
-      #     A bind mount (shown) or a named volume both work.
-      #     Security note: the session token is stored here in plaintext (the CLI
-      #     has no encryption option) — encrypt this volume at the storage layer
-      #     (encrypted ZFS dataset / LUKS). See README → "Session security".
+      # (1) /data — REQUIRED, READ-WRITE. Holds the Proton session
+      #     (proton/auth-session.json) and the SQLite job database. Must be writable
+      #     and persistent: without it you'd lose your login and all backup sets on
+      #     every restart. A bind mount (shown) or a named volume both work.
+      #     Upgrading from a CLI-era release (0.x tags) keeps this SAME /data: jobs,
+      #     history, catalog and the session carry over. See README → "Upgrade".
+      #     Security note: the session token is stored here in plaintext (0600) —
+      #     encrypt this volume at the storage layer (encrypted ZFS dataset / LUKS).
+      #     See README → "Session at rest".
       - ./data:/data
 
       # (2) /sources — the folders you want to BACK UP. They appear in the left
@@ -97,22 +99,12 @@ services:
       # SQLite job database path — keep it under /data so it persists.
       # - DB_PATH=/data/backup.db
 
-      # Proton session + cache dir — keep it under /data so your login persists.
+      # Proton session dir — keep it under /data so your login persists.
       # - PROTON_DRIVE_CACHE_DIR=/data/proton
 
-      # Required inside a container (file-based session store; the OS keyring is
-      # unavailable). Do not disable. (CLI 0.6.0+ renamed it from the old
-      # PROTON_DRIVE_UNSAFE_SECRETS=1.)
-      # - PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file
-
-      # CLI log verbosity: ERROR | WARN | INFO | DEBUG. Default ERROR.
-      # - PROTON_DRIVE_LOG_LEVEL=ERROR
-
-      # Memory the CLI's (Bun) runtime sizes its heap for, in BYTES, per upload
-      # process. Without it the runtime assumes the whole container limit is its
-      # headroom and collects garbage lazily — the usual cause of OOM kills during
-      # big backups. Default 512 MiB; lower on small hosts. See README → "Memory".
-      # - BUN_JSC_forceRAMSize=536870912
+      # Variables of CLI-era releases (PROTON_DRIVE_CREDENTIALS_STORE,
+      # PROTON_DRIVE_LOG_LEVEL, BUN_JSC_forceRAMSize, PROTON_DRIVE_CLI) are no longer
+      # needed. Leaving them in an existing compose file is harmless.
 
       # Proton API host — do not change.
       # - PROTON_DRIVE_BASE_URL=drive-api.proton.me
@@ -133,15 +125,12 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Optional: enable the "Limit upload speed" setting. It shapes traffic with the
-    # kernel's `tc` (the only reliable way — the Proton CLI has no bandwidth flag),
-    # which needs NET_ADMIN back. This is a deliberate, documented exception to
-    # cap_drop: ALL; leave it out and the speed-limit control shows as unavailable.
-    # cap_add:
-    #   - NET_ADMIN
+    # "Limit upload speed" (Settings) works with cap_drop: ALL — the app throttles
+    # its own uploads. CLI-era releases needed `cap_add: [NET_ADMIN]` for it; you
+    # can remove that line (keeping it is harmless).
 
     # Optional, stronger: read-only root filesystem. The ONLY writable path the app
-    # needs is the /data volume above (DB, Proton session, cache); everything else
+    # needs is the /data volume above (DB, Proton session); everything else
     # is served read-only. Add the two tmpfs mounts for the Next.js cache and /tmp,
     # and uncomment together. /config (declarative import) may be omitted entirely
     # or mounted :ro — it is never written.

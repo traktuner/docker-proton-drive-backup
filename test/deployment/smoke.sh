@@ -130,8 +130,8 @@ run_mode() {
       || { docker logs "$ctr" >&2 || true; fail "$name: /data/backup.db owned by uid '$owner', expected '$expect_uid' — privilege drop did not take effect"; }
   fi
 
-  # (5) Speed-limit capability (issue #23): with NET_ADMIN the app must report it can
-  # shape traffic; without it, must report it cannot (so the UI never lies).
+  # (5) Speed-limit capability (issue #23): the app limits its own upload reads, so
+  # it must report canShape=true in every mode (no NET_ADMIN needed any more).
   if [ -n "$expect_canshape" ]; then
     local cs
     cs="$(curl -fsS "$base/api/settings/uploads" 2>/dev/null | grep -o '"canShape":[a-z]*' | cut -d: -f2)"
@@ -191,14 +191,15 @@ run_nested_mode() {
 }
 
 blue "Deployment smoke matrix against $IMAGE"
-run_mode "default"            ""                                                            0 "" "false"
+run_mode "default"            ""                                                            0 "" "true"
 run_mode "hardened"           "--security-opt no-new-privileges:true --cap-drop ALL"
 run_mode "read-only"          "--read-only --tmpfs /tmp --tmpfs /app/.next/cache"
 run_mode "non-root"           "--user ${NONROOT_UID}:${NONROOT_GID}" 1
 run_mode "read-only-non-root" "--read-only --tmpfs /tmp --tmpfs /app/.next/cache --user ${NONROOT_UID}:${NONROOT_GID}" 1
 # PUID/PGID convenience layer: root container that chowns /data and drops itself.
 run_mode "puid-pgid"          "-e PUID=${NONROOT_UID} -e PGID=${NONROOT_GID}" 0 "${NONROOT_UID}"
-# Speed-limit opt-in: NET_ADMIN must flip canShape true (tc/iproute2 present + cap).
+# Since the SDK release the speed limit needs no capability (canShape=true above).
+# Compose files from CLI-era releases may still add NET_ADMIN: they must keep booting.
 run_mode "net-admin"          "--cap-add NET_ADMIN" 0 "" "true"
 
 # Nested sources (issue #72): the two safe layouts for mounting per-share dirs

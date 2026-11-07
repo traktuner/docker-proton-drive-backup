@@ -58,11 +58,16 @@ jobs:
       - name: Compute version-revision tag
         id: cliv
         run: |
-          V=$(grep -oP '^ARG PROTON_CLI_VERSION=\K.*' Dockerfile)
-          # Debian-style revision: commits since the current CLI version was set.
-          BUMP=$(git log -1 --format=%H -S"PROTON_CLI_VERSION=$V" -- Dockerfile || true)
+          # App release from package.json; Debian-style revision = commits since it
+          # was set. "<appVersion>-<revision>" keeps the tag shape the update check
+          # of already-installed containers parses (1.0.0-1 > 0.9.0-21).
+          V=$(node -p "require('./package.json').version")
+          BUMP=$(git log -1 --format=%H -S"\"version\": \"$V\"" -- package.json || true)
           if [ -n "$BUMP" ]; then REV=$(( $(git rev-list --count "$BUMP"..HEAD) + 1 )); else REV=1; fi
           echo "tag=$V-$REV" >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "sdk=$(node -p "require('./src/server/proton/vendor/UPSTREAM.json').sdkVersion")" >> "$GITHUB_OUTPUT"
+          echo "sdkcommit=$(node -p "require('./src/server/proton/vendor/UPSTREAM.json').commit")" >> "$GITHUB_OUTPUT"
 
       # Push by digest only (no tag). On PRs push=false, so this just validates that
       # the image builds natively on both arches. gha cache is scoped per-arch so the
@@ -76,6 +81,9 @@ jobs:
           build-args: |
             APP_VERSION=${{ github.sha }}
             IMAGE_TAG=${{ steps.cliv.outputs.tag }}
+            APP_RELEASE=${{ steps.cliv.outputs.version }}
+            SDK_VERSION=${{ steps.cliv.outputs.sdk }}
+            SDK_COMMIT=${{ steps.cliv.outputs.sdkcommit }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
@@ -128,8 +136,8 @@ jobs:
       - name: Compute version-revision tag
         id: cliv
         run: |
-          V=$(grep -oP '^ARG PROTON_CLI_VERSION=\K.*' Dockerfile)
-          BUMP=$(git log -1 --format=%H -S"PROTON_CLI_VERSION=$V" -- Dockerfile || true)
+          V=$(node -p "require('./package.json').version")
+          BUMP=$(git log -1 --format=%H -S"\"version\": \"$V\"" -- package.json || true)
           if [ -n "$BUMP" ]; then REV=$(( $(git rev-list --count "$BUMP"..HEAD) + 1 )); else REV=1; fi
           echo "tag=$V-$REV" >> "$GITHUB_OUTPUT"
 
@@ -143,7 +151,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=
-            # <cliVersion>-<revision> image tag so Renovate sees new releases even
+            # <appVersion>-<revision> image tag so Renovate sees new releases even
             # on default-branch builds (git-tag pushes from CI don't trigger).
             type=raw,value=${{ steps.cliv.outputs.tag }},enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}

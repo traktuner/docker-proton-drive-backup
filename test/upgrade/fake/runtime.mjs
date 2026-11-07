@@ -134,7 +134,7 @@ export async function createRuntime(opts) {
   };
 
   return {
-    versions: { app: opts.appVersion, appVersionHeader: 'external-drive-proton_drive_backup@fake', sdk: 'fake', sdkTag: 'fake', sdkCommit: 'fake', crypto: 'fake' },
+    versions: { app: opts.appVersion, appVersionHeader: 'external-drive-traktuner_proton_drive_backup@fake', sdk: 'fake', sdkTag: 'fake', sdkCommit: 'fake', crypto: 'fake' },
     drive,
     hasSession: () => !!readSession(),
     async account() {

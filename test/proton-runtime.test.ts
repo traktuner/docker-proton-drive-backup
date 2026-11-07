@@ -37,7 +37,7 @@ describe('SDK runtime bundle', () => {
     const rt = await createRuntime({ sessionDir: dir, appVersion: '1.2.3', appBuild: 'abc1234', clientUid: 'proton_drive_backup-test' });
     expect(rt.versions.sdk).toBe(UPSTREAM.sdkVersion);
     expect(rt.versions.sdkCommit).toBe(UPSTREAM.commit);
-    expect(rt.versions.appVersionHeader).toBe('external-drive-proton_drive_backup@1.2.3-stable+abc1234');
+    expect(rt.versions.appVersionHeader).toBe('external-drive-traktuner_proton_drive_backup@1.2.3-stable+abc1234');
     expect(rt.hasSession()).toBe(false);
     expect(await rt.account()).toBeNull();
     await expect(rt.drive.root()).rejects.toMatchObject({ name: 'DriveError', code: 'UNAUTHENTICATED' });

@@ -52,12 +52,17 @@ import {
   type UploadResult,
 } from './types';
 
-/** Third-party identification required by Proton (see the SDK README). */
+/**
+ * Third-party identification required by Proton (SDK README, "x-pm-appversion"):
+ * external-drive-{name}@{semver}-{channel}+{commit}. {name} carries the GitHub owner
+ * so it stays unique even if another "proton_drive_backup" app exists; each install
+ * is additionally told apart by its own clientUid.
+ */
 export function appVersionHeader(appVersion: string, build?: string): string {
   const semver = /^\d+\.\d+\.\d+$/.test(appVersion) ? appVersion : '0.0.0';
   const channel = semver.startsWith('0.') ? 'beta' : 'stable';
   const suffix = build && /^[0-9a-z]+$/i.test(build) ? `+${build.slice(0, 12)}` : '';
-  return `external-drive-proton_drive_backup@${semver}-${channel}${suffix}`;
+  return `external-drive-traktuner_proton_drive_backup@${semver}-${channel}${suffix}`;
 }
 
 /* ------------------------------------------------------------------------ */

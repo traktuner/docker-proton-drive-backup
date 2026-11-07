@@ -36,7 +36,7 @@ carry over, and the first run uploads nothing. Rolling back works too. See
   (`/data/backup.db`), including the Drive node of every file and folder. An
   unchanged run costs one `stat` and one indexed lookup per file — no Drive
   requests and no file reads.
-- **Identifies honestly** to Proton as `external-drive-proton_drive_backup@<version>`.
+- **Identifies honestly** to Proton as `external-drive-traktuner_proton_drive_backup@<version>`.
 
 ## Security
 

@@ -29,6 +29,8 @@ function fakeRuntime(state: { session: boolean; account: AccountInfo | null; fai
     },
     clearCaches: async () => {},
     startEvents: async () => {},
+    pauseEvents: async () => {},
+    cacheStats: () => ({ entities: 0, crypto: 0, events: false }),
     onFolderChanged() {},
     onSessionLost() {},
     notices: () => [],

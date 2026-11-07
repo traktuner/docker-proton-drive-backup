@@ -88,8 +88,7 @@ export async function runtime(): Promise<ProtonRuntime> {
       });
       rt.onFolderChanged((uid) => nameIndex().delete(uid));
       rt.onSessionLost(() => markSessionLost());
-      if (rt.hasSession()) rt.startEvents().catch(() => {});
-      return rt;
+      return rt; // events start with the first Drive activity (see noteActivity)
     })();
     g.__pdRuntime.catch(() => (g.__pdRuntime = undefined)); // retry on next call
   }
@@ -97,7 +96,33 @@ export async function runtime(): Promise<ProtonRuntime> {
 }
 
 export async function drive(): Promise<DriveService> {
-  return (await runtime()).drive;
+  const rt = await runtime();
+  noteActivity(rt);
+  return rt.drive;
+}
+
+/**
+ * Drive events are polled by the SDK every ~30 s. Nobody needs that while no run
+ * is active and nobody browses Drive: after IDLE_EVENTS_MS without Drive activity
+ * the subscription is paused (and the entity cache dropped); the next Drive call
+ * resumes it. An idle container then makes no Proton requests at all.
+ */
+const IDLE_EVENTS_MS = 10 * 60_000;
+const ga = globalThis as unknown as { __pdActivity?: { at: number; timer?: ReturnType<typeof setInterval>; paused: boolean } };
+function noteActivity(rt: ProtonRuntime) {
+  const a = ga.__pdActivity ?? (ga.__pdActivity = { at: 0, paused: true });
+  a.at = Date.now();
+  if (a.paused && rt.hasSession()) {
+    a.paused = false;
+    rt.startEvents().catch(() => {});
+  }
+  a.timer ??= setInterval(() => {
+    if (!a.paused && Date.now() - a.at > IDLE_EVENTS_MS && !uploadsBusy()) {
+      a.paused = true;
+      rt.pauseEvents().catch(() => {});
+    }
+  }, 60_000);
+  a.timer.unref?.();
 }
 
 export async function versions(): Promise<Versions> {
@@ -351,6 +376,7 @@ export async function loginStatus(): Promise<LoginStatus> {
 export async function logout(): Promise<void> {
   const rt = await runtime();
   await rt.logout();
+  if (ga.__pdActivity) ga.__pdActivity.paused = true;
   g.__pdAuth = { authed: false, at: Date.now(), account: null };
   invalidateFolder();
 }

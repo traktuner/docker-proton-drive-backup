@@ -175,6 +175,9 @@ export interface ProtonRuntime {
   clearCaches(): Promise<void>;
   /** Subscribe to Drive events once logged in (keeps caches coherent). */
   startEvents(): Promise<void>;
+  /** Stop event polling while idle (and drop the entity cache it kept coherent). */
+  pauseEvents(): Promise<void>;
+  cacheStats(): { entities: number; crypto: number; events: boolean };
   /** Called by the runtime when Drive reports changes under a folder (cache invalidation). */
   onFolderChanged(cb: (folderUid: string) => void): void;
   /** Called whenever the runtime concludes the session is gone (refresh rejected). */
@@ -196,5 +199,8 @@ export interface RuntimeOptions {
   clientUid: string;
   /** Max concurrent thumbnail decodes (memory bound). */
   thumbnailConcurrency?: number;
+  /** LRU sizes of the SDK caches (decrypted node metadata / keys). */
+  entityCacheSize?: number;
+  cryptoCacheSize?: number;
   log?: (level: 'debug' | 'info' | 'warn' | 'error', msg: string) => void;
 }

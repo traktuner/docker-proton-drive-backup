@@ -13,6 +13,7 @@ export async function GET() {
     memory: { rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers },
     cpu: process.cpuUsage(),
     requests: rt.requestStats(),
+    caches: rt.cacheStats(),
     notices: rt.notices(),
   });
 }

@@ -22,7 +22,6 @@ import { CryptoProxy, updateServerTime } from '@protontech/crypto';
 import { Api as CryptoApi } from '@protontech/crypto/proxy/endpoint/api.ts';
 import { computeKeyPassword, generateKeySalt, getRandomSrpVerifier, getSrp } from '@protontech/crypto/srp';
 import {
-  MemoryCache,
   NodeType,
   NullFeatureFlagProvider,
   OpenPGPCryptoWithCryptoProxy,
@@ -257,6 +256,76 @@ async function makeThumbnails(abs: string, mediaType: string): Promise<Thumbnail
   return out;
 }
 
+/**
+ * Bounded LRU implementation of the SDK's cache interface. The SDK's own
+ * MemoryCache is documented as "not recommended in production": it never evicts
+ * (memory grows with every node ever seen — a Verify of a million files keeps a
+ * million decrypted nodes) and setEntity scans every tag list (quadratic). Here
+ * every operation is O(1) amortised and the size is capped; an evicted entry is
+ * simply fetched/decrypted again when needed.
+ */
+export class LruCache<T> {
+  private map = new Map<string, { value: T; tags?: string[] }>();
+  private byTag = new Map<string, Set<string>>();
+  constructor(private readonly max: number) {}
+  async clear() {
+    this.map.clear();
+    this.byTag.clear();
+  }
+  private untag(key: string, tags?: string[]) {
+    for (const t of tags ?? []) {
+      const set = this.byTag.get(t);
+      set?.delete(key);
+      if (set && set.size === 0) this.byTag.delete(t);
+    }
+  }
+  async setEntity(key: string, value: T, tags?: string[]) {
+    const old = this.map.get(key);
+    if (old) {
+      this.untag(key, old.tags);
+      this.map.delete(key);
+    }
+    this.map.set(key, { value, tags });
+    for (const t of tags ?? []) {
+      let set = this.byTag.get(t);
+      if (!set) this.byTag.set(t, (set = new Set()));
+      set.add(key);
+    }
+    while (this.map.size > this.max) {
+      const [k, e] = this.map.entries().next().value!;
+      this.map.delete(k);
+      this.untag(k, e.tags);
+    }
+  }
+  async getEntity(key: string): Promise<T> {
+    const e = this.map.get(key);
+    if (!e) throw Error('Entity not found');
+    this.map.delete(key);
+    this.map.set(key, e); // most recently used
+    return e.value;
+  }
+  async *iterateEntities(keys: string[]) {
+    for (const key of keys) {
+      const e = this.map.get(key);
+      yield e ? { key, ok: true as const, value: e.value } : { key, ok: false as const, error: 'Entity not found' };
+    }
+  }
+  async *iterateEntitiesByTag(tag: string) {
+    yield* this.iterateEntities([...(this.byTag.get(tag) ?? [])]);
+  }
+  async removeEntities(keys: string[]) {
+    for (const key of keys) {
+      const e = this.map.get(key);
+      if (!e) continue;
+      this.map.delete(key);
+      this.untag(key, e.tags);
+    }
+  }
+  get size() {
+    return this.map.size;
+  }
+}
+
 /** Tiny counting semaphore. */
 function semaphore(n: number) {
   let active = 0;
@@ -302,6 +371,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   const credentials = new Credentials(sessionFile);
   const lostCbs = new Set<() => void>();
   credentials.lost = () => lostCbs.forEach((cb) => cb());
+  lostCbs.add(() => stopEvents()); // no polling with a dead session
 
   const logger = {
     debug: (m: string) => log('debug', m),
@@ -373,8 +443,9 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   };
 
   let latestEvent: string | null = null;
-  const entitiesCache = new MemoryCache<string>();
-  const cryptoCache = new MemoryCache<unknown>();
+  // Bounded: memory does not grow with the number of Drive items a run touches.
+  const entitiesCache = new LruCache<string>(opts.entityCacheSize ?? 20_000);
+  const cryptoCache = new LruCache<unknown>(opts.cryptoCacheSize ?? 5_000);
   const sdk = new ProtonDriveClient({
     httpClient: httpClient as never,
     entitiesCache: entitiesCache as never,
@@ -677,6 +748,12 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
       await Promise.allSettled([entitiesCache.clear()]);
     },
     startEvents,
+    async pauseEvents() {
+      // Without the event stream the entity cache could go stale: drop it too.
+      stopEvents();
+      await entitiesCache.clear();
+    },
+    cacheStats: () => ({ entities: entitiesCache.size, crypto: cryptoCache.size, events: subscription !== null }),
     onFolderChanged: (cb) => void folderChangedCbs.add(cb),
     onSessionLost: (cb) => void lostCbs.add(cb),
     notices: () => [...notices],

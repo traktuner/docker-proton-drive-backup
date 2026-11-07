@@ -165,6 +165,8 @@ export async function createRuntime(opts) {
     },
     async clearCaches() {},
     async startEvents() {},
+    async pauseEvents() {},
+    cacheStats: () => ({ entities: 0, crypto: 0, events: false }),
     onFolderChanged() {},
     onSessionLost() {},
     notices: () => [],

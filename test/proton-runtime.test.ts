@@ -15,10 +15,17 @@ import type { ProtonRuntime } from '@/server/proton/types';
 const ROOT = path.resolve(__dirname, '..');
 const UPSTREAM = JSON.parse(fs.readFileSync(path.join(ROOT, 'src/server/proton/vendor/UPSTREAM.json'), 'utf8'));
 let createRuntime: (o: unknown) => Promise<ProtonRuntime>;
+let LruCache: new <T>(max: number) => {
+  setEntity(k: string, v: T, tags?: string[]): Promise<void>;
+  getEntity(k: string): Promise<T>;
+  iterateEntitiesByTag(t: string): AsyncGenerator<{ key: string; ok: boolean }>;
+  removeEntities(k: string[]): Promise<void>;
+  size: number;
+};
 
 beforeAll(async () => {
   execFileSync(process.execPath, [path.join(ROOT, 'scripts/build-proton.mjs')], { cwd: ROOT, stdio: 'pipe' });
-  ({ createRuntime } = await import(pathToFileURL(path.join(ROOT, 'dist-proton/runtime.mjs')).href));
+  ({ createRuntime, LruCache } = await import(pathToFileURL(path.join(ROOT, 'dist-proton/runtime.mjs')).href));
 }, 120_000);
 
 describe('SDK runtime bundle', () => {
@@ -47,5 +54,33 @@ describe('SDK runtime bundle', () => {
     expect(rt.hasSession()).toBe(false);
     expect(fs.existsSync(path.join(dir, 'auth-session.json'))).toBe(false);
     await rt.dispose();
+  });
+});
+
+describe('LruCache (replaces the SDK MemoryCache: bounded, O(1))', () => {
+  it('evicts the least recently used entry and keeps the tag index consistent', async () => {
+    const c = new LruCache<string>(3);
+    await c.setEntity('a', '1', ['parent-x']);
+    await c.setEntity('b', '2', ['parent-x']);
+    await c.setEntity('c', '3');
+    await c.getEntity('a'); // a is now most recent
+    await c.setEntity('d', '4', ['parent-x']); // evicts b
+    expect(c.size).toBe(3);
+    await expect(c.getEntity('b')).rejects.toThrow();
+    const tagged: string[] = [];
+    for await (const r of c.iterateEntitiesByTag('parent-x')) if (r.ok) tagged.push(r.key);
+    expect(tagged.sort()).toEqual(['a', 'd']);
+    await c.removeEntities(['a']);
+    tagged.length = 0;
+    for await (const r of c.iterateEntitiesByTag('parent-x')) if (r.ok) tagged.push(r.key);
+    expect(tagged).toEqual(['d']);
+  });
+
+  it('stays fast and bounded with 200k entries', async () => {
+    const c = new LruCache<string>(20_000);
+    const t0 = performance.now();
+    for (let i = 0; i < 200_000; i++) await c.setEntity(`node-${i}`, 'v', [`parent-${i % 100}`]);
+    expect(c.size).toBe(20_000);
+    expect(performance.now() - t0).toBeLessThan(3000);
   });
 });

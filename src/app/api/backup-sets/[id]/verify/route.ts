@@ -1,6 +1,6 @@
 import { backupSets } from '@/server/db';
-import { verifySet } from '@/server/engine';
-import { drive, normalizeProtonPath, uploadsBusy, writeGate } from '@/server/drive';
+import { verifySet, specFor } from '@/server/engine';
+import { drive, uploadsBusy, writeGate } from '@/server/drive';
 import { claimBackupSet, releaseBackupSet } from '@/server/backup-lock';
 
 export const dynamic = 'force-dynamic';
@@ -40,17 +40,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (blocked) return Response.json({ error: blocked }, { status: 409 });
     // `?content=1` additionally compares every local file's SHA-1 with Drive's.
     const content = new URL(req.url).searchParams.get('content') === '1';
-    const res = await verifySet(
-      await drive(),
-      {
-        setId: id,
-        sourcePaths: set.sourcePaths,
-        targetPath: normalizeProtonPath(set.targetPath),
-        subfolder: set.targetSubfolder,
-        mode: set.mode,
-      },
-      { content },
-    );
+    const res = await verifySet(await drive(), specFor(set), { content });
     return Response.json(res, { status: res.ok ? 200 : 502 });
   } finally {
     g.__pdVerifying = false;

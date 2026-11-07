@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import { createReadStream, promises as fsp } from 'node:fs';
 import { walkSourceStream, relToLocalRoot, sourceMark } from './local';
 import { catalog, diffFile, type CatalogEntry, type CatalogFile } from './catalog';
-import { backupSets, type SourceMark } from './db';
+import { backupSets, type BackupSet, type SourceMark } from './db';
+import { normalizeProtonPath } from '../lib/proton-path';
 import type { SkippedFile } from './runs';
 import { getUploadConfig } from './upload-config';
 import { getMirrorSafetyConfig } from './mirror-safety';
@@ -85,6 +86,21 @@ export interface RunSpec {
   /** One-shot: the user confirmed the sources' current state (emptied on purpose,
    *  mounts changed on purpose); it becomes the new reference. */
   confirmSources?: boolean;
+}
+
+/** The run specification of a stored set (the one place that maps a set to a run). */
+export function specFor(set: BackupSet, extra: Pick<RunSpec, 'confirmSources'> = {}): RunSpec {
+  return {
+    setId: set.id,
+    sourcePaths: set.sourcePaths,
+    targetPath: normalizeProtonPath(set.targetPath),
+    subfolder: set.targetSubfolder,
+    mode: set.mode,
+    excludes: set.excludes,
+    skipThumbnails: set.skipThumbnails,
+    includeHidden: set.includeHidden,
+    ...extra,
+  };
 }
 
 export interface RunHooks {
@@ -185,6 +201,11 @@ export function relBaseFor(subfolder: string, abs: string): string {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Wait `ms`, checking `stop` every 250 ms (cancel must never wait out a backoff). */
+async function sleepUnless(ms: number, stop: () => boolean): Promise<void> {
+  for (let w = 0; w < ms && !stop(); w += 250) await sleep(Math.min(250, ms - w));
+}
 
 /** FIFO with O(1) shift (Array#shift is O(n): 100k shifts took 9.5 s). */
 class Fifo<T> {
@@ -1288,7 +1309,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
         if (code && TRANSIENT.has(code) && attempt < 4 && !fsCode) {
           const wait = retryDelay(code, attempt);
           log(`  ${f.rel}: ${describeUploadError(e)} — retry ${attempt}/3 in ${Math.round(wait / 1000)}s`);
-          for (let w = 0; w < wait && !shouldCancel(); w += 250) await sleep(Math.min(250, wait));
+          await sleepUnless(wait, shouldCancel);
           continue;
         }
         noteFailed(f.rel, describeUploadError(e));
@@ -1340,7 +1361,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
           if (code && TRANSIENT.has(code) && attempt < 4) {
             const wait = retryDelay(code, attempt);
             log(`  ${rel}: ${describeUploadError(e)} — retry ${attempt}/3 in ${Math.round(wait / 1000)}s`);
-            for (let w = 0; w < wait && laneOpen(); w += 250) await sleep(Math.min(250, wait));
+            await sleepUnless(wait, () => !laneOpen());
             continue;
           }
           noteFailed(rel, describeUploadError(e));

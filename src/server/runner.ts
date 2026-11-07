@@ -1,6 +1,6 @@
 import { backupSets } from './db';
-import { drive, normalizeProtonPath, setBackupRunning, writeGate, invalidateFolder } from './drive';
-import { runSet, type RunSpec } from './engine';
+import { drive, setBackupRunning, writeGate, invalidateFolder } from './drive';
+import { runSet, specFor } from './engine';
 import { progress } from './progress';
 import { control } from './control';
 import { runs } from './runs';
@@ -62,17 +62,7 @@ async function doRun(id: string, req: RunRequest): Promise<void> {
   let skipped: { rel: string; reason: string }[] = [];
 
   try {
-    const spec: RunSpec = {
-      setId: id,
-      sourcePaths: set.sourcePaths,
-      targetPath: normalizeProtonPath(set.targetPath),
-      subfolder: set.targetSubfolder,
-      mode: set.mode,
-      excludes: set.excludes,
-      skipThumbnails: set.skipThumbnails,
-      includeHidden: set.includeHidden,
-      confirmSources: req.confirmSources,
-    };
+    const spec = specFor(set, { confirmSources: req.confirmSources });
     const result = await runSet(await drive(), spec, {
       log,
       onProgress: (p) => progress.set(id, p),

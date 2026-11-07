@@ -1,6 +1,6 @@
 import { backupSets } from '@/server/db';
-import { previewSet } from '@/server/engine';
-import { drive, isAuthenticated, normalizeProtonPath, uploadsBusy } from '@/server/drive';
+import { previewSet, specFor } from '@/server/engine';
+import { drive, isAuthenticated, uploadsBusy } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,15 +33,7 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     if (set.mode === 'mirror' && !(await isAuthenticated())) {
       return Response.json({ error: 'Sign in to Proton Drive to preview deletions.' }, { status: 401 });
     }
-    const res = await previewSet(await drive(), {
-      setId: id,
-      sourcePaths: set.sourcePaths,
-      targetPath: normalizeProtonPath(set.targetPath),
-      subfolder: set.targetSubfolder,
-      mode: set.mode,
-      excludes: set.excludes,
-      includeHidden: set.includeHidden,
-    });
+    const res = await previewSet(await drive(), specFor(set));
     return Response.json(res);
   } finally {
     g.__pdPreviewing = false;

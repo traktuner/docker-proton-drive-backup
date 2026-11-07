@@ -1,6 +1,6 @@
 import { backupSets } from '@/server/db';
-import { restoreTest } from '@/server/engine';
-import { drive, normalizeProtonPath, writeGate } from '@/server/drive';
+import { restoreTest, specFor } from '@/server/engine';
+import { drive, writeGate } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
@@ -23,11 +23,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const blocked = await writeGate();
     if (blocked) return Response.json({ error: blocked }, { status: 409 });
     const files = Number(new URL(req.url).searchParams.get('files')) || 20;
-    const res = await restoreTest(
-      await drive(),
-      { setId: id, sourcePaths: set.sourcePaths, targetPath: normalizeProtonPath(set.targetPath), subfolder: set.targetSubfolder, mode: set.mode },
-      { files },
-    );
+    const res = await restoreTest(await drive(), specFor(set), { files });
     return Response.json(res, { status: res.mismatched.length ? 502 : 200 });
   } finally {
     g.__pdRestoreTest = false;

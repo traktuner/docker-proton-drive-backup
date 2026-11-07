@@ -14,20 +14,25 @@ interface GcState {
   liveHeap: number | null;
   /** Largest liveHeap seen since start (a leak makes this climb run after run). */
   maxLiveHeap: number;
+  /** Time spent in GC pauses since start (all kinds): its delta over wall time is the GC share of one core. */
+  gcMs: number;
+  majorGcMs: number;
 }
 
 const g = globalThis as unknown as { __pdGc?: GcState };
 
 export function startGcStats(): void {
   if (g.__pdGc) return;
-  const st: GcState = { majorGcs: 0, lastMajorAt: null, liveHeap: null, maxLiveHeap: 0 };
+  const st: GcState = { majorGcs: 0, lastMajorAt: null, liveHeap: null, maxLiveHeap: 0, gcMs: 0, majorGcMs: 0 };
   g.__pdGc = st;
   try {
     const obs = new PerformanceObserver((list) => {
       for (const e of list.getEntries()) {
         const kind = (e as { detail?: { kind?: number } }).detail?.kind;
+        st.gcMs += e.duration;
         if (kind !== constants.NODE_PERFORMANCE_GC_MAJOR) continue;
         st.majorGcs++;
+        st.majorGcMs += e.duration;
         st.lastMajorAt = Date.now();
         st.liveHeap = process.memoryUsage().heapUsed;
         st.maxLiveHeap = Math.max(st.maxLiveHeap, st.liveHeap);

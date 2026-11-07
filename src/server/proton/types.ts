@@ -185,7 +185,8 @@ export interface ProtonRuntime {
   startEvents(): Promise<void>;
   /** Stop event polling while idle (and drop the entity cache it kept coherent). */
   pauseEvents(): Promise<void>;
-  cacheStats(): { entities: number; entitiesBytes?: number; crypto: number; events: boolean };
+  /** keys: OpenPGP keys held by the crypto endpoint (stays near the cache sizes; growth = a key leak). */
+  cacheStats(): { entities: number; entitiesBytes?: number; crypto: number; keys?: number; events: boolean };
   /** Called by the runtime when Drive reports changes under a folder (cache invalidation). */
   onFolderChanged(cb: (folderUid: string) => void): void;
   /** Called whenever the runtime concludes the session is gone (refresh rejected). */

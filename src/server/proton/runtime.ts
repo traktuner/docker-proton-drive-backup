@@ -240,6 +240,54 @@ export function scopedSignal(parent?: AbortSignal): { signal: AbortSignal; dispo
   return { signal: ctrl.signal, dispose: () => parent?.removeEventListener('abort', relay) };
 }
 
+/**
+ * Crypto endpoint (PATCHES.md #8). The upstream endpoint keeps every key it imports
+ * or generates in its key store until clearKey(), and the SDK never calls clearKey:
+ * every decrypted Drive node — each file and folder a listing reads, each upload —
+ * stayed in memory for the life of the process (production: +600 MB live heap after
+ * 7 h of listing). The SDK reaches a key only through the reference object it got,
+ * so once that object is garbage collected nothing can use the key any more: then
+ * it is removed from the store. Keys the SDK still holds (cache, running work) stay.
+ */
+const KEY_METHODS = ['generateKey', 'reformatKey', 'importPrivateKey', 'importPublicKey', 'cloneKeyAndChangeUserIDs'] as const;
+
+class CryptoEndpoint extends CryptoApi {
+  private readonly unused = new FinalizationRegistry<number>((idx) => {
+    try {
+      this.keyStore.clear(idx);
+    } catch {
+      /* already gone: clearKeyStore() on logout */
+    }
+  });
+
+  constructor() {
+    super();
+    const self = this as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    for (const m of KEY_METHODS) {
+      const orig = self[m].bind(this);
+      self[m] = async (...a) => {
+        const ref = (await orig(...a)) as { _idx: number };
+        this.unused.register(ref, ref._idx);
+        return ref;
+      };
+    }
+  }
+
+  get keyCount(): number {
+    return (this.keyStore as unknown as { store: Map<number, unknown> }).store.size;
+  }
+}
+
+let endpoint: CryptoEndpoint | null = null;
+
+/** Keys currently held by the crypto endpoint (diagnostics). */
+export function cryptoKeyCount(): number {
+  return endpoint?.keyCount ?? 0;
+}
+
+/** For test/crypto-keystore.test.ts: drives the real endpoint the SDK uses. */
+export { CryptoProxy };
+
 /** EXIF lives in the file header for every format the SDK parses; never read whole images into RAM. */
 const EXIF_HEADER_BYTES = 256 * 1024;
 
@@ -415,7 +463,8 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   if (!cryptoReady) {
     // Process-wide singleton in @protontech/crypto: initialise exactly once.
     CryptoApi.init({});
-    CryptoProxy.setEndpoint(new CryptoApi(), (endpoint) => endpoint.clearKeyStore());
+    endpoint = new CryptoEndpoint();
+    CryptoProxy.setEndpoint(endpoint, (e) => e.clearKeyStore());
     cryptoReady = true;
   }
 
@@ -838,7 +887,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
       stopEvents();
       await entitiesCache.clear();
     },
-    cacheStats: () => ({ entities: entitiesCache.size, entitiesBytes: entitiesCache.bytes, crypto: cryptoCache.size, events: subscription !== null }),
+    cacheStats: () => ({ entities: entitiesCache.size, entitiesBytes: entitiesCache.bytes, crypto: cryptoCache.size, keys: cryptoKeyCount(), events: subscription !== null }),
     onFolderChanged: (cb) => void folderChangedCbs.add(cb),
     onSessionLost: (cb) => void lostCbs.add(cb),
     notices: () => [...notices],

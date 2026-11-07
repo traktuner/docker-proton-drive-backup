@@ -66,6 +66,28 @@ export class FakeDrive implements DriveService {
     throw new DriveError(f.code, `injected ${f.code} on ${op}`);
   }
 
+  async revisions(uid: string) {
+    const n = this.nodes.get(uid);
+    if (!n || n.kind !== 'file') throw new DriveError('NOT_FOUND', 'file not found');
+    return n.revisions
+      .map((r, i) => ({ uid: r.uid, active: i === n.revisions.length - 1, size: r.size, sha1: r.sha1, created: i }))
+      .reverse();
+  }
+
+  /** Writes the stored bytes of a revision ("decrypted download"); `corrupt` flips a byte for tests. */
+  corrupt = new Set<string>();
+  async download(revisionUid: string, destPath: string) {
+    for (const n of this.nodes.values()) {
+      const r = n.revisions.find((x) => x.uid === revisionUid);
+      if (!r) continue;
+      const buf = Buffer.from(r.content);
+      if (this.corrupt.has(n.name) && buf.length) buf[0] ^= 0xff;
+      (await import('node:fs')).writeFileSync(destPath, buf);
+      return buf.length;
+    }
+    throw new DriveError('NOT_FOUND', 'revision not found');
+  }
+
   private view(n: FNode): RemoteNode {
     const rev = n.revisions[n.revisions.length - 1];
     return {

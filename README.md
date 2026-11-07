@@ -209,6 +209,12 @@ Drive → followed; moved, deleted, or replaced by a new folder with the same na
 the run stops without writing and tells you. **Verify** re-checks the set (and, if
 the folder is really gone, starts the set over).
 
+**Test restore** (button on each set) proves a backup can be restored: it
+downloads 20 random backed-up files from Drive — decrypted exactly as a restore
+would — and compares them byte for byte with the originals. It changes nothing and
+can run during a backup (`POST /api/backup-sets/<id>/restore-test?files=N`, up to
+200; files over 512 MiB are not sampled).
+
 ## What gets skipped (a backup is never stopped by one bad file)
 
 A backup **never pauses or aborts** because of an individual file. If a single

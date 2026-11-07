@@ -81,6 +81,8 @@ const SQL = {
     (SELECT rel FROM listed_dirs l2 WHERE l2.set_id = l.set_id ORDER BY listed_at DESC LIMIT 1) AS lastRel
     FROM listed_dirs l GROUP BY set_id`,
   anyBelow: 'SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ? LIMIT 1',
+  sampleFiles: `SELECT rel, size, mtime_ms, sha1, node_uid FROM backup_catalog
+       WHERE set_id = ? AND kind = 'file' AND node_uid IS NOT NULL AND size <= ? ORDER BY random() LIMIT ?`,
   countBelow: 'SELECT COUNT(*) AS n FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ?',
 } as const;
 
@@ -294,6 +296,14 @@ export const catalog = {
   parts(setId: string, rel: string): { part: number; nodeUid: string }[] {
     ensure();
     return (stmt(SQL.parts).all(setId, rel) as { part: number; node_uid: string }[]).map((r) => ({ part: r.part, nodeUid: r.node_uid }));
+  },
+
+  /** A random sample of recorded files with a Drive node (restore test). */
+  sampleFiles(setId: string, n: number, maxSize: number): { rel: string; size: number; mtimeMs: number; sha1: string | null; nodeUid: string }[] {
+    ensure();
+    return (stmt(SQL.sampleFiles).all(setId, maxSize, n) as { rel: string; size: number; mtime_ms: number; sha1: string | null; node_uid: string }[]).map(
+      (r) => ({ rel: r.rel, size: r.size, mtimeMs: r.mtime_ms, sha1: r.sha1, nodeUid: r.node_uid }),
+    );
   },
 
   /** Number of catalog rows below folder `rel` (index range scan). */

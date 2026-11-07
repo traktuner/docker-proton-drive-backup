@@ -279,6 +279,29 @@ export default function BackupSets({
       load();
     }
   };
+  // Restore test: download a sample of backed-up files and compare them with the originals.
+  const [restoring, setRestoring] = useState<Set<string>>(new Set());
+  const testRestore = async (id: string) => {
+    const name = sets.find((s) => s.id === id)?.name;
+    setRestoring((prev) => new Set(prev).add(id));
+    toast(`Restore test${name ? ` for “${name}”` : ''}: downloading 20 random files from Drive…`, 'info');
+    try {
+      const res = await fetch(`/api/backup-sets/${id}/restore-test?files=20`, { method: 'POST' });
+      const d = await res.json();
+      if (d.error) throw new Error(d.error);
+      toast(d.message, d.ok ? 'success' : d.tested === 0 ? 'info' : 'error');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast(msg, 'error');
+      reportAuthError(msg);
+    } finally {
+      setRestoring((prev) => {
+        const n = new Set(prev);
+        n.delete(id);
+        return n;
+      });
+    }
+  };
   const closePreview = (id: string) =>
     setPreviews((prev) => {
       if (!prev[id]) return prev;
@@ -853,6 +876,14 @@ export default function BackupSets({
                         title="Reconcile the catalog against Drive — re-upload anything deleted or changed there. Shift-click: also compare every file's content (SHA-1) with Drive (reads all files)."
                       >
                         {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
+                      </button>
+                      <button
+                        onClick={() => testRestore(s.id)}
+                        disabled={restoring.has(s.id)}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title="Restore test — download 20 random backed-up files from Drive and compare them byte for byte with the originals. Changes nothing; works during a backup."
+                      >
+                        {restoring.has(s.id) ? 'Testing…' : 'Test restore'}
                       </button>
                       {s.mode === 'mirror' && s.lastStatus === 'error' && /confirm (the deletion )?in the set's row/.test(s.lastMessage ?? '') && (
                         <button

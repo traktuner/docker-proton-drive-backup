@@ -1779,3 +1779,81 @@ function localAbsFor(spec: RunSpec, rel: string): string | null {
   }
   return null;
 }
+
+/* ------------------------------------------------------------------ */
+/* Restore test                                                         */
+/* ------------------------------------------------------------------ */
+
+export interface RestoreTestResult {
+  ok: boolean;
+  /** Files downloaded and compared. */
+  tested: number;
+  /** Downloaded bytes identical to the local file (and to the digest recorded at upload). */
+  identical: number;
+  /** Downloaded content differs: this is a real problem. */
+  mismatched: { rel: string; reason: string }[];
+  /** Not comparable: the local file changed or is gone since the backup. */
+  skipped: number;
+  bytes: number;
+  message: string;
+}
+
+/**
+ * Proves that backups can be restored: downloads a random sample of backed-up
+ * files from Drive (decrypting them exactly as a restore would), and compares the
+ * bytes with the local file. Read-only on Drive and on the catalog; the download
+ * goes to a private temp file that is deleted right away.
+ */
+export async function restoreTest(
+  drive: DriveService,
+  spec: RunSpec,
+  opts: { files?: number; maxFileBytes?: number; tmpDir?: string; shouldCancel?: () => boolean } = {},
+): Promise<RestoreTestResult> {
+  const n = Math.min(200, Math.max(1, opts.files ?? 20));
+  const maxFileBytes = opts.maxFileBytes ?? 512 * 1024 * 1024;
+  const res: RestoreTestResult = { ok: false, tested: 0, identical: 0, mismatched: [], skipped: 0, bytes: 0, message: '' };
+  if (!drive.download || !drive.revisions) {
+    res.message = 'This build cannot download from Drive.';
+    return res;
+  }
+  const os = await import('node:os');
+  const dir = await fsp.mkdtemp(path.join(opts.tmpDir ?? os.tmpdir(), 'pdb-restore-'));
+  try {
+    for (const row of catalog.sampleFiles(spec.setId, n, maxFileBytes)) {
+      if (opts.shouldCancel?.()) break;
+      const abs = localAbsFor(spec, row.rel);
+      const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+      // Only a local file that still matches the catalog can be compared byte for byte.
+      if (!st || !st.isFile() || st.size !== row.size || Math.abs(st.mtimeMs - row.mtimeMs) > 2000) {
+        res.skipped++;
+        continue;
+      }
+      res.tested++;
+      try {
+        const revs = await drive.revisions(row.nodeUid);
+        const active = revs.find((r) => r.active);
+        if (!active) throw new Error('no active revision on Drive');
+        const tmp = path.join(dir, 'file');
+        const written = await drive.download(active.uid, tmp);
+        res.bytes += written;
+        const [got, local] = await Promise.all([sha1File(tmp), sha1File(abs!)]);
+        await fsp.rm(tmp, { force: true });
+        if (got !== local) res.mismatched.push({ rel: row.rel, reason: 'downloaded content differs from the local file' });
+        else if (row.sha1 && got !== row.sha1) res.mismatched.push({ rel: row.rel, reason: 'downloaded content differs from what was uploaded' });
+        else res.identical++;
+      } catch (e) {
+        res.mismatched.push({ rel: row.rel, reason: e instanceof Error ? e.message : String(e) });
+      }
+    }
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+  res.ok = res.tested > 0 && res.mismatched.length === 0;
+  res.message =
+    res.tested === 0
+      ? 'Nothing to test yet (no backed-up file that is still unchanged locally).'
+      : res.mismatched.length === 0
+        ? `Restore test passed: ${res.identical} of ${res.tested} files downloaded and byte-identical to the originals.`
+        : `Restore test FAILED for ${res.mismatched.length} of ${res.tested} files (e.g. “${path.basename(res.mismatched[0].rel)}” — ${res.mismatched[0].reason}).`;
+  return res;
+}

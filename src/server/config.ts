@@ -44,7 +44,6 @@ export function exportConfig(): string {
     if (s.excludes.length) item.excludes = s.excludes;
     if (s.skipThumbnails) item.skipThumbnails = true;
     if (s.includeHidden) item.includeHidden = true;
-    if (s.watch) item.watch = true;
     return item;
   });
   return YAML.stringify({ version: 1, backupSets: sets });
@@ -109,7 +108,6 @@ export function importConfig(text: string): ImportResult {
       excludes: Array.isArray(raw?.excludes) ? raw.excludes.map(String) : [],
       skipThumbnails: raw?.skipThumbnails === true,
       includeHidden: raw?.includeHidden === true,
-      watch: raw?.watch === true,
     };
 
     const dupe = existing.find((e) => e.name === name);
@@ -157,7 +155,6 @@ export function importConfig(text: string): ImportResult {
       if (!has('excludes')) payload.excludes = dupe.excludes;
       if (!has('skipThumbnails')) payload.skipThumbnails = dupe.skipThumbnails;
       if (!has('includeHidden')) payload.includeHidden = dupe.includeHidden;
-      if (!has('watch')) payload.watch = dupe.watch;
 
       // A source addition keeps every retained catalog key valid. Only moving the
       // Drive target invalidates the catalog and still requires a rebuild.
@@ -183,10 +180,10 @@ export function importConfig(text: string): ImportResult {
 export function autoImportFromConfigDir(): void {
   const dir = process.env.CONFIG_DIR || '/config';
   for (const name of ['backup-sets.yaml', 'backup-sets.yml', 'backup-sets.json']) {
-    const p = path.join(dir, name);
+    const p = path.join(/*turbopackIgnore: true*/ dir, name);
     let text: string;
     try {
-      text = fs.readFileSync(p, 'utf8');
+      text = fs.readFileSync(/*turbopackIgnore: true*/ p, 'utf8');
     } catch {
       continue; // not present
     }

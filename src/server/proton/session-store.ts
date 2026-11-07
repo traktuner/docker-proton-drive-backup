@@ -23,7 +23,7 @@ import path from 'node:path';
  * truncated session behind — the old CLI wrote in place.
  */
 
-export const SESSION_FILE = 'auth-session.json';
+const SESSION_FILE = 'auth-session.json';
 
 export interface StoredSession {
   userKeyPassword: string;

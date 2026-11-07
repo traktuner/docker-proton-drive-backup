@@ -9,7 +9,7 @@ import StorageBar from '@/components/StorageBar';
 import Settings from '@/components/Settings';
 import { useToast } from '@/components/Toast';
 import { useAuth } from '@/components/AuthProvider';
-import { formatBytes } from '@/lib/format';
+import { formatBytes, sanitizeSegment, targetLabel } from '@/lib/format';
 import { DOW, DOW_ORDER } from '@/lib/schedule';
 
 type Mode = 'add' | 'backup' | 'mirror';
@@ -405,11 +405,11 @@ export default function FilesPage() {
     }
   };
 
-  const targetLabel = targetPath === '/' ? 'Drive (root)' : `Drive${targetPath}`;
+  const targetText = targetLabel(targetPath);
   // Preview of the set's top-level Drive folder (mirrors server sanitizeSegment).
   // An explicit subfolder override wins; otherwise it's derived from the set name.
   // eslint-disable-next-line no-control-regex
-  const previewFolder = (subfolder.trim() || name).replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
+  const previewFolder = sanitizeSegment(subfolder.trim() || name);
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -552,7 +552,7 @@ export default function FilesPage() {
                       {sources.length} source{sources.length === 1 ? '' : 's'}
                     </span>
                     <span className="text-[color:var(--muted)]">→</span>
-                    <span className="font-medium text-[color:var(--accent-2)]">{targetLabel}</span>
+                    <span className="font-medium text-[color:var(--accent-2)]">{targetText}</span>
                   </div>
                   <div className="tnum mt-1.5 flex items-center gap-2 text-[0.8125rem] text-[color:var(--muted)]">
                     {estimate.counting && (
@@ -590,10 +590,10 @@ export default function FilesPage() {
                 className="w-full pfield px-3 py-2 text-base sm:text-sm"
               />
               {(name.trim() || subfolder.trim()) && (
-                <p className="clip text-xs text-[color:var(--muted)]" title={`${targetLabel}/${previewFolder}/…`}>
+                <p className="clip text-xs text-[color:var(--muted)]" title={`${targetText}/${previewFolder}/…`}>
                   Saved to{' '}
                   <span className="text-[color:var(--accent-2)]">
-                    {targetLabel}/{previewFolder}/…
+                    {targetText}/{previewFolder}/…
                   </span>{' '}
                   — each source keeps its folder path, so same-named folders never collide.
                 </p>

@@ -1,71 +1,27 @@
 'use client';
 
+import type { BackupSet as StoredSet } from '@/server/db';
+import type { Progress } from '@/server/progress';
+import type { RunRow } from '@/server/runs';
+import type { PreviewResult as EnginePreview } from '@/server/engine';
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useToast } from './Toast';
 import { useAuth } from './AuthProvider';
-import { formatBytes } from '@/lib/format';
+import { formatBytes, sanitizeSegment, targetLabel } from '@/lib/format';
 import { DOW, DOW_ORDER, pad } from '@/lib/schedule';
 
-export interface SkippedFile {
-  rel: string;
-  reason: string;
-}
-export interface RunRow {
-  id: number;
-  startedAt: number;
-  finishedAt: number;
-  status: 'success' | 'error' | 'cancelled';
-  message: string | null;
-  files: number;
-  bytes: number;
-  skipped?: SkippedFile[];
-}
-
-export interface BackupSet {
-  id: string;
-  name: string;
-  sourcePaths: string[];
-  targetPath: string;
-  targetSubfolder: string;
-  mode: 'add' | 'backup' | 'mirror';
-  schedule: 'off' | 'hourly' | 'daily' | 'weekly';
-  scheduleHour: number;
-  scheduleMinute: number;
-  scheduleDow: number;
-  excludes: string[];
-  skipThumbnails: boolean;
-  includeHidden: boolean;
-  watch: boolean;
-  lastRunAt: number | null;
-  lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
-  lastMessage: string | null;
+/** A set as GET /api/backup-sets returns it: the stored set plus live status. */
+interface BackupSet extends Omit<StoredSet, 'folderUid' | 'sourceMarks'> {
   nextRunAt?: number | null;
   recentRuns?: RunRow[];
   lastSuccessAt?: number | null;
   /** Local folders continued in "<name> · part N" on Drive (parts = highest part number). */
   splitFolders?: { rel: string; parts: number }[];
-  progress?: {
-    doneFiles: number;
-    totalFiles: number;
-    doneBytes: number;
-    totalBytes: number;
-    current: string;
-    bytesPerSec?: number;
-  } | null;
+  progress?: Progress | null;
 }
 
-interface PreviewResult {
-  mode: 'backup' | 'mirror';
-  wouldUploadCount: number;
-  wouldUploadBytes: number;
-  unchangedCount: number;
-  wouldDelete: string[];
-  wouldDeleteCount: number;
-  wouldDeleteTruncated: boolean;
-  deletionWouldSkip: string | null;
-  message: string;
-}
+type PreviewResult = Omit<EnginePreview, 'ok' | 'newCount' | 'changedCount'>;
 
 function fmtWhen(ts: number): string {
   const d = new Date(ts);
@@ -121,7 +77,6 @@ function scheduleLabel(s: BackupSet): string {
         ? `${DOW[s.scheduleDow]} ${t}`
         : 'manual';
 }
-const targetLabel = (p: string) => (p === '/' ? 'Drive (root)' : `Drive${p}`);
 
 function cleanPath(value: string): string {
   const clean = value.replace(/\/+/g, '/').replace(/\/$/, '');
@@ -156,10 +111,6 @@ function excludesForSources(excludes: string[], sources: string[]): string[] {
 }
 
 /** Live preview of the Drive folder name — mirrors the server's sanitizeSegment. */
-function sanitizePreview(name: string): string {
-  // eslint-disable-next-line no-control-regex
-  return (name || '').replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
-}
 
 export default function BackupSets({
   refreshKey,
@@ -384,7 +335,6 @@ export default function BackupSets({
       excludes: draft.excludes,
       skipThumbnails: draft.skipThumbnails,
       includeHidden: draft.includeHidden,
-      watch: draft.watch,
       // Changing this renames the Drive folder + rewrites catalog keys server-side.
       targetSubfolder: draft.targetSubfolder,
     };
@@ -451,9 +401,9 @@ export default function BackupSets({
                   <p className="clip text-xs text-[color:var(--muted)]">
                     Files go to{' '}
                     <span className="text-[color:var(--accent-2)]">
-                      {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizePreview(draft.targetSubfolder ?? '')}/…
+                      {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizeSegment(draft.targetSubfolder ?? '')}/…
                     </span>
-                    {sanitizePreview(draft.targetSubfolder ?? '') !== s.targetSubfolder && (
+                    {sanitizeSegment(draft.targetSubfolder ?? '') !== s.targetSubfolder && (
                       <span className="text-[color:var(--signal-warning)]"> · renames the Drive folder on save</span>
                     )}
                   </p>

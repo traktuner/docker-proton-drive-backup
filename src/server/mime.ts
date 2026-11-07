@@ -1,8 +1,8 @@
 import path from 'node:path';
 
 /**
- * Media type by file extension (case-insensitive), like the official CLI does via
- * Bun.file().type. Drive uses it for previews and thumbnails; unknown types are
+ * Media type by file extension (case-insensitive), the same mapping the official
+ * Proton CLI uses. Drive uses it for previews and thumbnails; unknown types are
  * uploaded as application/octet-stream, which is always valid.
  */
 const TYPES: Record<string, string> = {

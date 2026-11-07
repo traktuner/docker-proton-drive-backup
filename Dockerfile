@@ -39,15 +39,14 @@ COPY --from=builder /app/node_modules/sharp ./node_modules/sharp
 COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
 COPY --from=builder /app/node_modules/semver ./node_modules/semver
-RUN rm -rf src Dockerfile README.md docker-compose.yml docker-entrypoint.sh scripts test \
-    tsconfig*.json package-lock.json postcss.config.mjs vitest.config.ts .dockerignore
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
-# Build metadata. APP_VERSION = git sha (diagnostics); IMAGE_TAG = "<app>-<rev>"
-# (update check); SDK_VERSION/SDK_COMMIT label the image (the running app reports
-# the values compiled into the SDK bundle itself).
+# Build metadata. APP_VERSION = git sha (diagnostics); IMAGE_TAG = "1.2.3" for a
+# release, "1.2.3-preview.<sha>"/"1.2.3-edge.<sha>" otherwise (docs/RELEASING.md);
+# SDK_VERSION/SDK_COMMIT label the image (the app reports the values compiled into
+# the SDK bundle itself).
 ARG APP_VERSION=dev
 ARG IMAGE_TAG=dev
 ARG APP_RELEASE=dev

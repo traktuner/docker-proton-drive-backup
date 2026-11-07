@@ -8,7 +8,7 @@ import {
 } from 'node:fs';
 import { LOCAL_ROOT, resolveLocal } from './local';
 
-export const MAX_SOURCES_PER_SET = 256;
+const MAX_SOURCES_PER_SET = 256;
 const MAX_SOURCE_PATH_LENGTH = 4096;
 
 export class SourceValidationError extends Error {
@@ -21,7 +21,7 @@ export class SourceValidationError extends Error {
 }
 
 /** Resolve relative browser paths and stored absolute paths under LOCAL_ROOT. */
-export function resolveSourcePath(value: unknown): string {
+function resolveSourcePath(value: unknown): string {
   if (typeof value !== 'string' || !value.trim()) {
     throw new SourceValidationError('Every source must be a non-empty path.');
   }

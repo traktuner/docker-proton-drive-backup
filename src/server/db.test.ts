@@ -16,7 +16,6 @@ describe('backupSets store', () => {
     expect(s.schedule).toBe('off');
     expect(s.skipThumbnails).toBe(false);
     expect(s.includeHidden).toBe(false);
-    expect(s.watch).toBe(false);
     expect(s.targetSubfolder).toBe('Photos');
     expect(s.lastStatus).toBe('never');
     expect(backupSets.get(s.id)?.name).toBe('Photos');
@@ -58,12 +57,11 @@ describe('backupSets store', () => {
     expect(c.targetSubfolder).toBe('Photos');
   });
 
-  it('persists skipThumbnails / watch through update', () => {
+  it('persists skipThumbnails through update', () => {
     const s = backupSets.create({ name: 'A', sourcePaths: ['/x'], targetPath: '/' });
-    backupSets.update(s.id, { skipThumbnails: true, watch: true, name: 'A renamed' });
+    backupSets.update(s.id, { skipThumbnails: true, name: 'A renamed' });
     const got = backupSets.get(s.id)!;
     expect(got.skipThumbnails).toBe(true);
-    expect(got.watch).toBe(true);
     expect(got.name).toBe('A renamed');
     // rename keeps the Drive subfolder stable (no re-upload)
     expect(got.targetSubfolder).toBe('A');

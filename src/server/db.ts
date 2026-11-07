@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { normalizeProtonPath } from '../lib/proton-path';
 import { nanoid } from 'nanoid';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -30,12 +31,10 @@ export interface BackupSet {
   scheduleMinute: number; // 0-59
   scheduleDow: number; // 0=Sun..6=Sat, for weekly
   excludes: string[]; // glob patterns to skip (backup/mirror modes)
-  /** Skip generating Drive thumbnails for uploaded files (CLI `-t`). Faster, no previews. */
+  /** Skip generating Drive thumbnails for uploaded images. Faster, no previews. */
   skipThumbnails: boolean;
   /** Include hidden dotfiles/dotfolders in the backup (default off — they're skipped). */
   includeHidden: boolean;
-  /** Auto-run on local file changes (debounced) instead of only on schedule. */
-  watch: boolean;
   /**
    * Drive node uid of `<targetPath>/<targetSubfolder>` as last confirmed by a run.
    * A different node at the same path (folder deleted and re-created, or a rename
@@ -62,10 +61,8 @@ interface Row {
   schedule_minute: number;
   schedule_dow: number;
   excludes: string | null;
-  ping_url: string | null;
   skip_thumbnails: number | null;
   include_hidden: number | null;
-  watch: number | null;
   folder_uid: string | null;
   source_marks: string | null;
   last_run_at: number | null;
@@ -89,10 +86,10 @@ let _db: DatabaseSync | null = null;
  *     the same file after a rollback (it ignores columns and tables it does not
  *     know, and every one of its statements names its columns explicitly).
  */
-export const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 3;
 
 /** Path of the one-time pre-migration snapshot next to the DB. */
-export function preMigrationBackupPath(): string {
+function preMigrationBackupPath(): string {
   return `${DB_PATH}.pre-sdk.bak`;
 }
 
@@ -120,19 +117,6 @@ export function getDb(): DatabaseSync {
   return db;
 }
 
-/** Close the connection (tests and graceful shutdown). */
-export function closeDb(): void {
-  if (_db) {
-    try {
-      _db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    } catch {
-      /* best-effort */
-    }
-    _db.close();
-    _db = null;
-    stmtCache.clear();
-  }
-}
 
 /** The CLI-era schema, created idempotently exactly as every 0.x release did. */
 function createBaseSchema(db: DatabaseSync) {
@@ -352,7 +336,6 @@ function rowToSet(r: Row): BackupSet {
     excludes: JSON.parse(r.excludes || '[]'),
     skipThumbnails: !!r.skip_thumbnails,
     includeHidden: !!r.include_hidden,
-    watch: !!r.watch,
     folderUid: r.folder_uid ?? null,
     sourceMarks: parseMarks(r.source_marks),
     lastRunAt: r.last_run_at,
@@ -376,18 +359,8 @@ export interface CreateBackupSet {
   excludes?: string[];
   skipThumbnails?: boolean;
   includeHidden?: boolean;
-  watch?: boolean;
 }
 
-/**
- * One spelling per Drive location ("/Backups", "/my-files/Backups/" and
- * "Backups" are the same folder), so two sets can never share a Drive folder.
- */
-export function sameTarget(p: string): string {
-  const segs = (p || '/').trim().split('/').filter(Boolean);
-  if (segs[0] === 'my-files') segs.shift();
-  return '/' + segs.join('/');
-}
 
 export const backupSets = {
   all(): BackupSet[] {
@@ -408,10 +381,10 @@ export const backupSets = {
    * top-level folder.
    */
   uniqueSubfolder(desired: string, targetPath: string, exceptId?: string): string {
-    const t = sameTarget(targetPath);
+    const t = normalizeProtonPath(targetPath);
     const taken = new Set(
       this.all()
-        .filter((s) => s.id !== exceptId && sameTarget(s.targetPath) === t)
+        .filter((s) => s.id !== exceptId && normalizeProtonPath(s.targetPath) === t)
         .map((s) => s.targetSubfolder),
     );
     if (!taken.has(desired)) return desired;
@@ -447,7 +420,7 @@ export const backupSets = {
         JSON.stringify(input.excludes ?? []),
         input.skipThumbnails ? 1 : 0,
         input.includeHidden ? 1 : 0,
-        input.watch ? 1 : 0,
+        0, // watch: never implemented; the column stays for older releases
         Date.now(),
       );
     return this.get(id)!;
@@ -468,14 +441,13 @@ export const backupSets = {
       excludes: patch.excludes ?? cur.excludes,
       skipThumbnails: patch.skipThumbnails ?? cur.skipThumbnails,
       includeHidden: patch.includeHidden ?? cur.includeHidden,
-      watch: patch.watch ?? cur.watch,
     };
     getDb()
       .prepare(
         `UPDATE backup_sets SET
            name = ?, source_paths = ?, target_path = ?, mode = ?,
            schedule = ?, schedule_hour = ?, schedule_minute = ?, schedule_dow = ?, excludes = ?,
-           skip_thumbnails = ?, include_hidden = ?, watch = ?
+           skip_thumbnails = ?, include_hidden = ?
          WHERE id = ?`,
       )
       .run(
@@ -490,7 +462,6 @@ export const backupSets = {
         JSON.stringify(next.excludes),
         next.skipThumbnails ? 1 : 0,
         next.includeHidden ? 1 : 0,
-        next.watch ? 1 : 0,
         id,
       );
     return this.get(id);

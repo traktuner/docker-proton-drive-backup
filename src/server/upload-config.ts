@@ -2,20 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /**
- * Global upload tuning (persisted as JSON next to the DB).
- *  - concurrency: how many uploads run in parallel (1-8). Each is its own
- *    `proton-drive upload` process (which itself does ~4 internal streams), so a
- *    higher number is faster but heavier on the connection and likelier to hit
- *    Proton rate limits. The engine re-reads this live, so a change takes effect
- *    on the next batch of a running backup (graceful up/down-scaling), not just on
- *    the next run.
+ * Global upload tuning (persisted as JSON next to the DB). The engine re-reads it
+ * about once a second, so a change applies during a running backup.
+ *  - concurrency: files uploaded in parallel (1-5).
+ *  - limitKBps: read-speed cap for uploads (traffic.ts); 0 = off.
  */
 const FILE = path.join(path.dirname(process.env.DB_PATH || '/data/backup.db'), 'upload-config.json');
 
 export interface UploadConfig {
   concurrency: number;
-  /** Upload speed cap in KB/s. 0 = unlimited (off). Enforced via tc (see traffic.ts)
-   *  and only when the container has NET_ADMIN. */
+  /** Upload speed cap in KB/s. 0 = unlimited (off). Enforced in-app (traffic.ts). */
   limitKBps: number;
 }
 
@@ -23,8 +19,8 @@ const MIN = 1;
 // The SDK itself never runs more than 5 file uploads (and 40 MiB of file data) at
 // once (internal/upload/queue.ts), so higher values would only queue in memory.
 const MAX = 5;
-// Speed-cap floor: a too-low cap would starve the CLI's own API/control traffic and
-// risk Proton-side timeouts, so anything above 0 is clamped up to this.
+// Speed-cap floor: a very low cap makes block uploads time out at Proton, so
+// anything above 0 is clamped up to this.
 const MIN_KBPS = 50;
 const MAX_KBPS = 1_000_000; // ~8 Gbps — a sanity ceiling, effectively unlimited
 const DEFAULTS: UploadConfig = { concurrency: 2, limitKBps: 0 };

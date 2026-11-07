@@ -64,7 +64,7 @@ async function tick() {
       const s = backupSets.get(s0.id);
       if (!s || !isDue(s, new Date())) continue;
       console.log('[scheduler] running backup set %s (%s)', s.name, s.id);
-      await runBackupSet(s.id); // serialized via the CLI mutex anyway
+      await runBackupSet(s.id); // runs one after the other (runner queue)
     }
   } catch (e) {
     console.error('[scheduler] tick error', e);

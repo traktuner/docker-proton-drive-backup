@@ -31,8 +31,3 @@ export function makeThrottle(limitKBps: () => number) {
     }
   };
 }
-
-/** Upload config for the UI. The limit is always enforceable now. */
-export function uploadsView() {
-  return { ...getUploadConfig(), canShape: true, shapeReason: '' };
-}

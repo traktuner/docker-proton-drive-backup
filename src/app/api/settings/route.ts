@@ -1,8 +1,8 @@
+import { getUploadConfig } from '@/server/upload-config';
 import path from 'node:path';
 import { versions } from '@/server/drive';
 import { LOCAL_ROOT } from '@/server/local';
 import { getUserInfo } from '@/server/quota';
-import { uploadsView } from '@/server/traffic';
 import { getMirrorSafetyConfig } from '@/server/mirror-safety';
 
 export const dynamic = 'force-dynamic';
@@ -10,7 +10,7 @@ export const dynamic = 'force-dynamic';
 export async function GET() {
   const [v, user] = await Promise.all([versions(), getUserInfo()]);
   return Response.json({
-    uploads: uploadsView(),
+    uploads: getUploadConfig(),
     mirrorSafety: getMirrorSafetyConfig(),
     app: v.app,
     build: process.env.APP_VERSION || 'dev',

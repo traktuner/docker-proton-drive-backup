@@ -4,6 +4,7 @@ import { createReadStream, promises as fsp } from 'node:fs';
 import { walkSourceStream, relToLocalRoot, sourceMark } from './local';
 import { catalog, diffFile, type CatalogEntry, type CatalogFile } from './catalog';
 import { backupSets, type SourceMark } from './db';
+import type { SkippedFile } from './runs';
 import { getUploadConfig } from './upload-config';
 import { getMirrorSafetyConfig } from './mirror-safety';
 import { mediaTypeFor } from './mime';
@@ -42,10 +43,6 @@ import { DriveError, driveErrorCode, type DriveService, type RemoteNode } from '
  *     final write/trash calls are skipped.
  */
 
-export interface SkippedFile {
-  rel: string;
-  reason: string;
-}
 
 export interface DeltaResult {
   ok: boolean;
@@ -128,7 +125,7 @@ function globToRegExp(glob: string): RegExp {
 }
 
 /** True if rel (or its basename, or any path segment) matches an exclude glob. */
-export function makeExcluder(patterns: string[]): (rel: string) => boolean {
+function makeExcluder(patterns: string[]): (rel: string) => boolean {
   const res = patterns.filter((p) => p.trim()).map(globToRegExp);
   if (res.length === 0) return () => false;
   return (rel: string) => {
@@ -154,7 +151,7 @@ export function topMost<T extends { rel: string }>(entries: T[]): T[] {
   return entries.filter((e) => !hasAncestorIn(e.rel, all, false));
 }
 
-export function sha1File(abs: string): Promise<string> {
+function sha1File(abs: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const h = createHash('sha1');
     const s = createReadStream(abs, { highWaterMark: 1 << 20 });
@@ -212,7 +209,7 @@ class Fifo<T> {
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 160);
 
 /** Human reason for one file's failure (run summary / skipped-files panel). */
-export function describeUploadError(e: unknown): string {
+function describeUploadError(e: unknown): string {
   const code = driveErrorCode(e);
   const fsCode = code ? undefined : (e as NodeJS.ErrnoException)?.code;
   if (fsCode && /^E[A-Z]+$/.test(fsCode)) return `not readable (${fsCode})`;
@@ -1023,7 +1020,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
           }
           if (ctx.partOwner(n.uid)) return null; // a continuation folder, not a local one
           const abs = localAbsFor(spec, childRel);
-          const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+          const st = abs ? await fsp.stat(/*turbopackIgnore: true*/ abs).catch(() => null) : null;
           if (st?.isDirectory()) dirs.push({ rel: childRel, n });
           return null;
         }
@@ -1033,7 +1030,7 @@ async function runSetImpl(drive: DriveService, specIn: RunSpec, hooks: RunHooks)
           return null;
         }
         const abs = localAbsFor(spec, childRel);
-        const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+        const st = abs ? await fsp.stat(/*turbopackIgnore: true*/ abs).catch(() => null) : null;
         return st && st.isFile() && st.size === n.size && n.mtimeMs !== null && Math.abs(st.mtimeMs - n.mtimeMs) <= 2000
           ? { fileRel: childRel, size: st.size, mtimeMs: st.mtimeMs, n }
           : null;
@@ -1822,7 +1819,7 @@ export async function restoreTest(
     for (const row of catalog.sampleFiles(spec.setId, n, maxFileBytes)) {
       if (opts.shouldCancel?.()) break;
       const abs = localAbsFor(spec, row.rel);
-      const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+      const st = abs ? await fsp.stat(/*turbopackIgnore: true*/ abs).catch(() => null) : null;
       // Only a local file that still matches the catalog can be compared byte for byte.
       if (!st || !st.isFile() || st.size !== row.size || Math.abs(st.mtimeMs - row.mtimeMs) > 2000) {
         res.skipped++;

@@ -4,6 +4,9 @@ import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { backupSets, meta } from './db';
 import { startGcStats } from './gc-stats';
+import { PROTON_ROOT, normalizeProtonPath } from '../lib/proton-path';
+
+export { normalizeProtonPath };
 import {
   driveErrorCode,
   DriveError,
@@ -32,7 +35,6 @@ startGcStats(); // diagnostics: live heap after major GCs, from process start
  *    were created with.
  */
 
-export const PROTON_ROOT = '/my-files';
 export const SESSION_DIR = process.env.PROTON_DRIVE_CACHE_DIR || '/data/proton';
 const RUNTIME_PATH = process.env.PROTON_RUNTIME || path.join(process.cwd(), 'dist-proton/runtime.mjs');
 export const APP_VERSION = process.env.APP_RELEASE || readPackageVersion();
@@ -41,7 +43,7 @@ const APP_BUILD = (process.env.APP_VERSION || '').slice(0, 12);
 function readPackageVersion(): string {
   for (const p of [path.join(process.cwd(), 'package.json'), path.join(__dirname, '../../package.json')]) {
     try {
-      const v = JSON.parse(fs.readFileSync(p, 'utf8')).version;
+      const v = JSON.parse(fs.readFileSync(/*turbopackIgnore: true*/ p, 'utf8')).version;
       if (typeof v === 'string') return v;
     } catch {
       /* next candidate */
@@ -145,13 +147,6 @@ export const uploadsBusy = () => busy.v > 0;
 /* ------------------------------------------------------------------ */
 /* Paths and the folder-name index                                     */
 /* ------------------------------------------------------------------ */
-
-/** Normalise a user-supplied Proton path to an absolute /my-files path. */
-export function normalizeProtonPath(p: string): string {
-  if (!p || p === '/' || p === PROTON_ROOT) return PROTON_ROOT;
-  if (p === PROTON_ROOT || p.startsWith(PROTON_ROOT + '/')) return p.replace(/\/+$/, '');
-  return `${PROTON_ROOT}/${p.replace(/^\/+/, '').replace(/\/+$/, '')}`;
-}
 
 function segments(p: string): string[] {
   const n = normalizeProtonPath(p);
@@ -288,14 +283,6 @@ export async function renameDrive(p: string, newName: string): Promise<OpResult<
   }
 }
 
-/** true = exists, false = Drive confirmed it does not, null = could not tell. */
-export async function drivePathExists(p: string): Promise<boolean | null> {
-  try {
-    return (await resolvePath(p, true)) !== null;
-  } catch {
-    return null;
-  }
-}
 
 /** Map any Drive error to a user-safe message (never echoes raw server text). */
 export function cleanDriveError(e: unknown, code?: string | null): string {

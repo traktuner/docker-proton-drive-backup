@@ -20,7 +20,7 @@ export interface LocalEntry {
 /** Resolve a relative path safely inside LOCAL_ROOT (no traversal escape). */
 export function resolveLocal(relPath: string): string {
   const clean = path.normalize('/' + (relPath || '')).replace(/^(\.\.(\/|\\|$))+/, '');
-  const abs = path.join(LOCAL_ROOT, clean);
+  const abs = path.join(/*turbopackIgnore: true*/ LOCAL_ROOT, clean);
   if (abs !== LOCAL_ROOT && !abs.startsWith(LOCAL_ROOT + path.sep)) {
     throw new Error('Path escapes LOCAL_ROOT');
   }
@@ -38,19 +38,7 @@ export function relToLocalRoot(abs: string): string {
   return rel.replace(/^\/+/, '');
 }
 
-/**
- * Reduce an arbitrary string (a backup set's name) to exactly one safe Drive path
- * segment, used as the set's top-level folder. Slashes and control chars become
- * '-', surrounding dots/whitespace are trimmed, and an empty result falls back to
- * 'set' so we always have a usable folder name.
- */
-export function sanitizeSegment(name: string): string {
-  const seg = (name || '')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[/\\\x00-\x1f]+/g, '-') // path separators + control chars -> '-'
-    .replace(/^[.\s]+|[.\s]+$/g, ''); // trim leading/trailing dots & whitespace
-  return seg || 'set';
-}
+export { sanitizeSegment } from '../lib/format';
 
 export interface WalkedFile {
   abs: string;
@@ -246,7 +234,7 @@ export async function listLocal(relPath: string): Promise<LocalEntry[]> {
   const abs = resolveLocal(relPath);
   let dirents;
   try {
-    dirents = await fs.readdir(abs, { withFileTypes: true });
+    dirents = await fs.readdir(/*turbopackIgnore: true*/ abs, { withFileTypes: true });
   } catch (e: any) {
     if (e.code === 'ENOENT') {
       // Root not mounted yet - return empty rather than crashing.
@@ -260,7 +248,7 @@ export async function listLocal(relPath: string): Promise<LocalEntry[]> {
     dirents
       .filter((d) => !d.name.startsWith('.'))
       .map(async (d) => {
-        const childAbs = path.join(abs, d.name);
+        const childAbs = path.join(/*turbopackIgnore: true*/ abs, d.name);
         const rel = path.relative(LOCAL_ROOT, childAbs);
         const entry: LocalEntry = {
           name: d.name,
@@ -270,7 +258,7 @@ export async function listLocal(relPath: string): Promise<LocalEntry[]> {
         };
         if (d.isFile()) {
           try {
-            entry.size = (await fs.stat(childAbs)).size;
+            entry.size = (await fs.stat(/*turbopackIgnore: true*/ childAbs)).size;
           } catch {
             /* ignore */
           }

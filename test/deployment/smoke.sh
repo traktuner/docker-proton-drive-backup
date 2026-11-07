@@ -130,13 +130,13 @@ run_mode() {
       || { docker logs "$ctr" >&2 || true; fail "$name: /data/backup.db owned by uid '$owner', expected '$expect_uid' — privilege drop did not take effect"; }
   fi
 
-  # (5) Speed-limit capability (issue #23): the app limits its own upload reads, so
-  # it must report canShape=true in every mode (no NET_ADMIN needed any more).
+  # (5) Speed limit (issue #23): the app limits its own upload reads, so setting a
+  # limit must work in every mode (no NET_ADMIN needed any more).
   if [ -n "$expect_canshape" ]; then
-    local cs
-    cs="$(curl -fsS "$base/api/settings/uploads" 2>/dev/null | grep -o '"canShape":[a-z]*' | cut -d: -f2)"
-    [ "$cs" = "$expect_canshape" ] \
-      || { docker logs "$ctr" >&2 || true; fail "$name: /api/settings/uploads canShape='$cs', expected '$expect_canshape'"; }
+    local lim
+    lim="$(curl -fsS -X POST -H 'content-type: application/json' -d '{"limitKBps":512}' "$base/api/settings/uploads" 2>/dev/null | grep -o '"limitKBps":[0-9]*' | cut -d: -f2)"
+    [ "$lim" = "512" ] \
+      || { docker logs "$ctr" >&2 || true; fail "$name: setting a 512 KB/s upload limit returned '$lim'"; }
   fi
 
   # (6) Nested sources (issue #72): when shares are mounted at /sources/<share>
@@ -159,7 +159,7 @@ run_mode() {
     done
   fi
 
-  green "$name — started, initialised (/api/backup-sets 200), no read-only errors${expect_uid:+, dropped to uid $expect_uid}${expect_canshape:+, canShape=$expect_canshape}${EXPECT_SOURCE_ENTRIES:+, nested shares visible}"
+  green "$name — started, initialised (/api/backup-sets 200), no read-only errors${expect_uid:+, dropped to uid $expect_uid}${expect_canshape:+, speed limit settable}${EXPECT_SOURCE_ENTRIES:+, nested shares visible}"
   docker rm -f "$ctr" >/dev/null 2>&1 || true
   CURRENT_CTR=""
 }
@@ -198,7 +198,7 @@ run_mode "non-root"           "--user ${NONROOT_UID}:${NONROOT_GID}" 1
 run_mode "read-only-non-root" "--read-only --tmpfs /tmp --tmpfs /app/.next/cache --user ${NONROOT_UID}:${NONROOT_GID}" 1
 # PUID/PGID convenience layer: root container that chowns /data and drops itself.
 run_mode "puid-pgid"          "-e PUID=${NONROOT_UID} -e PGID=${NONROOT_GID}" 0 "${NONROOT_UID}"
-# Since the SDK release the speed limit needs no capability (canShape=true above).
+# Since the SDK release the speed limit needs no capability (see (5) above).
 # Compose files from CLI-era releases may still add NET_ADMIN: they must keep booting.
 run_mode "net-admin"          "--cap-add NET_ADMIN" 0 "" "true"
 

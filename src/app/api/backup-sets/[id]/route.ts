@@ -1,4 +1,4 @@
-import { backupSets, sameTarget, type BackupMode, type Schedule } from '@/server/db';
+import { backupSets, type BackupMode, type Schedule } from '@/server/db';
 import { sanitizeSegment } from '@/server/local';
 import { catalog } from '@/server/catalog';
 import { runs } from '@/server/runs';
@@ -44,13 +44,12 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     if (body.scheduleDow != null) patch.scheduleDow = Math.min(6, Math.max(0, +body.scheduleDow || 0));
     if (typeof body.skipThumbnails === 'boolean') patch.skipThumbnails = body.skipThumbnails;
     if (typeof body.includeHidden === 'boolean') patch.includeHidden = body.includeHidden;
-    if (typeof body.watch === 'boolean') patch.watch = body.watch;
     if (Array.isArray(body.excludes)) {
       patch.excludes = (body.excludes as unknown[]).map((s) => String(s).trim()).filter(Boolean);
     } else if (typeof body.excludes === 'string') {
       patch.excludes = body.excludes.split('\n').map((s) => s.trim()).filter(Boolean);
     }
-    const targetChanged = patch.targetPath != null && sameTarget(patch.targetPath) !== sameTarget(cur.targetPath);
+    const targetChanged = patch.targetPath != null && normalizeProtonPath(patch.targetPath) !== normalizeProtonPath(cur.targetPath);
 
     // --- Validate everything that can be rejected BEFORE mutating anything ---
 
@@ -76,7 +75,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
           { status: 400 },
         );
       }
-      if (backupSets.all().some((s) => s.id !== id && sameTarget(s.targetPath) === sameTarget(cur.targetPath) && s.targetSubfolder === newSub)) {
+      if (backupSets.all().some((s) => s.id !== id && normalizeProtonPath(s.targetPath) === normalizeProtonPath(cur.targetPath) && s.targetSubfolder === newSub)) {
         return Response.json(
           { error: `Another set already uses the Drive folder “${newSub}” under this target.` },
           { status: 409 },
@@ -88,7 +87,7 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // adopt that folder, and Mirror could trash files the other set relies on).
     if (targetChanged && !subfolderChanging) {
       const sub = cur.targetSubfolder;
-      if (backupSets.all().some((s) => s.id !== id && sameTarget(s.targetPath) === sameTarget(patch.targetPath!) && s.targetSubfolder === sub)) {
+      if (backupSets.all().some((s) => s.id !== id && normalizeProtonPath(s.targetPath) === normalizeProtonPath(patch.targetPath!) && s.targetSubfolder === sub)) {
         return Response.json(
           { error: `Another set already uses the Drive folder “${sub}” under that target. Rename this set's Drive folder first.` },
           { status: 409 },

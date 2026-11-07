@@ -18,3 +18,19 @@ export function formatBytes(n: number, mode: 'compact' | 'precise' = 'compact'):
     mode === 'precise' ? (v < 10 && i > 0 ? 2 : v < 100 ? 1 : 0) : v < 10 && i > 0 ? 1 : 0;
   return `${v.toFixed(decimals)} ${UNITS[i]}`;
 }
+
+/** "Drive (root)" or "Drive/Backups" for a set's target path. */
+export function targetLabel(p: string): string {
+  return p === '/' ? 'Drive (root)' : `Drive${p}`;
+}
+
+/**
+ * One safe Drive folder name from a user-chosen name: path separators and control
+ * characters become "-", leading/trailing dots and spaces go. The server stores
+ * exactly this; the UI uses it to preview the folder name.
+ */
+export function sanitizeSegment(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const seg = (name || '').replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '');
+  return seg || 'set';
+}

@@ -1,5 +1,6 @@
 'use client';
 
+import type { UploadConfig } from '@/server/upload-config';
 import { useCallback, useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { formatBytes } from '@/lib/format';
@@ -19,15 +20,7 @@ interface Info {
   uploads: UploadsCfg;
   mirrorSafety: MirrorSafetyCfg;
 }
-interface UploadsCfg {
-  concurrency: number;
-  /** Upload speed cap in KB/s; 0 = off. */
-  limitKBps: number;
-  /** Always true since the SDK release (the app limits its own reads). */
-  canShape: boolean;
-  /** Why it can't, when it can't — shown in the UI. */
-  shapeReason: string;
-}
+type UploadsCfg = UploadConfig;
 interface MirrorSafetyCfg {
   /** Percentage gate only; missing sources and upload failures always block deletion. */
   enabled: boolean;
@@ -39,7 +32,6 @@ interface Updates {
   container: { current: string; latest: string | null; updateAvailable: boolean; releaseUrl?: string | null };
 }
 
-const fmt = (n: number) => formatBytes(n, 'precise');
 
 function Gear() {
   return (
@@ -144,19 +136,19 @@ export default function Settings() {
 
   useEffect(() => setMounted(true), []);
 
-  // Prefetch settings on mount so the first open renders at its full size instead
-  // of growing as the Storage/Uploads sections load in. The open effect below
-  // still refreshes the data each time.
-  useEffect(() => {
+  const loadSettings = useCallback(() => {
     fetch('/api/settings')
       .then((r) => r.json())
       .then((d) => {
         setInfo(d);
         setUploads(d.uploads);
         setMirrorSafety(d.mirrorSafety);
+        setMirrorSafetyError(null);
       })
       .catch(() => {});
   }, []);
+  // Prefetch on mount (the first open renders at full size), refresh on every open.
+  useEffect(loadSettings, [loadSettings]);
 
   // Animate the exit (Proton dialog scale-out) before unmounting. We unmount on
   // the dialog's animationend (see onAnimationEnd below) rather than a fixed
@@ -194,20 +186,12 @@ export default function Settings() {
 
   useEffect(() => {
     if (!open) return;
-    fetch('/api/settings')
-      .then((r) => r.json())
-      .then((d) => {
-        setInfo(d);
-        setUploads(d.uploads);
-        setMirrorSafety(d.mirrorSafety);
-        setMirrorSafetyError(null);
-      })
-      .catch(() => {});
+    loadSettings();
     checkUpdates();
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && requestClose();
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [open, checkUpdates, requestClose]);
+  }, [open, loadSettings, checkUpdates, requestClose]);
 
   const logout = async () => {
     await fetch('/api/auth/logout', { method: 'POST' });
@@ -335,7 +319,7 @@ export default function Settings() {
                   <div className="flex items-center justify-between gap-3 text-sm">
                     <span className="text-[color:var(--muted)]">Limit upload speed</span>
                     <div className="flex items-center gap-2">
-                      {uploads.canShape && uploads.limitKBps > 0 && (
+                      {uploads.limitKBps > 0 && (
                         <>
                           <input
                             type="number"
@@ -353,23 +337,16 @@ export default function Settings() {
                         type="checkbox"
                         className="h-4 w-4"
                         checked={uploads.limitKBps > 0}
-                        disabled={!uploads.canShape}
                         onChange={(e) => saveUploads({ limitKBps: e.target.checked ? 1024 : 0 })}
                         aria-label="Enable upload speed limit"
                       />
                     </div>
                   </div>
-                  {uploads.canShape ? (
-                    <p className="mt-1 text-xs leading-relaxed text-[color:var(--muted)]">
-                      Caps how fast backups read files for upload, shared by all parallel uploads. Only
-                      backup traffic is limited, never the web UI. Changes apply within a second, also
-                      during a running backup.
-                    </p>
-                  ) : (
-                    <p className="mt-1 text-xs leading-relaxed text-amber-400/80">
-                      Unavailable — {uploads.shapeReason} See “Hardening” in the README.
-                    </p>
-                  )}
+                  <p className="mt-1 text-xs leading-relaxed text-[color:var(--muted)]">
+                    Caps how fast backups read files for upload, shared by all parallel uploads. Only
+                    backup traffic is limited, never the web UI. Changes apply within a second, also
+                    during a running backup.
+                  </p>
                 </div>
               </Section>
             )}
@@ -492,11 +469,11 @@ export default function Settings() {
                   />
                 </div>
                 <Row label="Total used">
-                  {fmt(info.quota.usedSpace)} / {fmt(info.quota.maxSpace)}
+                  {formatBytes(info.quota.usedSpace, 'precise')} / {formatBytes(info.quota.maxSpace, 'precise')}
                 </Row>
                 {products.map(([k, v]) => (
                   <Row key={k} label={k}>
-                    {fmt(v)}
+                    {formatBytes(v, 'precise')}
                   </Row>
                 ))}
               </Section>

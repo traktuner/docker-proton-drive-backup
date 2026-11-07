@@ -6,11 +6,10 @@ backup sets stay exactly as they are.
 
 ## Upgrade
 
-1. Optional, recommended: copy `/data` while the container is stopped
-   (`docker compose stop`, then copy the host folder or snapshot the dataset).
-   The app also writes `backup.db.pre-sdk.bak` next to the database on its first
-   start — a consistent copy of the old database — but a dataset snapshot also
-   covers the session file.
+1. Nothing to back up by hand. Before it changes anything, the first start of 1.0
+   saves the old database as `backup.db.pre-sdk.bak` and the untouched session as
+   `proton/auth-session.pre-sdk.json`. If your platform makes it easy, a dataset
+   snapshot of `/data` beforehand (with the container stopped) is a welcome extra.
 2. Update the image like any other release:
 
    ```bash

@@ -12,6 +12,7 @@ import {
 import { usePathname } from 'next/navigation';
 import { useToast } from './Toast';
 import SessionBanner from './SessionBanner';
+import AccountBanner from './AccountBanner';
 
 /**
  * Single source of truth for "is the Proton session alive?" on the client.
@@ -54,9 +55,9 @@ export function useAuth(): AuthApi {
   );
 }
 
-// Client-side mirror of the server's auth-error patterns (cli.ts AUTH_ERROR_PATTERNS),
-// plus the friendly messages this app produces, so a raw CLI error or our own
-// "session expired" text both count.
+// Phrases of the session-expired messages this app produces (server: drive.ts
+// cleanDriveError / engine.ts), plus legacy CLI-era phrases still found in old run
+// history, so any of them raises the reconnect banner.
 const AUTH_HINTS = [
   'no session',
   'please login',
@@ -88,6 +89,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const prevStatus = useRef<AuthStatus>('unknown');
   const reconnectPoll = useRef<ReturnType<typeof setInterval> | null>(null);
+  const firstBuild = useRef<string | null>(null);
+  const [staleBuild, setStaleBuild] = useState(false);
   const reconnectInFlight = useRef(false);
 
   // One probe of the truthful status endpoint. force=1 bypasses the server's short
@@ -99,6 +102,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     ): Promise<{ authenticated: boolean; loginState: string; signInUrl: string | null; error: string | null } | null> => {
       try {
         const d = await fetch(`/api/auth/status${force ? '?force=1' : ''}`).then((r) => r.json());
+        // The container was updated while this tab stayed open: its scripts are stale.
+        if (d.build) {
+          if (firstBuild.current === null) firstBuild.current = d.build;
+          else if (d.build !== firstBuild.current) setStaleBuild(true);
+        }
         setStatus(d.authenticated ? 'authenticated' : d.loginState === 'awaiting' ? 'reconnecting' : 'expired');
         if (d.authenticated) setSignInUrl(null);
         else if (d.signInUrl) setSignInUrl(d.signInUrl);
@@ -135,7 +143,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     check(false);
-    const id = setInterval(() => check(true), 60_000);
+    // Hidden tabs don't poll; they re-check when they become visible again.
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') check(true);
+    }, 60_000);
     const onFocus = () => check(true);
     const onVis = () => {
       if (document.visibilityState === 'visible') check(true);
@@ -206,7 +217,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <Ctx.Provider value={{ status, signInUrl, reconnect, reportAuthError }}>
+      {staleBuild && (
+        <div role="status" className="flex items-center gap-3 border-b border-[color:var(--border)] px-4 py-2 text-sm">
+          <span className="flex-1">The app was updated. Reload this page to use the new version.</span>
+          <button onClick={() => window.location.reload()} className="pbtn pbtn--solid px-3 py-1 text-xs">Reload</button>
+        </div>
+      )}
       {!selfManaged && <SessionBanner />}
+      {!selfManaged && <AccountBanner />}
       {children}
     </Ctx.Provider>
   );

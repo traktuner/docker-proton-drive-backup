@@ -40,10 +40,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck
+      - name: Typecheck (app + SDK boundary against the pinned SDK)
         run: npm run typecheck
 
-      - name: Unit tests (vitest)
+      - name: SDK pin consistency + unit/regression tests
         run: npm test
 
   deployment-smoke:
@@ -56,6 +56,13 @@ jobs:
 
       - name: Build image
         run: docker build -t proton-drive-backup:smoke .
+
+      - name: Upgrade acceptance test (published CLI-era image → this build)
+        run: |
+          sudo apt-get install -y sqlite3 jq >/dev/null
+          docker tag proton-drive-backup:smoke pdb:sdk
+          # sudo: the container writes /data as root; the test edits that DB from the host.
+          sudo env NEW_IMAGE=pdb:sdk test/upgrade/upgrade.sh
 
       - name: Boot every advertised deployment mode
         # sudo so the non-root modes can chown the data dir to uid 1000 (GitHub

@@ -1,38 +1,50 @@
 {
   "name": "proton-drive-backup",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "node scripts/build-proton.mjs && next dev",
+    "build": "node scripts/build-proton.mjs && next build",
+    "build:proton": "node scripts/build-proton.mjs",
     "start": "node .next/standalone/server.js",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "typecheck": "tsc --noEmit && node scripts/typecheck-proton.mjs",
+    "test": "node scripts/sdk-check.mjs && vitest run",
     "test:watch": "vitest",
-    "test:smoke": "test/deployment/smoke.sh"
+    "test:smoke": "test/deployment/smoke.sh",
+    "test:upgrade": "test/upgrade/upgrade.sh",
+    "sdk:update": "node scripts/sdk-update.mjs",
+    "sdk:check": "node scripts/sdk-check.mjs"
   },
   "dependencies": {
-    "better-sqlite3": "^13.0.0",
+    "@protontech/crypto": "2.0.0",
+    "@protontech/drive-sdk": "0.23.0",
     "geist": "^1.7.2",
+    "ky": "1.14.3",
     "nanoid": "^6.0.0",
     "next": "^16.2.9",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "sharp": "0.35.5",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.0",
-    "@types/better-sqlite3": "^9.0.0",
     "@types/node": "^26.0.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.1",
+    "esbuild": "0.28.2",
     "postcss": "^8.5.3",
     "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
     "vitest": "^5.0.0"
   },
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=26.0.0"
+  },
+  "allowScripts": {
+    "core-js": false,
+    "esbuild": false,
+    "exifreader": false
   }
 }

@@ -1,10 +1,8 @@
-import { runCli, loginManager, clearAuthCache } from '@/server/cli';
+import { logout } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST() {
-  await runCli(['auth', 'logout'], 30_000).catch(() => {});
-  loginManager.reset();
-  clearAuthCache();
+  await logout().catch((e) => console.warn('[logout]', e instanceof Error ? e.message : e));
   return Response.json({ ok: true });
 }

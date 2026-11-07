@@ -75,6 +75,20 @@ body {
   letter-spacing: -0.011em; /* Geist reads tighter, more "product"-like */
 }
 
+/* Long text (paths, names, progress): one line with an ellipsis where a mouse can
+   hover for the full text (title), wrapped in full on touch screens (no hover). */
+.clip {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@media (hover: hover) and (pointer: fine) {
+  .clip {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 /* Tabular figures for live-updating numbers (sizes, counts, speed) so they don't
    jitter as digits change. */
 .tnum {
@@ -149,6 +163,13 @@ input[type='number']::-webkit-outer-spin-button {
       color 0.15s var(--ease-out-quint),
       box-shadow 0.15s var(--ease-out-quint),
       opacity 0.15s var(--ease-out-quint);
+  }
+  /* Touch screens: every button is a comfortable target (~40 px), desktop stays compact. */
+  @media (pointer: coarse) {
+    .pbtn {
+      min-height: 2.5rem;
+      min-width: 2.5rem;
+    }
   }
   .pbtn:disabled {
     opacity: 0.5;

@@ -82,10 +82,9 @@ describe('exportConfig / importConfig round-trip', () => {
       excludes: ['*.tmp', 'node_modules'],
       skipThumbnails: true,
       includeHidden: true,
-      watch: false,
     });
 
-    // An hourly set with watch on, no time/dow emitted (defaults on import).
+    // An hourly set, no time/dow emitted (defaults on import).
     const hourly = backupSets.create({
       name: 'Documents',
       sourcePaths: [docsSrcA, docsSrcB],
@@ -94,7 +93,6 @@ describe('exportConfig / importConfig round-trip', () => {
       schedule: 'hourly',
       excludes: [],
       skipThumbnails: false,
-      watch: true,
     });
 
     const yaml = exportConfig();
@@ -124,7 +122,6 @@ describe('exportConfig / importConfig round-trip', () => {
     expect(gotWeekly.excludes).toEqual(['*.tmp', 'node_modules']);
     expect(gotWeekly.skipThumbnails).toBe(true);
     expect(gotWeekly.includeHidden).toBe(true);
-    expect(gotWeekly.watch).toBe(false);
 
     const gotHourly = all.find((s) => s.name === 'Documents')!;
     expect(gotHourly).toBeDefined();
@@ -135,7 +132,6 @@ describe('exportConfig / importConfig round-trip', () => {
     expect(gotHourly.excludes).toEqual([]);
     expect(gotHourly.skipThumbnails).toBe(false);
     expect(gotHourly.includeHidden).toBe(false); // not set → default off, not emitted
-    expect(gotHourly.watch).toBe(true);
     // hourly emits no time/dow -> import uses the defaults
     expect(gotHourly.scheduleHour).toBe(3);
     expect(gotHourly.scheduleMinute).toBe(0);
@@ -387,7 +383,7 @@ describe('importConfig upsert by name', () => {
     expect(res.errors).toEqual([]);
     expect(res.updated).toBe(1);
     expect(backupSets.get(set.id)!.sourcePaths).toEqual([resolveLocal('/old'), resolveLocal('/new')]);
-    expect(catalog.getFile(set.id, 'SafeImport/old/keep.txt')).toEqual({ size: 4, mtimeMs: 1, sha1: 'sha' });
+    expect(catalog.getFile(set.id, 'SafeImport/old/keep.txt')).toMatchObject({ size: 4, mtimeMs: 1, sha1: 'sha' });
   });
 
   it('rejects a missing imported source addition without changing the set', () => {

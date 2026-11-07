@@ -1,20 +1,21 @@
+import { getUploadConfig } from '@/server/upload-config';
 import path from 'node:path';
-import { getCliVersion } from '@/server/cli';
+import { versions } from '@/server/drive';
 import { LOCAL_ROOT } from '@/server/local';
 import { getUserInfo } from '@/server/quota';
-import { uploadsView } from '@/server/traffic';
 import { getMirrorSafetyConfig } from '@/server/mirror-safety';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
-  const [cli, user] = await Promise.all([getCliVersion(), getUserInfo()]);
+  const [v, user] = await Promise.all([versions(), getUserInfo()]);
   return Response.json({
-    uploads: uploadsView(),
+    uploads: getUploadConfig(),
     mirrorSafety: getMirrorSafetyConfig(),
-    app: process.env.APP_VERSION || 'dev',
+    app: v.app,
+    build: process.env.APP_VERSION || 'dev',
     imageTag: process.env.IMAGE_TAG || 'dev',
-    cli,
+    sdk: { version: v.sdk, tag: v.sdkTag, commit: v.sdkCommit, crypto: v.crypto, appVersionHeader: v.appVersionHeader },
     tz: process.env.TZ || 'UTC',
     localRoot: LOCAL_ROOT,
     dataDir: path.dirname(process.env.DB_PATH || '/data/backup.db'),

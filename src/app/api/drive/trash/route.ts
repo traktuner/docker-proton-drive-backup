@@ -1,11 +1,11 @@
-import { trashDrive, normalizeProtonPath, cleanCliError } from '@/server/cli';
+import { trashDrive, normalizeProtonPath, cleanDriveError } from '@/server/drive';
 import { backupSets } from '@/server/db';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request) {
   const body = await req.json().catch(() => ({}));
-  const { path } = body as { path?: string };
+  const { path, uid } = body as { path?: string; uid?: string };
   if (!path || path === '/') {
     return Response.json({ error: 'a valid path is required' }, { status: 400 });
   }
@@ -29,9 +29,11 @@ export async function POST(req: Request) {
     );
   }
 
-  const res = await trashDrive(path);
+  // `uid` (from the listing the user clicked in) makes the trash refuse if a
+  // different item has taken that name in the meantime.
+  const res = await trashDrive(path, uid);
   if (!res.ok) {
-    return Response.json({ error: cleanCliError(res.error) }, { status: 502 });
+    return Response.json({ error: cleanDriveError(null, res.code) }, { status: res.code === 'NAME_CONFLICT' ? 409 : 502 });
   }
   return Response.json({ ok: true });
 }

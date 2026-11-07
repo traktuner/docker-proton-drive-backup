@@ -18,7 +18,7 @@ describe('catalog.upsertFile / getFile round-trip', () => {
   it('stores and reads back size, mtimeMs, sha1', () => {
     catalog.upsertFile(SET, 'a/b.txt', 1234, 1000, 'deadbeef', 5000);
     const f = catalog.getFile(SET, 'a/b.txt');
-    expect(f).toEqual<CatalogFile>({ size: 1234, mtimeMs: 1000, sha1: 'deadbeef' });
+    expect(f).toMatchObject({ size: 1234, mtimeMs: 1000, sha1: 'deadbeef' });
   });
 
   it('returns undefined for a missing file', () => {
@@ -27,13 +27,13 @@ describe('catalog.upsertFile / getFile round-trip', () => {
 
   it('keeps a null sha1 as null', () => {
     catalog.upsertFile(SET, 'x.bin', 10, 20, null, 30);
-    expect(catalog.getFile(SET, 'x.bin')).toEqual({ size: 10, mtimeMs: 20, sha1: null });
+    expect(catalog.getFile(SET, 'x.bin')).toMatchObject({ size: 10, mtimeMs: 20, sha1: null });
   });
 
   it('upsert overwrites the existing row (same set_id/rel) in place', () => {
     catalog.upsertFile(SET, 'f', 1, 1, 'aaa', 100);
     catalog.upsertFile(SET, 'f', 2, 22, 'bbb', 200);
-    expect(catalog.getFile(SET, 'f')).toEqual({ size: 2, mtimeMs: 22, sha1: 'bbb' });
+    expect(catalog.getFile(SET, 'f')).toMatchObject({ size: 2, mtimeMs: 22, sha1: 'bbb' });
     // still exactly one row for the set
     expect(catalog.count(SET)).toBe(1);
   });
@@ -41,8 +41,8 @@ describe('catalog.upsertFile / getFile round-trip', () => {
   it('is scoped per set_id (same rel in two sets is independent)', () => {
     catalog.upsertFile(SET, 'shared', 1, 1, 'a', 100);
     catalog.upsertFile(OTHER, 'shared', 9, 9, 'z', 100);
-    expect(catalog.getFile(SET, 'shared')).toEqual({ size: 1, mtimeMs: 1, sha1: 'a' });
-    expect(catalog.getFile(OTHER, 'shared')).toEqual({ size: 9, mtimeMs: 9, sha1: 'z' });
+    expect(catalog.getFile(SET, 'shared')).toMatchObject({ size: 1, mtimeMs: 1, sha1: 'a' });
+    expect(catalog.getFile(OTHER, 'shared')).toMatchObject({ size: 9, mtimeMs: 9, sha1: 'z' });
   });
 
   it('getFile only returns rows of kind=file, not dirs', () => {

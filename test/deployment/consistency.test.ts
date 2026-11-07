@@ -36,9 +36,9 @@ describe('advertised deployment modes are covered by the smoke matrix', () => {
     expect(smoke, 'PUID/PGID must be exercised by test/deployment/smoke.sh').toMatch(/-e PUID=/);
   });
 
-  it('the NET_ADMIN speed-limit opt-in is documented and its capability is smoke-tested (issue #23)', () => {
-    expect(compose, 'the NET_ADMIN opt-in must be documented in docker-compose.yml').toMatch(/NET_ADMIN/);
-    expect(smoke, 'the NET_ADMIN capability must be exercised by test/deployment/smoke.sh').toMatch(/--cap-add NET_ADMIN/);
+  it('the speed limit needs no capability, and a leftover NET_ADMIN still boots (issue #23)', () => {
+    expect(compose, 'compose must not tell users to add NET_ADMIN any more').not.toMatch(/^\s*-\s*NET_ADMIN/m);
+    expect(smoke, 'CLI-era compose files with NET_ADMIN must still be smoke-tested').toMatch(/--cap-add NET_ADMIN/);
   });
 
   it('smoke.sh proves real init via /api/backup-sets, not just static /api/health', () => {

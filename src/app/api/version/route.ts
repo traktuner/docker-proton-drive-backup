@@ -1,12 +1,16 @@
-import { getCliVersion } from '@/server/cli';
+import { versions } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
-  const cli = await getCliVersion();
+  const v = await versions();
   return Response.json({
-    app: process.env.APP_VERSION || 'dev',
+    app: v.app,
+    build: process.env.APP_VERSION || 'dev',
     imageTag: process.env.IMAGE_TAG || 'dev',
-    cli,
+    sdk: v.sdk,
+    sdkTag: v.sdkTag,
+    sdkCommit: v.sdkCommit,
+    appVersionHeader: v.appVersionHeader,
   });
 }

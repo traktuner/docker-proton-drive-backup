@@ -1,0 +1,150 @@
+#!/usr/bin/env node
+// Fake `proton-drive` CLI for the CLI-era image in the upgrade acceptance test.
+// Speaks exactly the argv/JSON protocol src/server/cli.ts of the 0.x releases
+// uses (list/info/create-folder/trash/rename/upload/auth/version), against the
+// shared fake Drive in /fake-drive. The real CLI's session file format is used:
+// $PROTON_DRIVE_CACHE_DIR/auth-session.json.
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { load, save, op, child, add, resolve, withLock } from './state.mjs';
+
+const args = process.argv.slice(2).filter((a) => a !== '-j' && a !== '--json');
+const SESSION = path.join(process.env.PROTON_DRIVE_CACHE_DIR || '/data/proton', 'auth-session.json');
+const out = (v) => process.stdout.write(JSON.stringify(v) + '\n');
+const fail = (msg, code = 1) => {
+  process.stderr.write(msg + '\n');
+  process.exit(code);
+};
+
+function session() {
+  try {
+    const s = JSON.parse(fs.readFileSync(SESSION, 'utf8'));
+    if (s?.session?.accessToken && s.userKeyPassword) return s;
+  } catch {}
+  return null;
+}
+
+if (args[0] === 'version') {
+  out('Proton Drive CLI cli-drive@0.9.0+fake');
+  process.exit(0);
+}
+if (args[0] === 'auth' && args[1] === 'login') {
+  out({ signInUrl: 'https://account.proton.me/desktop/login?app=drive#fake' });
+  setTimeout(() => {
+    fs.mkdirSync(path.dirname(SESSION), { recursive: true });
+    fs.writeFileSync(
+      SESSION,
+      JSON.stringify({ cachePassword: 'cp', userKeyPassword: 'ukp', session: { uid: 'sess-1', accessToken: 'at-0', refreshToken: 'rt-0' }, telemetryEnabled: false }),
+      { mode: 0o600 },
+    );
+    process.exit(0);
+  }, 500);
+} else if (args[0] === 'auth' && args[1] === 'logout') {
+  fs.rmSync(SESSION, { force: true });
+  process.exit(0);
+} else {
+  const s = session();
+  if (!s) fail('You need to login first');
+  // A rotated token written by the SDK release must be accepted (rollback).
+  if (!/^at-\d+$/.test(s.session.accessToken)) fail('not authenticated');
+  withLock(run);
+}
+
+function entry(n) {
+  const r = n.revisions[n.revisions.length - 1];
+  return {
+    uid: n.uid,
+    name: n.name,
+    type: n.kind === 'folder' ? 'folder' : 'file',
+    activeRevision: r ? { claimedSize: r.size, claimedModificationTime: new Date(r.mtimeMs).toISOString(), claimedDigests: { sha1: r.sha1 } } : undefined,
+  };
+}
+
+function run() {
+  const [group, cmd, ...rest] = args;
+  if (group !== 'filesystem') fail('unknown command');
+  const st = load();
+  if (cmd === 'list') {
+    const n = resolve(st, rest[0]);
+    if (!n) fail('Node not found: does not exist');
+    out(Object.values(st.nodes).filter((x) => x.parentUid === n.uid && !x.trashed).map(entry));
+    op('cli', 'list', { path: rest[0] });
+  } else if (cmd === 'info') {
+    const n = resolve(st, rest[0]);
+    if (!n) fail('Node not found: does not exist');
+    out(entry(n));
+  } else if (cmd === 'create-folder') {
+    const p = resolve(st, rest[0]);
+    if (!p) fail('parent does not exist');
+    if (child(st, p.uid, rest[1])) fail('already exists');
+    add(st, p.uid, rest[1], 'folder');
+    save(st);
+    op('cli', 'createFolder', { name: rest[1] });
+    out({});
+  } else if (cmd === 'trash') {
+    const n = resolve(st, rest[0]);
+    if (!n) fail('Node not found: does not exist');
+    n.trashed = true;
+    save(st);
+    op('cli', 'trash', { uid: n.uid, path: rest[0] });
+    out({});
+  } else if (cmd === 'rename') {
+    const n = resolve(st, rest[0]);
+    if (!n) fail('Node not found: does not exist');
+    n.name = rest[1];
+    save(st);
+    out({});
+  } else if (cmd === 'upload') {
+    upload(st, rest);
+    save(st);
+  } else fail('unknown filesystem command');
+}
+
+function upload(st, rest) {
+  let fileStrategy = 'skip';
+  const paths = [];
+  let verbose = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '-f') fileStrategy = rest[++i];
+    else if (a === '-d') i++;
+    else if (a === '-t') continue;
+    else if (a === '-v') verbose = true;
+    else paths.push(a.replace(/\[(.)\]/g, '$1')); // undo the app's glob escaping
+  }
+  const target = resolve(st, paths.pop());
+  if (!target) fail('target does not exist');
+  const putFile = (abs, parent) => {
+    const name = path.basename(abs);
+    const buf = fs.readFileSync(abs);
+    const sha1 = createHash('sha1').update(buf).digest('hex');
+    const mtimeMs = Math.round(fs.statSync(abs).mtimeMs);
+    let n = child(st, parent.uid, name);
+    if (n && fileStrategy === 'skip') return;
+    if (!n) {
+      n = add(st, parent.uid, name, 'file');
+      op('cli', 'uploadNew', { uid: n.uid, name, size: buf.length });
+    } else op('cli', 'uploadRevision', { uid: n.uid, name, size: buf.length });
+    n.revisions.push({ size: buf.length, mtimeMs, sha1 });
+    if (verbose) process.stderr.write(`[metric] upload ${JSON.stringify({ uploadedSize: buf.length })}\n`);
+  };
+  const putDir = (abs, parent) => {
+    const name = path.basename(abs);
+    let d = child(st, parent.uid, name);
+    if (!d) {
+      d = add(st, parent.uid, name, 'folder');
+      op('cli', 'createFolder', { name });
+    }
+    for (const e of fs.readdirSync(abs, { withFileTypes: true })) {
+      const p = path.join(abs, e.name);
+      if (e.isDirectory()) putDir(p, d);
+      else if (e.isFile()) putFile(p, d);
+    }
+  };
+  for (const p of paths) {
+    const stt = fs.statSync(p);
+    if (stt.isDirectory()) putDir(p, target);
+    else putFile(p, target);
+  }
+}

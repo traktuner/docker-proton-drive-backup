@@ -1,11 +1,10 @@
-import { clearTreeCache, uploadsBusy } from '@/server/cli';
+import { invalidateFolder, runtime } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
+/** Drop cached Drive listings/metadata so the next browse reads fresh from Drive. */
 export async function POST() {
-  if (uploadsBusy()) {
-    return Response.json({ error: 'A backup is running - resync after it finishes.' }, { status: 409 });
-  }
-  clearTreeCache();
+  invalidateFolder();
+  await (await runtime()).clearCaches();
   return Response.json({ ok: true });
 }

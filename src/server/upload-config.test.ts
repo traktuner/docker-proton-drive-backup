@@ -18,11 +18,13 @@ describe('getUploadConfig', () => {
     expect(getUploadConfig()).toEqual({ concurrency: 2, limitKBps: 0 });
   });
 
-  it('reads a v2 value verbatim (clamped to 1-8) and does NOT re-migrate on the v3 bump', () => {
-    writeRaw({ v: 2, concurrency: 6 });
-    expect(getUploadConfig()).toEqual({ concurrency: 6, limitKBps: 0 }); // 6 kept, not remapped to 2
+  it('reads a v2 value verbatim (clamped to 1-5) and does NOT re-migrate on the v3 bump', () => {
+    writeRaw({ v: 2, concurrency: 4 });
+    expect(getUploadConfig()).toEqual({ concurrency: 4, limitKBps: 0 }); // 4 kept, not remapped to 1
+    writeRaw({ v: 2, concurrency: 8 });
+    expect(getUploadConfig().concurrency).toBe(5); // above the SDK's own limit: capped
     writeRaw({ v: 2, concurrency: 99 });
-    expect(getUploadConfig().concurrency).toBe(8);
+    expect(getUploadConfig().concurrency).toBe(5);
     writeRaw({ v: 2, concurrency: -3 });
     expect(getUploadConfig().concurrency).toBe(1);
   });
@@ -53,7 +55,7 @@ describe('setUploadConfig', () => {
   });
 
   it('clamps out-of-range concurrency input', () => {
-    expect(setUploadConfig({ concurrency: 100 }).concurrency).toBe(8);
+    expect(setUploadConfig({ concurrency: 100 }).concurrency).toBe(5);
     expect(setUploadConfig({ concurrency: 0 }).concurrency).toBe(2); // 0 is falsy → default
   });
 });
@@ -86,13 +88,13 @@ describe('upload speed limit (issue #23)', () => {
   });
 
   it('changing the limit leaves concurrency untouched, and vice-versa', () => {
-    setUploadConfig({ concurrency: 7 });
-    expect(setUploadConfig({ limitKBps: 200 })).toEqual({ concurrency: 7, limitKBps: 200 });
+    setUploadConfig({ concurrency: 4 });
+    expect(setUploadConfig({ limitKBps: 200 })).toEqual({ concurrency: 4, limitKBps: 200 });
     expect(setUploadConfig({ concurrency: 3 })).toEqual({ concurrency: 3, limitKBps: 200 });
   });
 
   it('migrates a v2 file (no limitKBps) to limit 0 without touching concurrency', () => {
-    writeRaw({ v: 2, concurrency: 6 });
-    expect(getUploadConfig()).toEqual({ concurrency: 6, limitKBps: 0 });
+    writeRaw({ v: 2, concurrency: 3 });
+    expect(getUploadConfig()).toEqual({ concurrency: 3, limitKBps: 0 });
   });
 });

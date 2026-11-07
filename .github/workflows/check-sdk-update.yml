@@ -73,7 +73,7 @@ jobs:
             status npm test
             status npm run build
             status docker build -t proton-drive-backup:sdk-update .
-            status env NEW_IMAGE=proton-drive-backup:sdk-update test/upgrade/upgrade.sh
+            status sudo env NEW_IMAGE=proton-drive-backup:sdk-update test/upgrade/upgrade.sh
           } > /tmp/gates.md
           cat /tmp/gates.md
 

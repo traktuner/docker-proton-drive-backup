@@ -61,7 +61,8 @@ jobs:
         run: |
           sudo apt-get install -y sqlite3 jq >/dev/null
           docker tag proton-drive-backup:smoke pdb:sdk
-          NEW_IMAGE=pdb:sdk test/upgrade/upgrade.sh
+          # sudo: the container writes /data as root; the test edits that DB from the host.
+          sudo env NEW_IMAGE=pdb:sdk test/upgrade/upgrade.sh
 
       - name: Boot every advertised deployment mode
         # sudo so the non-root modes can chown the data dir to uid 1000 (GitHub

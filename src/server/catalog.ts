@@ -71,6 +71,7 @@ const SQL = {
   addPart: 'INSERT OR REPLACE INTO drive_parts (set_id, rel, part, node_uid) VALUES (?, ?, ?, ?)',
   partOwner: 'SELECT rel, part FROM drive_parts WHERE set_id = ? AND node_uid = ?',
   clearParts: 'DELETE FROM drive_parts WHERE set_id = ?',
+  removePart: 'DELETE FROM drive_parts WHERE set_id = ? AND rel = ? AND part = ?',
   partsSummary: 'SELECT rel, max(part) AS parts FROM drive_parts WHERE set_id = ? GROUP BY rel ORDER BY rel LIMIT 50',
   isListed: 'SELECT 1 FROM listed_dirs WHERE set_id = ? AND rel = ?',
   markListed: 'INSERT OR REPLACE INTO listed_dirs (set_id, rel, listed_at) VALUES (?, ?, ?)',
@@ -305,6 +306,11 @@ export const catalog = {
   partsSummary(setId: string): { rel: string; parts: number }[] {
     ensure();
     return stmt(SQL.partsSummary).all(setId) as { rel: string; parts: number }[];
+  },
+
+  removePart(setId: string, rel: string, part: number): void {
+    ensure();
+    stmt(SQL.removePart).run(setId, rel, part);
   },
 
   addPart(setId: string, rel: string, part: number, nodeUid: string): void {

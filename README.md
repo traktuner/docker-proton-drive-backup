@@ -197,7 +197,12 @@ folder reaches that limit, the rest of its files go into a folder next to it,
 never reorganised, and runs, revisions, Mirror and Verify treat a folder and its
 parts as one. Restoring through Proton Drive's web app: copy the contents of the
 parts back into one folder. The mapping is stored in the database; if it is lost,
-the parts are found again by their names.
+the parts are found again by their names. In **Mirror**, a file deleted locally is
+trashed from whichever part holds it; a removed folder takes its parts with it
+(each identity-checked; anything this backup did not upload is kept). Parts are
+never merged back or rebalanced. If a part is deleted on Drive, the next upload
+into that folder (or **Verify**) notices it and the missing files are uploaded
+again.
 
 **The set's Drive folder** is identified by its node, not its name: renamed on
 Drive → followed; moved, deleted, or replaced by a new folder with the same name →

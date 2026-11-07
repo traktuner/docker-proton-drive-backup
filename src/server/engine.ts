@@ -544,12 +544,55 @@ class RunContext {
     const node = uid ? await this.drive.getNode(uid).catch(() => undefined) : null;
     if (node === undefined || (node && !node.trashed)) {
       catalog.setNodeUid(this.spec.setId, rel, null); // could not tell, or it still exists: resolve again
+      // The folder is there — maybe one of its continuation folders is not.
+      if (node && (await this.pruneParts(rel))) await this.reconcileFolder(rel);
       return;
     }
     catalog.removeTree(this.spec.setId, rel);
     const below = rel + '/';
     for (const k of [...this.dirUids.keys()]) if (k.startsWith(below)) this.dirUids.delete(k);
     for (const k of [...this.partsCache.keys()]) if (k === rel || k.startsWith(below)) this.partsCache.delete(k);
+  }
+
+  /**
+   * Forget continuation folders of `rel` that are gone from Drive (deleted or in
+   * the trash). Returns whether any was dropped. A part that cannot be checked
+   * (network) is kept.
+   */
+  async pruneParts(rel: string): Promise<boolean> {
+    let dropped = false;
+    for (const { part, nodeUid } of catalog.parts(this.spec.setId, rel)) {
+      const node = await this.drive.getNode(nodeUid).catch(() => undefined);
+      if (node === undefined || (node && !node.trashed)) continue;
+      if (this.write) catalog.removePart(this.spec.setId, rel, part);
+      this.kids.delete(nodeUid);
+      dropped = true;
+    }
+    if (dropped) {
+      this.partsCache.delete(rel);
+      const below = rel + '/';
+      for (const k of [...this.dirUids.keys()]) if (k.startsWith(below)) this.dirUids.delete(k);
+    }
+    return dropped;
+  }
+
+  /**
+   * A Drive folder of `rel` vanished: whatever the catalog records below `rel` that
+   * is not in its remaining Drive folders is no longer backed up — forget it, so it
+   * is uploaded again (this run if the walk has not passed it, else the next run).
+   */
+  async reconcileFolder(rel: string): Promise<void> {
+    const present = new Map<string, RemoteNode>();
+    for (const uid of await this.folders(rel, false)) for (const [k, v] of await this.childMap(uid, true)) if (!present.has(k)) present.set(k, v);
+    if (!this.write) return;
+    for (const row of catalog.children(this.spec.setId, rel)) {
+      const r = present.get(path.posix.basename(row.rel));
+      if (row.kind === 'dir') {
+        if (r?.kind !== 'folder') catalog.removeTree(this.spec.setId, row.rel);
+      } else if (r?.kind !== 'file' || (row.nodeUid && row.nodeUid !== r.uid)) {
+        catalog.remove(this.spec.setId, [row.rel]);
+      }
+    }
   }
 
   /**
@@ -1673,6 +1716,7 @@ export async function verifySet(
     const { rel, uid } = stack.pop()!;
     // The folder and its continuation folders ("· part N") together hold `rel`.
     const remote = new Map<string, RemoteNode>();
+    if (await ctx.pruneParts(rel)) repaired++; // a continuation folder deleted on Drive
     for (const u of [uid, ...ctx.partUids(rel)]) for (const [k, v] of await ctx.childMap(u, true)) if (!remote.has(k)) remote.set(k, v);
     const seen = new Set<string>();
     for (const row of catalog.children(spec.setId, rel)) {

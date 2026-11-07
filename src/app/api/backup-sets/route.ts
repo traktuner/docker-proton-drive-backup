@@ -3,6 +3,7 @@ import { resolveLocal } from '@/server/local';
 import { progress } from '@/server/progress';
 import { computeNextRun } from '@/server/scheduler';
 import { runs } from '@/server/runs';
+import { catalog } from '@/server/catalog';
 
 export const dynamic = 'force-dynamic';
 
@@ -28,6 +29,8 @@ export async function GET() {
     nextRunAt: computeNextRun(s),
     recentRuns: runs.recent(s.id, 8),
     lastSuccessAt: runs.lastSuccessAt(s.id),
+    // Folders continued in "<name> · part N" (Proton's per-folder item limit).
+    splitFolders: catalog.partsSummary(s.id),
   }));
   return Response.json({ backupSets: sets, tz: process.env.TZ || 'UTC' });
 }

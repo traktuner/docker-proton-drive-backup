@@ -357,6 +357,7 @@ describe("Proton's per-folder item limit (200300): continuation folders", () => 
     expect(drive.at(remote(spec, 'big · part 3'))!.uid).toBeTruthy();
     const total = ['big', 'big · part 2', 'big · part 3'].reduce((n, d) => n + names(spec, d).length, 0);
     expect(total).toBe(30);
+    expect(catalog.partsSummary(spec.setId)).toEqual([{ rel: remote(spec, 'big'), parts: 3 }]); // UI notice
 
     drive.reset();
     const r2 = await runSet(drive, spec);

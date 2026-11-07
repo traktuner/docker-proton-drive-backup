@@ -43,6 +43,8 @@ export interface BackupSet {
   nextRunAt?: number | null;
   recentRuns?: RunRow[];
   lastSuccessAt?: number | null;
+  /** Local folders continued in "<name> · part N" on Drive (parts = highest part number). */
+  splitFolders?: { rel: string; parts: number }[];
   progress?: {
     doneFiles: number;
     totalFiles: number;
@@ -187,6 +189,7 @@ export default function BackupSets({
   const [previews, setPreviews] = useState<Record<string, PreviewResult>>({});
   // Which sets have their "skipped files" panel expanded.
   const [openSkips, setOpenSkips] = useState<Record<string, boolean>>({});
+  const [openSplits, setOpenSplits] = useState<Record<string, boolean>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [addingSources, setAddingSources] = useState(false);
 
@@ -685,6 +688,46 @@ export default function BackupSets({
                       </p>
                     )
                   )}
+
+                  {/* Proton allows a limited number of items per Drive folder; bigger
+                      local folders continue in "<name> · part N" next to it. Nothing is
+                      skipped — this only explains the extra folders on Drive. */}
+                  {(() => {
+                    const sp = s.splitFolders ?? [];
+                    if (sp.length === 0) return null;
+                    const open = !!openSplits[s.id];
+                    const shown = (rel: string) => (rel.startsWith(`${s.targetSubfolder}/`) ? rel.slice(s.targetSubfolder.length + 1) : rel);
+                    return (
+                      <div className="mt-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setOpenSplits((o) => ({ ...o, [s.id]: !o[s.id] }))}
+                          className="inline-flex items-center gap-1 text-[11px] text-[color:var(--muted)] hover:underline"
+                          aria-expanded={open}
+                        >
+                          <span aria-hidden>{open ? '▾' : '▸'}</span>
+                          {sp.length}
+                          {sp.length >= 50 ? '+' : ''} large folder{sp.length === 1 ? '' : 's'} split on Drive
+                        </button>
+                        {open && (
+                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-[11px]">
+                            <p className="text-[color:var(--muted)]">
+                              Proton Drive allows a limited number of items per folder (about 30,000). Everything is backed up: what does not fit
+                              continues in “&lt;folder&gt; · part 2”, “· part 3”, … right next to it. A restore needs all parts.
+                            </p>
+                            <ul className="mt-1.5 max-h-40 space-y-1 overflow-y-auto pr-1">
+                              {sp.map((f) => (
+                                <li key={f.rel} className="min-w-0 break-all">
+                                  <span className="font-mono text-[color:var(--text)]">{shown(f.rel)}</span>
+                                  <span className="text-[color:var(--muted)]"> → {f.parts} parts</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
                   {/* Skipped-files panel: files the last run couldn't back up (name
                       unsupported / unreadable). Skipping is never fatal — the rest

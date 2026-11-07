@@ -32,6 +32,7 @@ function fakeRuntime(state: { session: boolean; account: AccountInfo | null; fai
     onFolderChanged() {},
     onSessionLost() {},
     notices: () => [],
+    requestStats: () => ({ total: 0, byEndpoint: {} }),
     dispose: async () => {},
   };
 }

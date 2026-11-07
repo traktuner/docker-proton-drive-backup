@@ -284,6 +284,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   const baseUrl = opts.baseUrl || 'drive-api.proton.me';
   const header = appVersionHeader(opts.appVersion, opts.appBuild);
   const notices: UpdateNotice[] = [];
+  const stats = { total: 0, byEndpoint: {} as Record<string, number> };
   const noticeOnce = (kind: UpdateNotice['kind'], message: string) => {
     if (notices.some((n) => n.message === message)) return;
     notices.push({ kind, message, at: Date.now() });
@@ -316,7 +317,16 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
     logger,
     headers: { 'x-pm-drive-sdk-version': SDK_VERSION },
     afterResponseHooks: [
-      (_req, _o, res) => {
+      (req, _o, res) => {
+        stats.total++;
+        try {
+          const u = new URL(req.url);
+          // Mask ids (long tokens) so the endpoint shape is countable.
+          const shape = `${req.method} ${u.pathname.replace(/\/[A-Za-z0-9_=-]{16,}(?=\/|$)/g, '/:id').replace(/\/\d+(?=\/|$)/g, '/:n')}`;
+          stats.byEndpoint[shape] = (stats.byEndpoint[shape] ?? 0) + 1;
+        } catch {
+          /* uncountable URL */
+        }
         const d = res.headers.get('x-pm-date') ?? res.headers.get('date');
         const t = d ? new Date(d) : null;
         if (t && !Number.isNaN(t.getTime())) updateServerTime(t);
@@ -670,6 +680,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
     onFolderChanged: (cb) => void folderChangedCbs.add(cb),
     onSessionLost: (cb) => void lostCbs.add(cb),
     notices: () => [...notices],
+    requestStats: () => ({ total: stats.total, byEndpoint: { ...stats.byEndpoint } }),
     async dispose() {
       loginAbort?.abort();
       stopEvents();

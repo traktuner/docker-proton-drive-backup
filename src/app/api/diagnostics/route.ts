@@ -1,0 +1,18 @@
+import { runtime, uploadsBusy } from '@/server/drive';
+
+export const dynamic = 'force-dynamic';
+
+/** Process and Proton API counters (benchmarks, troubleshooting). No secrets. */
+export async function GET() {
+  const rt = await runtime();
+  const m = process.memoryUsage();
+  return Response.json({
+    versions: rt.versions,
+    uptimeS: Math.round(process.uptime()),
+    busy: uploadsBusy(),
+    memory: { rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal, external: m.external, arrayBuffers: m.arrayBuffers },
+    cpu: process.cpuUsage(),
+    requests: rt.requestStats(),
+    notices: rt.notices(),
+  });
+}

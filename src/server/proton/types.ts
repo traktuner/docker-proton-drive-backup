@@ -180,6 +180,8 @@ export interface ProtonRuntime {
   /** Called whenever the runtime concludes the session is gone (refresh rejected). */
   onSessionLost(cb: () => void): void;
   notices(): UpdateNotice[];
+  /** Proton API requests since start, by method + endpoint (ids masked). */
+  requestStats(): { total: number; byEndpoint: Record<string, number> };
   dispose(): Promise<void>;
 }
 

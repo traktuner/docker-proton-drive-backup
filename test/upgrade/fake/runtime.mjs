@@ -168,6 +168,7 @@ export async function createRuntime(opts) {
     onFolderChanged() {},
     onSessionLost() {},
     notices: () => [],
+    requestStats: () => ({ total: 0, byEndpoint: {} }),
     async dispose() {},
   };
 }

@@ -579,13 +579,124 @@ export default function BackupSets({
               </div>
             ) : (
               <>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
-                <div className="min-w-0">
-                  <div className="flex min-w-0 items-start gap-2">
+              {/* Name + status and the buttons share the first row; every detail line
+                  below spans the full card width (the buttons no longer squeeze them). */}
+              <div>
+                <div>
+                  <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+                  <div className="flex min-w-[min(100%,12rem)] flex-1 items-start gap-2">
                     <span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]" title={s.name}>{s.name}</span>
                     <span className="mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs" style={statusStyle(s.lastStatus)}>
                       {s.lastStatus}
                     </span>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  {confirmDel === s.id ? (
+                    <span className="flex items-center gap-1.5 text-[0.8125rem]">
+                      <span className="text-[color:var(--muted)]">Delete?</span>
+                      <button
+                        onClick={() => {
+                          setConfirmDel(null);
+                          remove(s.id);
+                        }}
+                        className="pbtn rounded px-2.5 py-1 text-white"
+                        style={{ background: 'var(--signal-danger)' }}
+                      >
+                        Yes
+                      </button>
+                      <button onClick={() => setConfirmDel(null)} className="pbtn pbtn--ghost px-2.5 py-1">
+                        No
+                      </button>
+                    </span>
+                  ) : (
+                    <>
+                      {s.lastStatus === 'running' ? (
+                        <>
+                          <button
+                            onClick={() => pause(s.id)}
+                            disabled={pausing.has(s.id) || cancelling.has(s.id)}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
+                            style={{ color: 'var(--signal-warning)' }}
+                            title="Pause now and resume later (continues from where it left off)"
+                          >
+                            {pausing.has(s.id) && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
+                            )}
+                            {pausing.has(s.id) ? 'Pausing…' : 'Pause'}
+                          </button>
+                          <button
+                            onClick={() => cancel(s.id)}
+                            disabled={cancelling.has(s.id) || pausing.has(s.id)}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
+                            style={{ color: 'var(--signal-danger)' }}
+                          >
+                            {cancelling.has(s.id) && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
+                            )}
+                            {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
+                          </button>
+                        </>
+                      ) : (
+                        <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-[0.8125rem]">
+                          {s.lastStatus === 'paused' ? 'Resume' : 'Run'}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => startEdit(s)}
+                        disabled={s.lastStatus === 'running'}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title={s.lastStatus === 'running' ? 'Pause or cancel this backup before editing it' : 'Edit backup set'}
+                      >
+                        Edit
+                      </button>
+                      {s.mode !== 'add' && (
+                        <button
+                          onClick={() => preview(s.id)}
+                          disabled={s.lastStatus === 'running' || previewing.has(s.id)}
+                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                          title="Dry run — show what the next backup would upload, and (mirror) which Drive files it would delete, without changing anything"
+                        >
+                          {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
+                        </button>
+                      )}
+                      <button
+                        onClick={(e) => verify(s.id, e.shiftKey)}
+                        disabled={s.lastStatus === 'running' || verifying.has(s.id)}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title="Reconcile the catalog against Drive — re-upload anything deleted or changed there. Shift-click: also compare every file's content (SHA-1) with Drive (reads all files)."
+                      >
+                        {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
+                      </button>
+                      <button
+                        onClick={() => testRestore(s.id)}
+                        disabled={restoring.has(s.id)}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title="Restore test — download 20 random backed-up files from Drive and compare them byte for byte with the originals. Changes nothing; works during a backup."
+                      >
+                        {restoring.has(s.id) ? 'Testing…' : 'Test restore'}
+                      </button>
+                      {s.mode === 'mirror' && s.lastStatus === 'error' && /confirm (the deletion )?in the set's row/.test(s.lastMessage ?? '') && (
+                        <button
+                          onClick={() => {
+                            if (window.confirm('A source is empty or no longer a mounted share. Apply the deletions this causes (items go to the Drive trash)? Only do this if you changed the folder on purpose — not if a NAS share is offline.'))
+                              void fetch(`/api/backup-sets/${s.id}/run?confirmSources=1`, { method: 'POST' }).then(load);
+                          }}
+                          className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
+                          title="Confirm that the empty source was emptied on purpose and apply the deletions once"
+                        >
+                          Apply deletions
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setConfirmDel(s.id)}
+                        disabled={s.lastStatus === 'running'}
+                        className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
                   </div>
                   <p
                     className="clip mt-1 text-[0.8125rem] text-[color:var(--muted)]"
@@ -749,113 +860,6 @@ export default function BackupSets({
                       </div>
                     );
                   })()}
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
-                  {confirmDel === s.id ? (
-                    <span className="flex items-center gap-1.5 text-[0.8125rem]">
-                      <span className="text-[color:var(--muted)]">Delete?</span>
-                      <button
-                        onClick={() => {
-                          setConfirmDel(null);
-                          remove(s.id);
-                        }}
-                        className="pbtn rounded px-2.5 py-1 text-white"
-                        style={{ background: 'var(--signal-danger)' }}
-                      >
-                        Yes
-                      </button>
-                      <button onClick={() => setConfirmDel(null)} className="pbtn pbtn--ghost px-2.5 py-1">
-                        No
-                      </button>
-                    </span>
-                  ) : (
-                    <>
-                      {s.lastStatus === 'running' ? (
-                        <>
-                          <button
-                            onClick={() => pause(s.id)}
-                            disabled={pausing.has(s.id) || cancelling.has(s.id)}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
-                            style={{ color: 'var(--signal-warning)' }}
-                            title="Pause now and resume later (continues from where it left off)"
-                          >
-                            {pausing.has(s.id) && (
-                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
-                            )}
-                            {pausing.has(s.id) ? 'Pausing…' : 'Pause'}
-                          </button>
-                          <button
-                            onClick={() => cancel(s.id)}
-                            disabled={cancelling.has(s.id) || pausing.has(s.id)}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
-                            style={{ color: 'var(--signal-danger)' }}
-                          >
-                            {cancelling.has(s.id) && (
-                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
-                            )}
-                            {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
-                          </button>
-                        </>
-                      ) : (
-                        <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-[0.8125rem]">
-                          {s.lastStatus === 'paused' ? 'Resume' : 'Run'}
-                        </button>
-                      )}
-                      <button
-                        onClick={() => startEdit(s)}
-                        disabled={s.lastStatus === 'running'}
-                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
-                        title={s.lastStatus === 'running' ? 'Pause or cancel this backup before editing it' : 'Edit backup set'}
-                      >
-                        Edit
-                      </button>
-                      {s.mode !== 'add' && (
-                        <button
-                          onClick={() => preview(s.id)}
-                          disabled={s.lastStatus === 'running' || previewing.has(s.id)}
-                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
-                          title="Dry run — show what the next backup would upload, and (mirror) which Drive files it would delete, without changing anything"
-                        >
-                          {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
-                        </button>
-                      )}
-                      <button
-                        onClick={(e) => verify(s.id, e.shiftKey)}
-                        disabled={s.lastStatus === 'running' || verifying.has(s.id)}
-                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
-                        title="Reconcile the catalog against Drive — re-upload anything deleted or changed there. Shift-click: also compare every file's content (SHA-1) with Drive (reads all files)."
-                      >
-                        {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
-                      </button>
-                      <button
-                        onClick={() => testRestore(s.id)}
-                        disabled={restoring.has(s.id)}
-                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
-                        title="Restore test — download 20 random backed-up files from Drive and compare them byte for byte with the originals. Changes nothing; works during a backup."
-                      >
-                        {restoring.has(s.id) ? 'Testing…' : 'Test restore'}
-                      </button>
-                      {s.mode === 'mirror' && s.lastStatus === 'error' && /confirm (the deletion )?in the set's row/.test(s.lastMessage ?? '') && (
-                        <button
-                          onClick={() => {
-                            if (window.confirm('A source is empty or no longer a mounted share. Apply the deletions this causes (items go to the Drive trash)? Only do this if you changed the folder on purpose — not if a NAS share is offline.'))
-                              void fetch(`/api/backup-sets/${s.id}/run?confirmSources=1`, { method: 'POST' }).then(load);
-                          }}
-                          className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
-                          title="Confirm that the empty source was emptied on purpose and apply the deletions once"
-                        >
-                          Apply deletions
-                        </button>
-                      )}
-                      <button
-                        onClick={() => setConfirmDel(s.id)}
-                        disabled={s.lastStatus === 'running'}
-                        className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
-                      >
-                        Delete
-                      </button>
-                    </>
-                  )}
                 </div>
               </div>
               {previews[s.id] &&

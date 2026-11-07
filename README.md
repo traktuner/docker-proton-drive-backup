@@ -1,6 +1,6 @@
 # Proton Drive Backup
 
-A self-hosted web app that turns the official **proton-drive CLI** into a classic
+A self-hosted web app built on the official **Proton Drive SDK** that works as a classic
 left → right backup tool: browse local folders on the left, your Proton Drive on
 the right, and define "backup sets" that upload the former into the latter.
 
@@ -11,28 +11,32 @@ the right, and define "backup sets" that upload the former into the latter.
 > nominatively to describe what this tool interoperates with. For the official
 > product and support, see [proton.me](https://proton.me).
 
-## Why the CLI (and not the SDK)?
+## Upgrading from a 0.x (CLI) release
 
-The [Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) explicitly does
-**not** include authentication, login flows or session management - you'd have to
-reimplement Proton's SRP/SSO login and key handling yourself. The official CLI is
-the SDK *plus* all of that, maintained by Proton. So this app wraps the CLI and
-gets the SDK's capabilities for free.
+Release 1.0 talks to Proton Drive through the official
+[Proton Drive SDK](https://github.com/ProtonDriveApps/sdk) inside the app instead of
+running the `proton-drive` CLI once per operation. Update the image as usual —
+same compose file, same `/data`; sets, schedules, history, catalog and your login
+carry over, and the first run uploads nothing. Rolling back works too. See
+**[Upgrade an existing container and roll back](docs/UPGRADE.md)**.
 
 ## How it works
 
-- **Single Next.js container** serving the web UI and invoking the CLI.
-- Every Drive operation runs the CLI **one-shot** (`proton-drive … -j`) and parses
-  the JSON - no fragile interactive REPL.
-- **Login** spawns `proton-drive auth login`, captures the printed sign-in URL,
-  shows it in the UI, and polls until you finish signing in any browser. No
-  localhost callback needed, so it works for a remote/headless server.
-- **Secrets** use the CLI's file-based store via `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`
-  (CLI 0.6.0+, replacing the removed `PROTON_DRIVE_UNSAFE_SECRETS=1`), so the container
-  never needs libsecret/gnome-keyring/D-Bus. The session is written under
-  `PROTON_DRIVE_CACHE_DIR` (`/data/proton`) and survives restarts.
-- Backup sets are stored in SQLite (`/data/backup.db`).
-- An in-process scheduler runs scheduled sets on the container's local time.
+- **One process.** A single Node.js server runs the web UI, the scheduler, the
+  backup engine and the Proton Drive SDK. No CLI processes, no second runtime.
+- **The SDK is bundled once** (`dist-proton/runtime.mjs`) and pinned to an exact
+  upstream release; the version is shown in the footer, in Settings and in the
+  image labels. See [Update the Proton SDK](docs/SDK-UPDATE.md).
+- **Login** uses Proton's browser sign-in: the app shows a link, you sign in on any
+  device, the session is handed to the app. No password ever reaches the app, no
+  localhost callback is needed.
+- **Session** is stored in `/data/proton/auth-session.json` (0600) — the same file
+  and format the CLI releases used, which is what makes upgrade and rollback work.
+- **Catalog.** What Drive has confirmed is recorded per set in SQLite
+  (`/data/backup.db`), including the Drive node of every file and folder. An
+  unchanged run costs one `stat` and one indexed lookup per file — no Drive
+  requests and no file reads.
+- **Identifies honestly** to Proton as `external-drive-proton_drive_backup@<version>`.
 
 ## Security
 
@@ -50,11 +54,9 @@ interface (e.g. `127.0.0.1:3005:3000`) when in doubt.
 
 ### Session at rest
 
-The proton-drive CLI can only store its session two ways: the OS keyring
-(libsecret - unavailable/unreliable in a container), `pass` (requires GPG/pass
-setup), or a **plaintext file** (`PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`,
-the default in this image). It has no built-in encryption option. So the
-session token lives unencrypted in `/data/proton/auth-session.json`.
+The session (tokens and the key password Proton hands over at sign-in) lives
+unencrypted in `/data/proton/auth-session.json`, mode 0600 — the same file the
+CLI releases used with `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file`.
 
 Because the app must start and use the session unattended, it can't meaningfully
 encrypt it at rest by itself (any key it could use would also have to sit on the
@@ -124,8 +126,7 @@ paths are relative to `/sources` (e.g. `/photos/...`).
 
 The image is published for **`linux/amd64`** and **`linux/arm64`**. To check a
 host: `uname -m` must report `x86_64` or `aarch64`. There is **no 32-bit ARM**
-build - the Proton Drive CLI ships no `armhf`/`armv7` binary, so devices that
-report `armv7l` cannot run this at all.
+build.
 
 Practical arm64 targets: Raspberry Pi 4/5 on a **64-bit** OS, Apple Silicon, and
 generic arm64 Linux servers.
@@ -153,18 +154,42 @@ generic arm64 Linux servers.
 | **Backup** (recommended) | Uploads new files and re-uploads only the ones that changed (by size, date, then checksum). Nothing is downloaded, unchanged files are skipped. Files you delete locally stay on Drive. |
 | **Mirror** ⚠ | Like Backup, but also **trashes** files on Drive that you removed locally (only within the folders you back up). |
 
-A changed file in **Backup**/**Mirror** mode is written as a **new revision** in
-Proton Drive (so the previous version stays in your Drive version history and is
-restorable), not re-uploaded as a brand-new file. This uses the CLI 0.8.0
-`create-new-revision` file conflict strategy.
+A changed file in **Backup**/**Mirror** mode is written as a **new revision** of the
+same Drive file, so the previous version stays in your Drive version history and
+is restorable. Folders are mirrored too, including empty ones.
 
-**Mirror safety:** the deletion pass is skipped (and flagged) if a configured
-source path is missing on disk, if any upload failed during the run, or if more
-than the configured share of the catalog would be removed at once. The global
-threshold defaults to 30% and can be changed or disabled under **Settings → Mirror
-safety**. Disabling it affects only the percentage gate; missing sources and upload
-failures always prevent deletion. Re-run after fixing a protected failure to apply
-pending deletions.
+**What a run detects.** A file counts as changed when its size differs, or when
+its modification time differs by more than 2 s *and* its SHA-1 differs from the
+one recorded (or, for catalogs from 0.x releases, from the one Drive stores). A
+change that keeps both size and modification time identical is invisible to this
+fast check — **Shift-click Verify** for a content verify: it reads every local file
+and compares its SHA-1 with Drive's, then re-uploads mismatches on the next run.
+
+**Exactly once.** A file is only recorded after Drive confirmed the upload. If the
+container dies after Drive confirmed but before the record was written, the next
+run finds Drive already holding that exact content and records it — no second
+revision. A Drive item with the same name that already holds the local content is
+adopted the same way instead of being uploaded again.
+
+**Mirror safety.** Deletion moves items to the **Drive trash** (restorable) and is
+skipped, with the reason shown, when:
+- a source path is missing, or a source that was a mounted share last time is now
+  a plain directory of the container (NAS offline, empty mountpoint left behind);
+- a source is completely **empty** although it held files last time — if you
+  emptied it on purpose, **Apply deletions** in the set's row confirms it once;
+- any upload failed or a file was unreadable in this run;
+- more than the configured share of the catalog would be removed (Settings →
+  Mirror safety; default 30%, can be disabled — the other gates cannot).
+
+Before an item is trashed it is re-read from Drive and must still be the node this
+backup uploaded, in the same place and under the same name. A folder that contains
+anything this backup did not upload is kept; only our files inside it are trashed.
+**Preview** (dry run) uses the same scan and the same rules.
+
+**The set's Drive folder** is identified by its node, not its name: renamed on
+Drive → followed; moved, deleted, or replaced by a new folder with the same name →
+the run stops without writing and tells you. **Verify** re-checks the set (and, if
+the folder is really gone, starts the set over).
 
 ## What gets skipped (a backup is never stopped by one bad file)
 
@@ -176,7 +201,7 @@ reason), so nothing is ever lost silently. A file is skipped when:
 - **Its name is unsupported by Proton Drive.** Proton limits each file/folder name
   to **255 characters**. In practice a local file can't exceed this (Linux caps a
   name at 255 bytes), and names with special characters (e.g. `Movie [1080p].mkv`)
-  are handled automatically — but if the CLI ever rejects a name, that one file is
+  are handled automatically — but if Drive ever rejects a name, that one file is
   skipped, not the whole backup.
 - **It can't be read** (permission or I/O error). It's counted and named as skipped
   instead of vanishing silently — and in Mirror mode this also prevents an
@@ -189,7 +214,8 @@ reason), so nothing is ever lost silently. A file is skipped when:
 Each set can run **off** (manual only), **hourly**, **daily**, or **weekly**.
 Scheduled times use the container's local time, so set the `TZ` environment
 variable (default UTC). Missed runs (container was off) are caught up on the next
-tick. Scheduled runs are paused while signed out.
+tick, once. Scheduled runs wait while signed out or while the Proton account is
+unconfirmed, and run as soon as that is resolved.
 
 ## Declarative config
 
@@ -207,48 +233,28 @@ still sign in interactively once. See the volume `(3)` comment in
 | `DB_PATH` | `/data/backup.db` | SQLite database path |
 | `LOCAL_ROOT` | `/sources` | Folder shown in the left pane |
 | `CONFIG_DIR` | `/config` | Directory scanned for declarative `backup-sets.*` |
-| `PROTON_DRIVE_CLI` | `/usr/local/bin/proton-drive` | CLI binary path |
-| `PROTON_DRIVE_CACHE_DIR` | `/data/proton` | Session + cache + logs (persist this) |
-| `PROTON_DRIVE_CREDENTIALS_STORE` | `unsafe_file` | File-based secret store (required in Docker; CLI 0.6.0+) |
-| `PROTON_DRIVE_LOG_LEVEL` | `ERROR` | CLI log verbosity |
-| `HOME` | `/data/proton` | HOME for the app + CLI, kept on the writable `/data` volume so a read-only root and a non-root user both work |
-| `BUN_JSC_forceRAMSize` | `536870912` (512 MiB) | Memory the CLI's runtime sizes its heap for, in bytes — see [Memory](#memory) |
+| `PROTON_DRIVE_CACHE_DIR` | `/data/proton` | Holds the session file `auth-session.json` (persist this) |
+| `HOME` | `/data/proton` | HOME for the app, kept on the writable `/data` volume so a read-only root and a non-root user both work |
 | `GITHUB_REPO` | `traktuner/docker-proton-drive-backup` | Repo for the in-app update check |
+| `PDB_ENABLE_DOWNLOAD` | *(unset)* | `1` enables `GET /api/drive/download` (test/diagnostics; exposes Drive content to anyone who can reach the port) |
 
-The CLI version is pinned via the `PROTON_CLI_VERSION` build arg in the Dockerfile
-and bumped automatically (see "Notable changes").
+`PROTON_DRIVE_CLI`, `PROTON_DRIVE_CREDENTIALS_STORE`, `PROTON_DRIVE_LOG_LEVEL` and
+`BUN_JSC_forceRAMSize` belonged to the CLI releases and are ignored. The SDK version
+is pinned in `package.json` and updated by a workflow ([docs/SDK-UPDATE.md](docs/SDK-UPDATE.md)).
 
 ## Memory
 
-The container is two kinds of process: one Node.js server (the UI, scheduler and
-delta engine) and, while a backup runs, up to **Settings → Uploads → parallel
-uploads** copies of the `proton-drive` CLI, one per upload batch. The CLI is a
-[Bun](https://bun.com)-compiled executable, and its JavaScriptCore runtime sizes
-its garbage-collected heap from the memory it sees as *available* — which inside a
-container is the cgroup limit. Left alone, every CLI process treats a 16 GiB
-`mem_limit` as 16 GiB of headroom and collects lazily, so raising the limit after
-an OOM kill mainly raises how much garbage accumulates before the next one.
+One Node.js process does everything, so memory is predictable: about 60 MiB idle,
+signed out or in. During a run, memory is bounded by design — a fixed number of
+files in flight (**Settings → Uploads → parallel uploads**), each streamed from
+disk in 1 MiB chunks into the SDK's 4 MiB encryption blocks; the local scan runs
+in a separate thread with one batch in flight; the catalog lives in SQLite, not in
+memory. A fast disk and a slow uplink do not make memory grow: the scan simply
+waits for uploads.
 
-The image therefore tells the CLI to size its heap for 512 MiB per process
-(`BUN_JSC_forceRAMSize`, bytes). That is a sizing hint, not a hard cap: a process
-that genuinely needs more still gets it, it just collects garbage sooner. Baseline
-is about 80 MiB per CLI process. Rough budget: ~300 MiB for the server plus
-~0.5–1 GiB per parallel upload.
-
-Levers, in order of effect:
-
-- **Fewer parallel uploads** (Settings → Uploads). Each is a full CLI process.
-- **Skip thumbnails** per backup set. Thumbnail generation decodes every image
-  in the CLI process; large photos and videos are the biggest transient spikes.
-- **A sensible `mem_limit`** sized to the budget above, instead of growing it after
-  each kill.
-- `BUN_JSC_forceRAMSize` — lower it (e.g. `268435456` for 256 MiB) on small hosts;
-  raise it only if uploads visibly slow down from GC churn. Must be a positive
-  integer in bytes; a malformed value is ignored with a warning.
-
-The first run of a set (the recursive seed) and interrupted runs are resumable:
-the catalog is recorded per uploaded subtree, so a kill mid-seed costs only the
-subtree in flight, and the next run continues per file.
+Levers: fewer parallel uploads; **skip thumbnails** per set (thumbnails decode each
+image, one at a time). `BUN_JSC_forceRAMSize` from the CLI releases is no longer
+used.
 
 ## Hardening
 
@@ -311,25 +317,10 @@ ownership.)
 
 ## Limit upload speed
 
-The Proton Drive CLI has **no** bandwidth flag, and the app doesn't own its byte
-stream, so the only reliable way to cap upload speed is to shape traffic in the
-kernel with `tc` — which needs the **`NET_ADMIN`** capability. It's therefore
-opt-in and a deliberate, documented exception to `cap_drop: ALL`:
-
-```yaml
-    cap_drop: [ALL]
-    cap_add: [NET_ADMIN]   # only for "Limit upload speed"
-```
-
-Then set the limit in **Settings → Uploads → Limit upload speed** (KB/s). Without
-`NET_ADMIN` the control shows as unavailable rather than silently doing nothing.
-
-Notes: the cap is approximate, shared across all parallel uploads, applied to the
-whole container's egress **only while a backup runs** (removed afterwards so
-browsing isn't throttled), and takes effect on the next run. A minimum of 50 KB/s
-is enforced so the shaper can't starve the CLI's own API calls. `trickle` was
-evaluated and rejected — its `LD_PRELOAD` interception is unreliable against the
-CLI's bundled runtime and can silently fail to limit anything.
+**Settings → Uploads → Limit upload speed** caps how fast backups read files for
+upload (KB/s, shared by all parallel uploads). It needs no extra capability — the
+`cap_add: [NET_ADMIN]` the CLI releases required can be removed — never slows the
+web UI, and applies within a second, also to a running backup.
 
 ## API
 
@@ -346,26 +337,35 @@ All routes are unauthenticated (see [Security](#security)).
 | GET/POST | `/api/backup-sets` | list / create backup sets |
 | PATCH/DELETE | `/api/backup-sets/:id` | update / delete a set |
 | POST | `/api/backup-sets/:id/source-paths` | safely add source roots to a stopped set |
-| POST | `/api/backup-sets/:id/run` · `/cancel` · `/verify` | run / cancel / verify a set |
+| POST | `/api/backup-sets/:id/run` · `/cancel` · `/pause` | run / cancel / pause a set (`run?allowEmptySource=1` confirms an emptied Mirror source once) |
+| POST | `/api/backup-sets/:id/verify` · `/dry-run` | reconcile with Drive (`?content=1`: also compare SHA-1 of every file) / preview |
+| POST | `/api/auth/confirm` | confirm the signed-in account for the backup sets |
+| GET | `/api/drive/revisions?path=` | revisions of a Drive file |
+| GET | `/api/drive/download?revision=` | download a revision — disabled unless `PDB_ENABLE_DOWNLOAD=1` |
+| GET | `/api/version` | app, image and SDK version |
 | GET/POST | `/api/settings/mirror-safety` | read / update the global Mirror deletion threshold |
 
 ## Development
 
 ```bash
-npm install      # needs Node 24 (better-sqlite3 native build)
-npm run dev      # http://localhost:3000
-npm run build    # production build (standalone output)
-npm run typecheck # tsc --noEmit
-npm test         # vitest — server logic + deployment static guards
-npm run test:smoke # build the image and boot every advertised deployment mode
+npm install        # Node 26 (built-in node:sqlite; no native build)
+npm run dev        # http://localhost:3000 (builds the SDK bundle first)
+npm run build      # SDK bundle + production build (standalone output)
+npm run typecheck  # app + the SDK boundary against the pinned SDK types
+npm test           # SDK pin check + vitest (engine regression suite on a fake Drive)
+npm run test:smoke # boot every advertised deployment mode (needs an image)
+npm run test:upgrade # published 0.x image → this image, see test/upgrade
+npm run sdk:update -- <version>   # see docs/SDK-UPDATE.md
 ```
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the typecheck and
 vitest suite on every push/PR, then the Docker deployment smoke matrix
 ([`test/deployment/smoke.sh`](test/deployment/smoke.sh)) — it starts the container in
 every advertised mode (default, hardened, read-only, non-root, read-only + non-root)
-and fails if any mode doesn't start and initialise. That is the guard that makes an
-"advertised but doesn't start" deployment impossible to merge.
+and fails if any mode doesn't start and initialise, and the upgrade acceptance
+test from the last published 0.x image ([`test/upgrade/upgrade.sh`](test/upgrade/upgrade.sh)).
+Against real Proton Drive (dedicated test account): [`test/live/live.sh`](test/live/live.sh)
+and [`test/live/takeover.sh`](test/live/takeover.sh).
 
 ## Project structure
 
@@ -380,19 +380,31 @@ src/
     BackupSets.tsx        # backup-set list + run/delete
     AuthProvider.tsx      # reactive session state + reconnect banner
   server/
-    cli.ts                # one-shot CLI runner + login manager + auth probe
-    engine.ts             # delta backup engine (add/backup/mirror)
+    proton/runtime.ts     # THE SDK boundary (only file importing the SDK)
+    proton/types.ts       # the small contract the rest of the app uses
+    proton/vendor/        # pinned upstream account module + UPSTREAM.json
+    drive.ts              # runtime loader, paths, login, account binding
+    engine.ts             # backup engine (add/backup/mirror), dry run, verify
     scheduler.ts          # in-process schedule ticker
-    local.ts              # local filesystem browsing
-    db.ts                 # SQLite (better-sqlite3)
+    local.ts              # local filesystem browsing + scanner thread
+    db.ts                 # SQLite (node:sqlite) + schema migration
     runner.ts             # executes a backup set
 Dockerfile · docker-compose.yml · docker-entrypoint.sh
 ```
 
 ## Notable changes
 
-Newest first. Image tags follow the bundled `proton-drive` CLI version
-(`<cliVersion>-<revision>`); these are app-level highlights, not per-tag notes.
+Newest first. Image tags are `<appVersion>-<revision>` (0.x tags followed the
+bundled CLI version); these are app-level highlights, not per-tag notes.
+
+- **1.0: Proton Drive SDK instead of the CLI** - one process instead of one CLI
+  process per operation; every changed file is read once (the CLI read it twice,
+  images three times); an unchanged run over a million files takes seconds of CPU
+  instead of minutes and writes nothing; uploads reconcile with Drive so a crash can
+  never create a duplicate revision; mirror deletions are identity-checked, never
+  trash folders with foreign content and detect offline NAS shares; the upload
+  speed limit needs no NET_ADMIN; changes to the set's Drive folder are detected.
+  Upgrade and rollback keep `/data` as it is ([docs/UPGRADE.md](docs/UPGRADE.md)).
 
 - **Bounded memory** - the CLI's Bun runtime is told to size its heap for 512 MiB
   per process instead of the whole container limit (`BUN_JSC_forceRAMSize`); the
@@ -425,26 +437,26 @@ Newest first. Image tags follow the bundled `proton-drive` CLI version
 
 ## Troubleshooting
 
-- **Login shows no URL / `ERR_SECRETS_PLATFORM_ERROR` / "Cannot spawn a message bus
-  without a machine-id"** - ensure `PROTON_DRIVE_CREDENTIALS_STORE=unsafe_file` is
-  set (it is by default in the image). This avoids the keyring/D-Bus requirement.
-  (On CLI 0.6.0+ the old `PROTON_DRIVE_UNSAFE_SECRETS=1` was removed and replaced
-  by `PROTON_DRIVE_CREDENTIALS_STORE` with values `keychain` (default) /
-  `unsafe_file` / `pass`.)
+- **"Proton session expired" right after upgrading from 0.x** - Proton did not
+  accept the old session; click **Reconnect** and sign in once. Sets are untouched.
+- **Backups wait for "Confirm the Proton account"** - see [docs/UPGRADE.md](docs/UPGRADE.md).
 - **Left pane empty** - mount your folders into `/sources`.
-- **Container OOM-killed during a backup** - find out *which* process the kernel
-  killed with `journalctl -k | grep -iE 'killed process|oom'` on the host: `node` is
-  the server, `proton-drive` an upload worker. See [Memory](#memory) — usually the
-  fix is fewer parallel uploads and/or skipping thumbnails, not a bigger limit.
-- **Check the CLI works:** `docker exec -it proton-drive-backup proton-drive version`
+- **A Mirror run says a source is missing or empty** - check the NAS mount on the
+  host; nothing was deleted. If you emptied the folder on purpose, use **Apply
+  deletions** in the set's row.
+- **Container OOM-killed during a backup** - lower Settings → Uploads → parallel
+  uploads and/or skip thumbnails for photo sets; see [Memory](#memory).
+- **Diagnostics:** `GET /api/version` shows the app version, image tag, SDK
+  version, upstream commit and the exact `x-pm-appversion` sent to Proton.
 
 ## License
 
 [MIT](LICENSE) © traktuner.
 
-The bundled `proton-drive` CLI binary is downloaded from Proton at build time and
-remains under **Proton's own license and terms** - the MIT license covers only the
-code in this repository, not that binary.
+The image bundles the Proton Drive SDK, `@protontech/crypto` and Proton's account
+module (MIT, © Proton AG; see `dist-proton/runtime.mjs.LEGAL.txt` and
+`src/server/proton/vendor/account/LICENSE.md`). Using Proton's services is subject
+to Proton's terms; see the SDK's usage guidelines for third-party apps.
 
 ## Trademark
 

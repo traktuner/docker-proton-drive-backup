@@ -365,6 +365,31 @@ describe('failures inside a batch', () => {
   });
 });
 
+describe('cancel and pause', () => {
+  it('stops promptly: confirmed files are recorded, the rest is not, nothing is deleted', async () => {
+    for (let i = 0; i < 30; i++) write(`f${i}.txt`, `c${i}`);
+    const spec = makeSet('mirror');
+    let uploads = 0;
+    const orig = drive.uploadNew.bind(drive);
+    drive.uploadNew = async (...a: Parameters<FakeDrive['uploadNew']>) => {
+      uploads++;
+      return orig(...a);
+    };
+    const r = await runSet(drive, spec, { shouldCancel: () => uploads >= 5 });
+    expect(r.cancelled).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(drive.calls.trash).toBe(0);
+    const recorded = catalog.countFiles(spec.setId);
+    expect(recorded).toBeGreaterThanOrEqual(5);
+    expect(recorded).toBeLessThan(30);
+    // Resume: only the rest is uploaded.
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(drive.calls.uploadNew).toBe(30 - recorded);
+  });
+});
+
 describe('add mode', () => {
   it('never updates; a different file already on Drive is left alone, and Backup later uploads it', async () => {
     write('a.txt', 'local');

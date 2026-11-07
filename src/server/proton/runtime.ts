@@ -33,6 +33,7 @@ import {
   type EventSubscription,
 } from '@protontech/drive-sdk';
 import { generateAdditionalNodeMetadata } from '@protontech/drive-sdk/dist/additionalNodeMetadata';
+import { Telemetry, LogFilter, LogLevel } from '@protontech/drive-sdk/dist/telemetry';
 import { ApiClient, initAccount, type SessionCredentials, type SessionInfo } from './vendor/account/index';
 import UPSTREAM from './vendor/UPSTREAM.json';
 import { SessionFile } from './session-store';
@@ -486,7 +487,25 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
   const envInt = (k: string) => (Number(process.env[k]) > 0 ? Number(process.env[k]) : undefined);
   const entitiesCache = new LruCache<string>(opts.entityCacheSize ?? envInt('PDB_ENTITY_CACHE') ?? 5_000);
   const cryptoCache = new LruCache<unknown>(opts.cryptoCacheSize ?? envInt('PDB_CRYPTO_CACHE') ?? 200);
+  // The SDK's default telemetry prints every API request (INFO) and every metric to
+  // the console: tens of thousands of lines per run. Route it through our logger
+  // instead: warnings and errors always, the rest only with PDB_DEBUG.
+  const telemetry = new Telemetry({
+    logFilter: new LogFilter({ globalLevel: process.env.PDB_DEBUG ? LogLevel.DEBUG : LogLevel.WARNING }),
+    logHandlers: [
+      {
+        log: (r: { level: string; loggerName: string; message: string; error?: unknown }) => {
+          const lvl = r.level === 'ERROR' ? 'error' : r.level === 'WARNING' ? 'warn' : 'debug';
+          const err = r.error instanceof Error ? `: ${r.error.message}` : '';
+          log(lvl, `${r.loggerName}: ${r.message}${err}`);
+        },
+      },
+    ],
+    metricHandlers: [{ onEvent: (m: { event: { eventName?: string } }) => log('debug', `metric ${m.event?.eventName ?? ''}`) }],
+  } as never);
+
   const sdk = new ProtonDriveClient({
+    telemetry: telemetry as never,
     httpClient: httpClient as never,
     entitiesCache: entitiesCache as never,
     cryptoCache: cryptoCache as never,

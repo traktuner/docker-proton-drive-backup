@@ -2,5 +2,16 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "The Proton SDK set (SDK, crypto, ky, vendored account module) moves together via `npm run sdk:update` and the check-sdk-update workflow, never piecemeal.",
+      "matchPackageNames": [
+        "@protontech/drive-sdk",
+        "@protontech/crypto",
+        "ky"
+      ],
+      "enabled": false
+    }
   ]
 }

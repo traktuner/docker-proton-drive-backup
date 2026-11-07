@@ -10,7 +10,6 @@ interface Quota {
   driveUsed: number;
 }
 
-const fmt = (n: number) => formatBytes(n, 'precise');
 
 export default function StorageBar() {
   const { status: authStatus } = useAuth();
@@ -23,7 +22,9 @@ export default function StorageBar() {
         .then((d) => setQ(d.quota))
         .catch(() => {});
     load();
-    const t = setInterval(load, 60_000);
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 60_000);
     return () => clearInterval(t);
     // Reload immediately when the session is (re)authenticated so the bar — which
     // hides itself on a dead session — comes back without waiting for the interval.
@@ -42,14 +43,14 @@ export default function StorageBar() {
   return (
     <div
       className="hidden items-center gap-2 sm:flex"
-      title={`Drive ${fmt(q.driveUsed)} of ${fmt(q.maxSpace)} (${pct.toFixed(1)}%)`}
+      title={`Drive ${formatBytes(q.driveUsed, 'precise')} of ${formatBytes(q.maxSpace, 'precise')} (${pct.toFixed(1)}%)`}
     >
       <div className="h-1.5 w-28 overflow-hidden rounded-full" style={{ background: 'var(--background-strong)' }}>
         <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, background: color }} />
       </div>
-      <span className="tnum text-xs">
-        <span className="text-[color:var(--text-norm)]">{fmt(q.driveUsed)}</span>
-        <span className="text-[color:var(--text-weak)]"> / {fmt(q.maxSpace)}</span>
+      <span className="tnum text-[0.8125rem]">
+        <span className="text-[color:var(--text-norm)]">{formatBytes(q.driveUsed, 'precise')}</span>
+        <span className="text-[color:var(--text-weak)]"> / {formatBytes(q.maxSpace, 'precise')}</span>
       </span>
     </div>
   );

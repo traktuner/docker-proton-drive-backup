@@ -1,6 +1,6 @@
 import { backupSets } from '@/server/db';
-import { previewDelta } from '@/server/engine';
-import { uploadsBusy } from '@/server/cli';
+import { previewSet, specFor } from '@/server/engine';
+import { drive, isAuthenticated, uploadsBusy } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,7 +12,8 @@ const g = globalThis as unknown as { __pdPreviewing?: boolean };
 /**
  * Dry-run a backup/mirror set: report what the next run WOULD upload (new/changed
  * files + bytes) and, for mirror, which Drive items it would trash — without
- * uploading, trashing, or writing anything. Read-only; never contacts Drive.
+ * uploading, trashing, or writing anything. Same scan and deletion rules as a real
+ * run (engine.ts previewSet); reads Drive only for the items it would delete.
  */
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -29,7 +30,10 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   }
   g.__pdPreviewing = true;
   try {
-    const res = await previewDelta(id, set.sourcePaths, set.targetSubfolder, set.mode, set.excludes, undefined, set.includeHidden);
+    if (set.mode === 'mirror' && !(await isAuthenticated())) {
+      return Response.json({ error: 'Sign in to Proton Drive to preview deletions.' }, { status: 401 });
+    }
+    const res = await previewSet(await drive(), specFor(set));
     return Response.json(res);
   } finally {
     g.__pdPreviewing = false;

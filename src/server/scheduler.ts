@@ -1,6 +1,6 @@
 import { backupSets, type BackupSet } from './db';
 import { runBackupSet } from './runner';
-import { isAuthenticated } from './cli';
+import { writeGate } from './drive';
 
 /**
  * Minimal in-process scheduler. Ticks once a minute and runs any backup set
@@ -45,21 +45,26 @@ async function tick() {
       .filter((s) => s.schedule !== 'off' && s.lastStatus !== 'running' && isDue(s, now));
     if (due.length === 0) return;
 
-    if (!(await isAuthenticated())) {
-      // Pause scheduled runs while signed out. Write the skip once per set (not every
-      // tick) so we don't clobber the real last-run result or churn the DB each
-      // minute. isDue() still treats the slot as attempted-later, so each set resumes
-      // automatically on its next due slot after the user reconnects.
-      const msg = 'Skipped: not signed in to Proton Drive';
+    const blocked = await writeGate();
+    if (blocked) {
+      // Pause scheduled runs while signed out (or while the account is unconfirmed).
+      // Write the skip once per set (not every tick) so we don't clobber the real
+      // last-run result or churn the DB each minute. isDue() still treats the slot
+      // as not attempted, so each set runs as soon as the gate opens.
+      const msg = `Skipped: ${blocked}`;
       for (const s of due) {
         if (s.lastStatus === 'error' && s.lastMessage === msg) continue;
         backupSets.updateStatus(s.id, 'error', msg, false);
       }
       return;
     }
-    for (const s of due) {
+    for (const s0 of due) {
+      // Re-read: an earlier run of this tick can take hours; the user may have
+      // switched the schedule off, paused, or already run this set meanwhile.
+      const s = backupSets.get(s0.id);
+      if (!s || !isDue(s, new Date())) continue;
       console.log('[scheduler] running backup set %s (%s)', s.name, s.id);
-      await runBackupSet(s.id); // serialized via the CLI mutex anyway
+      await runBackupSet(s.id); // runs one after the other (runner queue)
     }
   } catch (e) {
     console.error('[scheduler] tick error', e);

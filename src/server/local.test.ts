@@ -313,3 +313,29 @@ describe('walkSourceStream', () => {
     expect(skips.find((s) => s.rel.includes('locked'))!.reason).toMatch(/folder not readable/);
   });
 });
+
+describe('walkSourceStream — parallel stat mode (network mounts)', () => {
+  it('yields exactly the same files, sizes and folder events as the synchronous mode', async () => {
+    const fsn = await import('node:fs');
+    const pth = await import('node:path');
+    const { walkSourceStream, LOCAL_ROOT } = await import('@/server/local');
+    const root = pth.join(LOCAL_ROOT, 'par');
+    for (let d = 0; d < 3; d++) {
+      fsn.mkdirSync(pth.join(root, `d${d}`), { recursive: true });
+      for (let i = 0; i < 70; i++) fsn.writeFileSync(pth.join(root, `d${d}`, `f${i}`), 'x'.repeat(i));
+    }
+    const collect = async () => {
+      const out: string[] = [];
+      for await (const f of walkSourceStream(root, 'R', { onDir: (r, sub) => out.push(`D ${r} ${sub?.join(',')}`) })) out.push(`F ${f.rel} ${f.size}`);
+      return out;
+    };
+    const sync = await collect();
+    process.env.PDB_SCAN_FORCE_PARALLEL = '1';
+    try {
+      expect(await collect()).toEqual(sync);
+    } finally {
+      delete process.env.PDB_SCAN_FORCE_PARALLEL;
+    }
+    expect(sync.filter((l) => l.startsWith('F')).length).toBe(210);
+  });
+});

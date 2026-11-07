@@ -1,10 +1,9 @@
-import { setUploadConfig } from '@/server/upload-config';
-import { uploadsView } from '@/server/traffic';
+import { getUploadConfig, setUploadConfig } from '@/server/upload-config';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
-  return Response.json(uploadsView());
+  return Response.json(getUploadConfig());
 }
 
 export async function POST(req: Request) {
@@ -13,7 +12,6 @@ export async function POST(req: Request) {
   if (body.concurrency != null) patch.concurrency = Number(body.concurrency);
   if (body.limitKBps != null) patch.limitKBps = Number(body.limitKBps);
   setUploadConfig(patch);
-  // The cap is (re)applied by the runner around each run so it doesn't throttle the
-  // UI/API between runs — so no immediate tc call here, just persist + report.
-  return Response.json(uploadsView());
+  // The engine re-reads the config within a second, also during a running backup.
+  return Response.json(getUploadConfig());
 }

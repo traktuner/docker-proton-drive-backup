@@ -1,771 +1,793 @@
 import path from 'node:path';
-import { promises as fsp } from 'node:fs';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
-
-// Mock the CLI (the only real-I/O / network layer the engine touches). Keep the
-// pure helpers (normalizeProtonPath / looksUnauthenticated) as the real impls so
-// path normalisation and the auth-string detection behave exactly as in prod;
-// stub everything that would spawn the proton-drive binary or hit Drive.
-vi.mock('@/server/cli', async (importActual) => {
-  const actual = await importActual<typeof import('@/server/cli')>();
-  return {
-    ...actual,
-    // pass-through pure helpers
-    normalizeProtonPath: actual.normalizeProtonPath,
-    looksUnauthenticated: actual.looksUnauthenticated,
-    // stubbed I/O — overwritten per-test via the spies below
-    upload: vi.fn(async () => ({ code: 0, stdout: '', stderr: '' })),
-    createFolder: vi.fn(async () => ({ ok: true, data: {} })),
-    trashDrive: vi.fn(async () => ({ ok: true, data: {} })),
-    listDrive: vi.fn(async () => ({ ok: true, data: [] })),
-  };
-});
-
-// Import AFTER the mock is registered. relBaseFor / runCatalogDelta come from the
-// engine; the catalog + LOCAL_ROOT come from the real (DB-backed) modules.
-import { relBaseFor, runCatalogDelta, previewDelta } from '@/server/engine';
-import * as cli from '@/server/cli';
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { FakeDrive } from '../../test/fake-drive';
+import { runSet, previewSet, verifySet, relBaseFor, topMost, engineActivity, type RunSpec } from '@/server/engine';
 import { catalog } from '@/server/catalog';
 import { LOCAL_ROOT } from '@/server/local';
-import { getDb } from '@/server/db';
+import { backupSets, getDb } from '@/server/db';
 import { setMirrorSafetyConfig } from '@/server/mirror-safety';
 
-const upload = vi.mocked(cli.upload);
-const createFolder = vi.mocked(cli.createFolder);
-const trashDrive = vi.mocked(cli.trashDrive);
+const sha1 = (s: string | Buffer) => createHash('sha1').update(s).digest('hex');
+let n = 0;
+let src = '';
+let drive: FakeDrive;
 
-// Convenience: write a fixture file under LOCAL_ROOT (relative path), creating
-// parent dirs. Returns its absolute path.
-async function writeFixture(rel: string, content = 'x'): Promise<string> {
-  const abs = path.join(LOCAL_ROOT, rel);
-  await fsp.mkdir(path.dirname(abs), { recursive: true });
-  await fsp.writeFile(abs, content);
+function write(rel: string, content: string | Buffer, mtimeMs?: number) {
+  const abs = path.join(src, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, content);
+  if (mtimeMs) fs.utimesSync(abs, mtimeMs / 1000, mtimeMs / 1000);
   return abs;
 }
 
+function makeSet(mode: 'add' | 'backup' | 'mirror', extra: Partial<RunSpec> = {}): RunSpec {
+  const s = backupSets.create({ name: `Set${n}`, sourcePaths: [src], targetPath: '/', mode });
+  return {
+    setId: s.id,
+    sourcePaths: [src],
+    targetPath: '/my-files',
+    subfolder: s.targetSubfolder,
+    mode,
+    skipThumbnails: true,
+    ...extra,
+  };
+}
+
+/** Remote path of a local file of the set (relative to the set folder on Drive). */
+const remote = (spec: RunSpec, rel: string) => `${relBaseFor(spec.subfolder, src)}/${rel}`;
+
 beforeEach(() => {
-  // Touch the catalog once so its table is created (catalog.ts creates it lazily
-  // on first use), then wipe it for a fresh per-test state.
-  catalog.count('__warm__');
-  getDb().exec('DELETE FROM backup_catalog');
-  upload.mockClear();
-  createFolder.mockClear();
-  trashDrive.mockClear();
-  // Every test starts with the historical behavior used by existing installs.
+  n++;
+  src = path.join(LOCAL_ROOT, `src${n}`);
+  fs.mkdirSync(src, { recursive: true });
+  drive = new FakeDrive();
+  getDb().exec('DELETE FROM backup_catalog; DELETE FROM backup_sets;');
   setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.3 });
-  // Reset to the default happy-path implementations (tests may override).
-  upload.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
-  createFolder.mockResolvedValue({ ok: true, data: {} } as any);
-  trashDrive.mockResolvedValue({ ok: true, data: {} } as any);
 });
 
-describe('relBaseFor (pure)', () => {
-  it('prefixes the source rel-to-LOCAL_ROOT with the subfolder', () => {
-    const abs = path.join(LOCAL_ROOT, 'foldera', 'Fotos');
-    expect(relBaseFor('MySet', abs)).toBe('MySet/foldera/Fotos');
+describe('first run and the unchanged follow-up run', () => {
+  it('uploads everything once; an unchanged re-run makes zero uploads, revisions, deletions and reads', async () => {
+    write('a.txt', 'alpha');
+    write('sub/b.txt', 'beta');
+    write('sub/deep/c.txt', 'gamma');
+    const spec = makeSet('mirror');
+    const r1 = await runSet(drive, spec);
+    expect(r1.ok).toBe(true);
+    expect(r1.newCount).toBe(3);
+    expect(drive.at(remote(spec, 'sub/deep/c.txt'))?.revisions).toHaveLength(1);
+
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(r2.unchangedCount).toBe(3);
+    expect(drive.calls.uploadNew + drive.calls.uploadRevision + drive.calls.trash + drive.calls.createFolder).toBe(0);
+    expect(drive.bytesRead).toBe(0);
+    // Only the target/set-folder identity check touches Drive.
+    expect(drive.calls.getNode).toBe(1);
   });
 
-  it('returns just the subfolder when abs === LOCAL_ROOT', () => {
-    expect(relBaseFor('MySet', LOCAL_ROOT)).toBe('MySet');
+  it('a changed file becomes exactly one new revision of the SAME node', async () => {
+    write('doc.txt', 'v1');
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    const node = drive.at(remote(spec, 'doc.txt'))!;
+    write('doc.txt', 'version 2', Date.now() + 10_000);
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.changedCount).toBe(1);
+    expect(drive.calls.uploadRevision).toBe(1);
+    expect(drive.calls.uploadNew).toBe(0);
+    expect(drive.at(remote(spec, 'doc.txt'))!.uid).toBe(node.uid);
+    expect(node.revisions.map((x) => x.content.toString())).toEqual(['v1', 'version 2']);
   });
 
-  it('handles a direct child of LOCAL_ROOT', () => {
-    const abs = path.join(LOCAL_ROOT, 'photos');
-    expect(relBaseFor('Backup', abs)).toBe('Backup/photos');
-  });
-});
-
-describe('runCatalogDelta — first run (recursive seed path)', () => {
-  it('counts new files, uploads, and writes the catalog', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'src');
-    await writeFixture('src/a.txt', 'aaa');
-    await writeFixture('src/sub/b.txt', 'bbbb');
-
-    const res = await runCatalogDelta('set1', [srcDir], '/', 'Set', 'backup');
-
-    expect(res.ok).toBe(true);
-    expect(res.cancelled).toBe(false);
-    expect(res.newCount).toBe(2);
-    expect(res.message).toBe('2 uploaded');
-    // The seed path uploads (at least once) via uploadSourceTrees.
-    expect(upload).toHaveBeenCalled();
-    // Catalog now records both files (keyed by "<subfolder>/<src-rel>/…").
-    expect(catalog.count('set1')).toBeGreaterThanOrEqual(2);
-    expect(catalog.getFile('set1', 'Set/src/a.txt')).toBeDefined();
-    expect(catalog.getFile('set1', 'Set/src/sub/b.txt')).toBeDefined();
-    // The directory rows are recorded too (so a later mirror pass can touch them).
-    expect(catalog.hasDir('set1', 'Set/src')).toBe(true);
-    expect(catalog.hasDir('set1', 'Set/src/sub')).toBe(true);
-  });
-});
-
-describe('runCatalogDelta — second run with no changes', () => {
-  it('reports everything unchanged and uploads nothing', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'src2');
-    await writeFixture('src2/a.txt', 'aaa');
-    await writeFixture('src2/b.txt', 'bbbb');
-
-    // First run seeds the catalog (recursive seed path).
-    await runCatalogDelta('set2', [srcDir], '/', 'Set', 'backup');
-    upload.mockClear();
-
-    // Second run: catalog is non-empty → per-file diff path. No changes on disk.
-    const res = await runCatalogDelta('set2', [srcDir], '/', 'Set', 'backup');
-
-    expect(res.ok).toBe(true);
-    expect(res.newCount).toBe(0);
-    expect(res.changedCount).toBe(0);
-    expect(res.unchangedCount).toBe(2);
-    expect(res.message).toContain('2 unchanged');
-    // Nothing re-uploaded.
-    expect(upload).not.toHaveBeenCalled();
-  });
-
-  it('detects a changed file (size differs) and re-uploads only it', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'src3');
-    await writeFixture('src3/a.txt', 'aaa');
-    await writeFixture('src3/b.txt', 'bbbb');
-
-    await runCatalogDelta('set3', [srcDir], '/', 'Set', 'backup');
-    upload.mockClear();
-
-    // Grow a.txt so its size differs from the catalog → 'changed'.
-    await writeFixture('src3/a.txt', 'aaaaaaaaaaaa');
-
-    const res = await runCatalogDelta('set3', [srcDir], '/', 'Set', 'backup');
-
-    expect(res.changedCount).toBe(1);
-    expect(res.unchangedCount).toBe(1);
-    expect(res.newCount).toBe(0);
-    // Exactly one batch upload for the single changed file.
-    expect(upload).toHaveBeenCalledTimes(1);
-    const [absList] = upload.mock.calls[0];
-    expect(absList).toEqual([path.join(srcDir, 'a.txt')]);
-  });
-
-  it('detects a brand-new file added after the seed', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'src4');
-    await writeFixture('src4/a.txt', 'aaa');
-
-    await runCatalogDelta('set4', [srcDir], '/', 'Set', 'backup');
-    upload.mockClear();
-
-    await writeFixture('src4/c.txt', 'cccc');
-
-    const res = await runCatalogDelta('set4', [srcDir], '/', 'Set', 'backup');
-
-    expect(res.newCount).toBe(1);
-    expect(res.unchangedCount).toBe(1);
-    expect(upload).toHaveBeenCalledTimes(1);
-    expect(catalog.getFile('set4', 'Set/src4/c.txt')).toBeDefined();
+  it('handles empty files, empty folders and special characters', async () => {
+    write('empty.bin', '');
+    fs.mkdirSync(path.join(src, 'empty dir/nested'), { recursive: true });
+    write('Movie [1080p] {x} *?.mkv', 'm');
+    write('ümlaut ñ 日本/ä#%&.txt', 'u');
+    const spec = makeSet('mirror');
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(drive.at(remote(spec, 'empty.bin'))?.revisions[0].size).toBe(0);
+    expect(drive.at(remote(spec, 'empty dir/nested'))?.kind).toBe('folder');
+    expect(drive.at(remote(spec, 'Movie [1080p] {x} *?.mkv'))).toBeDefined();
+    expect(drive.at(remote(spec, 'ümlaut ñ 日本/ä#%&.txt'))).toBeDefined();
+    // and nothing is "stale" on the next run: empty folders are kept, not trashed
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.deletedCount).toBe(0);
+    expect(drive.calls.trash).toBe(0);
   });
 });
 
-describe('runCatalogDelta — source addition without catalog reset (issue #51)', () => {
-  it('uploads only the added source and never re-uploads unchanged existing files', async () => {
-    const original = path.join(LOCAL_ROOT, 'source-add-old');
-    const added = path.join(LOCAL_ROOT, 'source-add-new');
-    await writeFixture('source-add-old/keep.txt', 'old-data');
-    await runCatalogDelta('source-add-set', [original], '/', 'Set', 'backup');
-    await writeFixture('source-add-new/new.txt', 'new-data');
-    upload.mockClear();
+describe('upgrade from a CLI-era catalog (no node ids, no digests)', () => {
+  it('first SDK run: zero uploads; one changed file → one revision of the existing Drive file', async () => {
+    const mtime = Date.now() - 86_400_000;
+    write('p/one.jpg', 'one', mtime);
+    write('p/two.jpg', 'two', mtime);
+    const spec = makeSet('mirror');
+    // What the CLI release left behind: files on Drive, catalog rows WITHOUT node_uid/sha1.
+    const base = relBaseFor(spec.subfolder, src);
+    drive.putFile(`${base}/p/one.jpg`, 'one', mtime);
+    drive.putFile(`${base}/p/two.jpg`, 'two', mtime);
+    for (const d of [spec.subfolder, base, `${base}/p`]) catalog.upsertDir(spec.setId, d, 1);
+    catalog.upsertFile(spec.setId, `${base}/p/one.jpg`, 3, mtime, null, 1);
+    catalog.upsertFile(spec.setId, `${base}/p/two.jpg`, 3, mtime, null, 1);
 
-    const res = await runCatalogDelta('source-add-set', [original, added], '/', 'Set', 'backup');
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.unchangedCount).toBe(2);
+    expect(drive.calls.uploadNew + drive.calls.uploadRevision + drive.calls.trash).toBe(0);
+    expect(drive.revisionCount).toBe(2);
 
-    expect(res.newCount).toBe(1);
-    expect(res.changedCount).toBe(0);
-    expect(res.unchangedCount).toBe(1);
-    expect(upload).toHaveBeenCalledTimes(1);
-    expect(upload.mock.calls[0][0]).toEqual([path.join(added, 'new.txt')]);
-    expect(catalog.getFile('source-add-set', 'Set/source-add-old/keep.txt')).toBeDefined();
-    expect(catalog.getFile('source-add-set', 'Set/source-add-new/new.txt')).toBeDefined();
+    write('p/two.jpg', 'TWO!', Date.now());
+    const before = drive.at(`${base}/p/two.jpg`)!;
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.changedCount).toBe(1);
+    expect(drive.calls.uploadRevision).toBe(1);
+    expect(drive.calls.uploadNew).toBe(0);
+    expect(before.revisions).toHaveLength(2);
+    expect(catalog.getFile(spec.setId, `${base}/p/two.jpg`)?.nodeUid).toBe(before.uid);
   });
 
-  it('still uploads a changed existing file while also adding the new source', async () => {
-    const original = path.join(LOCAL_ROOT, 'source-change-old');
-    const added = path.join(LOCAL_ROOT, 'source-change-new');
-    await writeFixture('source-change-old/changed.txt', 'old');
-    await runCatalogDelta('source-change-set', [original], '/', 'Set', 'backup');
-    await writeFixture('source-change-old/changed.txt', 'longer-current-data');
-    await writeFixture('source-change-new/new.txt', 'new');
-    upload.mockClear();
-
-    const res = await runCatalogDelta('source-change-set', [original, added], '/', 'Set', 'backup');
-    const uploaded = upload.mock.calls.flatMap(([files]) => files).sort();
-
-    expect(res.newCount).toBe(1);
-    expect(res.changedCount).toBe(1);
-    expect(uploaded).toEqual([
-      path.join(original, 'changed.txt'),
-      path.join(added, 'new.txt'),
-    ].sort());
-  });
-
-  it('does not classify retained Mirror files as stale after adding a source', async () => {
-    const original = path.join(LOCAL_ROOT, 'source-mirror-old');
-    const added = path.join(LOCAL_ROOT, 'source-mirror-new');
-    for (let i = 0; i < 10; i++) await writeFixture(`source-mirror-old/f${i}.txt`, `old-${i}`);
-    await runCatalogDelta('source-mirror-set', [original], '/', 'Set', 'mirror');
-    await writeFixture('source-mirror-new/new.txt', 'new');
-    upload.mockClear();
-    trashDrive.mockClear();
-
-    const res = await runCatalogDelta('source-mirror-set', [original, added], '/', 'Set', 'mirror');
-
-    expect(res.newCount).toBe(1);
-    expect(res.unchangedCount).toBe(10);
-    expect(res.deletedCount).toBe(0);
-    expect(trashDrive).not.toHaveBeenCalled();
+  it('mtime drift with a CLI-era row (no digest) compares with Drive instead of re-uploading', async () => {
+    const spec = makeSet('backup');
+    const base = relBaseFor(spec.subfolder, src);
+    write('x.txt', 'same', Date.now());
+    drive.putFile(`${base}/x.txt`, 'same', Date.now() - 100_000);
+    for (const d of [spec.subfolder, base]) catalog.upsertDir(spec.setId, d, 1);
+    catalog.upsertFile(spec.setId, `${base}/x.txt`, 4, Date.now() - 100_000, null, 1);
+    const r = await runSet(drive, spec);
+    expect(r.unchangedCount).toBe(1);
+    expect(drive.calls.uploadRevision + drive.calls.uploadNew).toBe(0);
+    expect(catalog.getFile(spec.setId, `${base}/x.txt`)?.sha1).toBe(sha1('same'));
   });
 });
 
-describe('runCatalogDelta — mirror deletion + safety gates', () => {
-  // Seed a catalog without going through the recursive seed path's stat/readdir
-  // (so the deletion-pass tests start from a known catalog independent of disk).
-  // We do a real first run to seed, then mutate disk and re-run in mirror mode.
-  async function seed(setId: string, srcDir: string) {
-    return runCatalogDelta(setId, [srcDir], '/', 'Set', 'backup');
+describe('first SDK run after an interrupted CLI first upload (files on Drive, not in the catalog)', () => {
+  it('adopts them from one listing per folder: no upload, no conflict round trip, no file read', async () => {
+    const t = Date.now() - 3_600_000;
+    for (let d = 0; d < 3; d++) for (let i = 0; i < 20; i++) write(`y${d}/f${i}.jpg`, `photo ${d}-${i}`, t);
+    const spec = makeSet('mirror');
+    for (let d = 0; d < 3; d++) for (let i = 0; i < 20; i++) drive.putFile(remote(spec, `y${d}/f${i}.jpg`), `photo ${d}-${i}`, t);
+    write('y0/new.jpg', 'genuinely new', t);
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.adoptedCount).toBe(60);
+    expect(drive.calls.uploadNew).toBe(1); // only the genuinely new file
+    expect(drive.calls.uploadRevision + drive.calls.getNode).toBe(0); // no per-file node lookups
+    expect(drive.bytesRead).toBe('genuinely new'.length);
+    expect(catalog.countFiles(spec.setId)).toBe(61);
+  });
+});
+
+describe('an existing Drive folder is listed once, ever', () => {
+  it('adopts while listing and never lists that folder again just to find uploaded files', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    for (let i = 0; i < 30; i++) {
+      write(`old/f${i}.jpg`, `p${i}`, t);
+      drive.putFile(remote(spec, `old/f${i}.jpg`), `p${i}`, t);
+    }
+    write('old/new1.jpg', 'new one', t);
+    const r1 = await runSet(drive, spec);
+    expect(r1.adoptedCount).toBe(30);
+    expect(r1.newCount).toBe(1);
+    const folderUid = drive.at(remote(spec, 'old'))!.uid;
+    write('old/new2.jpg', 'new two', t);
+    let listedOld = 0;
+    const orig = drive.children.bind(drive);
+    drive.children = (uid: string) => {
+      if (uid === folderUid) listedOld++;
+      return orig(uid);
+    };
+    const r2 = await runSet(drive, spec);
+    expect(r2.newCount).toBe(1);
+    expect(listedOld).toBe(0);
+  });
+
+  it('names the folder being listed in the progress and records the finished listing', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    drive.mkdirp(remote(spec, 'graph'));
+    for (let i = 0; i < 1000; i++) drive.putFile(remote(spec, `graph/old${i}.jpg`), 'x', t);
+    write('graph/new.jpg', 'new', t);
+    drive.listDelayMs = 300; // keep the listing on screen past the progress throttle
+    const seen: string[] = [];
+    const r = await runSet(drive, spec, { onProgress: (p) => seen.push(p.current) });
+    expect(r.ok).toBe(true);
+    expect(seen.some((c) => /reading Drive folder "[^"]*\/graph" \(1,000 items so far\)/.test(c))).toBe(true);
+    const summary = catalog.listedSummary().find((s) => s.setId === spec.setId);
+    expect(summary?.count).toBeGreaterThanOrEqual(1);
+    expect(summary?.lastRel).toMatch(/\/graph$/);
+  });
+
+  it('a listed folder is not listed again to find (or create) a subfolder, nor for CLI-era rows', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    for (let i = 0; i < 30; i++) {
+      write(`big/f${i}.jpg`, `p${i}`, t);
+      drive.putFile(remote(spec, `big/f${i}.jpg`), `p${i}`, t);
+    }
+    drive.putFile(remote(spec, 'big/sub/old.jpg'), 'o', t); // a subfolder already on Drive
+    write('big/new1.jpg', 'new one', t);
+    // A CLI-era row (no node uid, no digest) for a file the listing will see.
+    write('big/cli.jpg', 'cli', t);
+    drive.putFile(remote(spec, 'big/cli.jpg'), 'cli', t);
+    const cliRel = remote(spec, 'big/cli.jpg');
+    catalog.upsertFile(spec.setId, cliRel, 3, t, null, 1, null);
+    const r1 = await runSet(drive, spec); // lists "big" once (new1.jpg goes into it)
+    expect(r1.ok).toBe(true);
+    expect(catalog.getFile(spec.setId, cliRel)?.nodeUid).toBe(drive.at(remote(spec, 'big/cli.jpg'))!.uid); // remembered
+
+    const bigUid = drive.at(remote(spec, 'big'))!.uid;
+    let listedBig = 0;
+    const orig = drive.children.bind(drive);
+    drive.children = (uid: string) => {
+      if (uid === bigUid) listedBig++;
+      return orig(uid);
+    };
+    write('big/sub/fresh.jpg', 'fresh', t); // into the subfolder that exists on Drive
+    write('big/other/x.jpg', 'x', t); // into a subfolder that does not
+    write('big/cli.jpg', 'cli', t + 60_000); // same size, other mtime: compare digests
+    const subUid = drive.at(remote(spec, 'big/sub'))!.uid;
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(listedBig).toBe(0);
+    expect(drive.at(remote(spec, 'big/sub/fresh.jpg'))?.parentUid).toBe(subUid); // no second "sub"
+    expect(drive.at(remote(spec, 'big/other/x.jpg'))?.kind).toBe('file');
+    expect(drive.at(remote(spec, 'big/cli.jpg'))?.revisions).toHaveLength(1); // same content: no upload
+  });
+
+  it('never adopts hidden files when the set excludes them', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    write('d/.hidden', 'h', t);
+    write('d/visible.txt', 'v', t);
+    drive.putFile(remote(spec, 'd/.hidden'), 'h', t);
+    drive.putFile(remote(spec, 'd/other.txt'), 'o', t);
+    write('d/other.txt', 'o', t);
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(catalog.getFile(spec.setId, remote(spec, 'd/.hidden'))).toBeUndefined();
+  });
+});
+
+describe('many empty folders (a photo library\'s internals) do not stall the scan', () => {
+  it('creates them in parallel, each exactly once, reports progress, and an unchanged re-run creates none', async () => {
+    for (let i = 0; i < 60; i++) fs.mkdirSync(path.join(src, `lib/private/c${i % 6}/e${i}`), { recursive: true });
+    write('zz/after.txt', 'scanned after the empty folders');
+    const spec = makeSet('mirror');
+    let active = 0;
+    let peak = 0;
+    const made = new Map<string, number>();
+    const orig = drive.createFolder.bind(drive);
+    let maxQueued = 0;
+    drive.createFolder = async (parentUid: string, name: string) => {
+      active++;
+      peak = Math.max(peak, active);
+      const act = engineActivity().find((a) => a.setId === spec.setId) as { emptyFoldersQueued?: number } | undefined;
+      maxQueued = Math.max(maxQueued, act?.emptyFoldersQueued ?? 0);
+      await new Promise((r) => setTimeout(r, 15)); // a real create takes ~300 ms
+      try {
+        const n = await orig(parentUid, name);
+        made.set(`${parentUid}/${name}`, (made.get(`${parentUid}/${name}`) ?? 0) + 1);
+        return n;
+      } finally {
+        active--;
+      }
+    };
+    let foldersAtUpload = -1;
+    const origUp = drive.uploadNew.bind(drive);
+    drive.uploadNew = (async (...a: Parameters<FakeDrive['uploadNew']>) => {
+      foldersAtUpload = made.size;
+      return origUp(...a);
+    }) as FakeDrive['uploadNew'];
+    const seen: string[] = [];
+    const r = await runSet(drive, spec, { onProgress: (p) => seen.push(p.current) });
+    expect(r.ok).toBe(true);
+    expect(r.newCount).toBe(1);
+    expect(peak).toBeGreaterThan(1); // not one request after the other
+    // The scan went on to the file while the folders were still being created.
+    expect(foldersAtUpload).toBeGreaterThanOrEqual(0);
+    expect(foldersAtUpload).toBeLessThan(30);
+    expect([...made.values()].every((c) => c === 1)).toBe(true); // shared parents created once
+    for (let i = 0; i < 60; i++) expect(drive.at(remote(spec, `lib/private/c${i % 6}/e${i}`))?.kind).toBe('folder');
+    expect(seen.some((c) => /\d+ empty folders created/.test(c))).toBe(true);
+    expect(maxQueued).toBeGreaterThan(0); // /api/diagnostics shows the backlog
+    expect(engineActivity().find((a) => a.setId === spec.setId)).toBeUndefined(); // gone after the run
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(drive.calls.createFolder).toBe(0);
+  });
+
+  it('a rate limit (429) never skips a folder, and the lane shrinks to one worker while Proton throttles', async () => {
+    for (let i = 0; i < 12; i++) fs.mkdirSync(path.join(src, `cache/e${i}`), { recursive: true });
+    const spec = makeSet('mirror');
+    drive.faults.push({ op: 'createFolder', code: 'RATE_LIMITED', times: 3, match: (n) => n.startsWith('e') });
+    let active = 0;
+    let peak = 0;
+    const orig = drive.createFolder.bind(drive);
+    drive.createFolder = async (parentUid: string, name: string) => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 5));
+      try {
+        return await orig(parentUid, name);
+      } finally {
+        active--;
+      }
+    };
+    drive.rateLimitedAt = () => Date.now(); // Proton keeps answering 429 for this run
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.failedCount).toBe(0);
+    for (let i = 0; i < 12; i++) expect(drive.at(remote(spec, `cache/e${i}`))?.kind).toBe('folder');
+    expect(peak).toBe(1);
+  });
+
+  it('a backlog over the cap makes the scan wait, and still every folder is created', async () => {
+    process.env.PDB_DIR_BACKLOG_CAP = '5';
+    try {
+      for (let i = 0; i < 5000; i++) fs.mkdirSync(path.join(src, `many/d${i}`), { recursive: true });
+      write('zz/after.txt', 'after');
+      const spec = makeSet('mirror');
+      const r = await runSet(drive, spec);
+      expect(r.ok).toBe(true);
+      expect(r.newCount).toBe(1);
+      const many = drive.at(remote(spec, 'many'))!.uid;
+      expect([...drive.nodes.values()].filter((n) => n.parentUid === many).length).toBe(5000);
+    } finally {
+      delete process.env.PDB_DIR_BACKLOG_CAP;
+    }
+  });
+
+  it('parallel uploads into one new folder create that folder once', async () => {
+    for (let i = 0; i < 20; i++) write(`fresh/deep/f${i}.txt`, `n${i}`);
+    const spec = makeSet('backup');
+    const orig = drive.createFolder.bind(drive);
+    const names: string[] = [];
+    drive.createFolder = async (parentUid: string, name: string) => {
+      names.push(name);
+      await new Promise((r) => setTimeout(r, 10));
+      return orig(parentUid, name);
+    };
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(names.filter((x) => x === 'fresh')).toHaveLength(1);
+    expect(names.filter((x) => x === 'deep')).toHaveLength(1);
+  });
+});
+
+describe('one listing per existing Drive folder, even with parallel uploads into it', () => {
+  it('parallel new files in a folder that already exists on Drive share a single listing', async () => {
+    const spec = makeSet('backup');
+    for (let i = 0; i < 40; i++) write(`dir/f${i}.txt`, `n${i}`);
+    drive.mkdirp(remote(spec, 'dir'));
+    for (let i = 0; i < 200; i++) drive.putFile(remote(spec, `dir/old${i}.txt`), 'x');
+    drive.listDelayMs = 30; // a slow listing overlaps with the next parallel upload
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.newCount).toBe(40);
+    // root + target + set folder + source chain + 'dir' — but 'dir' exactly once.
+    expect(drive.calls.children).toBeLessThanOrEqual(6);
+  });
+});
+
+describe("Proton's per-folder item limit (200300): continuation folders", () => {
+  const names = (spec: RunSpec, rel: string) =>
+    [...drive.nodes.values()].filter((n) => n.parentUid === drive.at(remote(spec, rel))?.uid && !n.trashed).map((n) => n.name).sort();
+
+  it('puts what does not fit into "<folder> · part N" next to it; nothing is skipped; re-runs are no-ops', async () => {
+    for (let i = 0; i < 30; i++) write(`big/f${String(i).padStart(2, '0')}.bin`, `b${i}`);
+    for (let i = 0; i < 3; i++) write(`small/f${i}.bin`, `s${i}`);
+    const spec = makeSet('mirror');
+    drive.maxChildren = 10;
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.failedCount).toBe(0);
+    expect(r.newCount).toBe(33);
+    expect(names(spec, '')).toEqual(['big', 'big · part 2', 'big · part 3', 'small']);
+    expect(drive.at(remote(spec, 'big · part 3'))!.uid).toBeTruthy();
+    const total = ['big', 'big · part 2', 'big · part 3'].reduce((n, d) => n + names(spec, d).length, 0);
+    expect(total).toBe(30);
+    expect(catalog.partsSummary(spec.setId)).toEqual([{ rel: remote(spec, 'big'), parts: 3 }]); // UI notice
+
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.unchangedCount).toBe(33);
+    expect(drive.calls.uploadNew + drive.calls.createFolder + drive.calls.trash).toBe(0);
+
+    // A changed file that lives in part 3 becomes a revision of that node.
+    const inPart3 = names(spec, 'big · part 3')[0];
+    const node = drive.at(remote(spec, `big · part 3/${inPart3}`))!;
+    write(`big/${inPart3}`, 'changed!', Date.now() + 5000);
+    const r3 = await runSet(drive, spec);
+    expect(r3.changedCount).toBe(1);
+    expect(node.revisions).toHaveLength(2);
+  });
+
+  it('a subfolder of a full folder is created in the current part', async () => {
+    for (let i = 0; i < 10; i++) write(`big/f${i}.bin`, `b${i}`);
+    write('big/sub/inner.txt', 'i');
+    const spec = makeSet('backup');
+    drive.maxChildren = 10;
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    const where = ['big', 'big · part 2'].find((d) => names(spec, d).includes('sub'));
+    expect(where).toBeDefined();
+    expect(drive.at(remote(spec, `${where}/sub/inner.txt`))).toBeDefined();
+  });
+
+  it('mirror trashes files inside parts and a removed folder together with its parts; parts are never "foreign"', async () => {
+    setMirrorSafetyConfig({ enabled: false, deleteSafetyPct: 0.3 });
+    for (let i = 0; i < 25; i++) write(`big/f${String(i).padStart(2, '0')}.bin`, `b${i}`);
+    write('keep.txt', 'k');
+    const spec = makeSet('mirror');
+    drive.maxChildren = 10;
+    await runSet(drive, spec);
+    const inPart2 = names(spec, 'big · part 2')[0];
+    fs.rmSync(path.join(src, 'big', inPart2));
+    const preview = await previewSet(drive, spec);
+    const r = await runSet(drive, spec);
+    expect(r.deletedCount).toBe(1);
+    expect(preview.wouldDeleteCount).toBe(1);
+    expect(drive.at(remote(spec, `big · part 2/${inPart2}`))).toBeUndefined();
+
+    fs.rmSync(path.join(src, 'big'), { recursive: true });
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(names(spec, '')).toEqual(['keep.txt']);
+  });
+
+  it('rediscovers parts by name when the index is lost — no duplicate parts', async () => {
+    for (let i = 0; i < 25; i++) write(`big/f${String(i).padStart(2, '0')}.bin`, `b${i}`);
+    const spec = makeSet('backup');
+    drive.maxChildren = 10;
+    await runSet(drive, spec);
+    getDb().exec('DELETE FROM drive_parts');
+    for (let i = 0; i < 8; i++) write(`big/new${i}.bin`, `n${i}`);
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    // part 3 had 5 free slots, the other 3 went to a new part 4; parts 2/3 were reused.
+    expect(names(spec, '').filter((n) => n.startsWith('big'))).toEqual(['big', 'big · part 2', 'big · part 3', 'big · part 4']);
+  });
+
+  it('verify sees files in parts and does not count parts as foreign', async () => {
+    for (let i = 0; i < 15; i++) write(`big/f${i}.bin`, `b${i}`);
+    const spec = makeSet('backup');
+    drive.maxChildren = 10;
+    await runSet(drive, spec);
+    const v = await verifySet(drive, spec);
+    expect(v.repaired).toBe(0);
+    expect(v.foreign).toBe(0);
+    expect(v.checked).toBe(15);
+  });
+
+  it('nesting too deep stays a clear, permanent skip', async () => {
+    write('a/b.txt', 'x');
+    const spec = makeSet('backup');
+    drive.faults.push({ op: 'createFolder', code: 'TOO_DEEP', times: 99, match: (nm) => nm === 'a' });
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(false);
+    expect(r.failedFiles[0].reason).toMatch(/nested deeper/);
+  });
+});
+
+describe('crash between Drive confirmation and the SQLite commit', () => {
+  it('a NEW file Drive already has is adopted, not uploaded twice', async () => {
+    write('a.txt', 'payload');
+    const spec = makeSet('backup');
+    drive.faults.push({ op: 'uploadNew', code: 'NETWORK', times: 1, afterCommit: true });
+    const r1 = await runSet(drive, { ...spec });
+    // The upload was retried after the "crash": the retry found the committed file.
+    expect(r1.adoptedCount + r1.newCount).toBeGreaterThan(0);
+    expect(drive.at(remote(spec, 'a.txt'))!.revisions).toHaveLength(1);
+  });
+
+  it('a REVISION Drive already has is adopted on restart (no second revision)', async () => {
+    write('a.txt', 'v1');
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    const node = drive.at(remote(spec, 'a.txt'))!;
+    write('a.txt', 'v2-longer', Date.now() + 5000);
+    // Simulate: Drive committed v2, then the process died before recording it.
+    drive.faults.push({ op: 'uploadRevision', code: 'UNAUTHENTICATED', times: 1, afterCommit: true });
+    await runSet(drive, spec);
+    expect(node.revisions).toHaveLength(2);
+    expect(catalog.getFile(spec.setId, remote(spec, 'a.txt'))?.size).toBe(2); // still v1 in the catalog
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.adoptedCount).toBe(1);
+    expect(drive.calls.uploadRevision).toBe(0);
+    expect(node.revisions).toHaveLength(2);
+    expect(catalog.getFile(spec.setId, remote(spec, 'a.txt'))?.size).toBe(9);
+  });
+
+  it('an upload that failed before confirmation is never recorded as backed up', async () => {
+    write('a.txt', 'x');
+    const spec = makeSet('backup');
+    drive.faults.push({ op: 'uploadNew', code: 'QUOTA', times: 1 });
+    const r = await runSet(drive, spec);
+    expect(r.failedCount).toBe(1);
+    expect(catalog.getFile(spec.setId, remote(spec, 'a.txt'))).toBeUndefined();
+  });
+});
+
+describe('mirror safety', () => {
+  async function seeded(files = 10) {
+    for (let i = 0; i < files; i++) write(`f${i}.txt`, `c${i}`);
+    const spec = makeSet('mirror');
+    await runSet(drive, spec);
+    return spec;
   }
 
-  it('trashes a file that vanished locally (mirror)', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'm1');
-    // Several files so removing one stays well under the 30% safety threshold.
-    for (let i = 0; i < 10; i++) await writeFixture(`m1/f${i}.txt`, `data-${i}`);
-
-    await seed('m1set', srcDir);
-    trashDrive.mockClear();
-
-    // Delete one local file → it becomes "stale" in the catalog next run.
-    await fsp.rm(path.join(srcDir, 'f3.txt'));
-
-    const res = await runCatalogDelta('m1set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(res.deletedCount).toBe(1);
-    expect(trashDrive).toHaveBeenCalledTimes(1);
-    // Trashed the right Drive path (normalized under /my-files).
-    expect(trashDrive).toHaveBeenCalledWith('/my-files/Set/m1/f3.txt');
-    expect(res.message).toContain('1 removed');
-    // Catalog entry for the trashed file is dropped.
-    expect(catalog.getFile('m1set', 'Set/m1/f3.txt')).toBeUndefined();
+  it('an offline NAS share (empty mountpoint) never deletes; an intentionally emptied folder does after confirmation', async () => {
+    setMirrorSafetyConfig({ enabled: false, deleteSafetyPct: 0.3 });
+    const spec = await seeded();
+    for (const f of fs.readdirSync(src)) fs.rmSync(path.join(src, f), { recursive: true });
+    const r = await runSet(drive, spec);
+    expect(r.deletionSkipped).toMatch(/is empty/);
+    expect(drive.calls.trash).toBe(0);
+    const r2 = await runSet(drive, { ...spec, confirmSources: true });
+    expect(r2.deletedCount).toBe(10);
   });
 
-  it('hard safety gate: skips deletion when a source is missing even if the percentage gate is disabled', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'm2');
-    for (let i = 0; i < 10; i++) await writeFixture(`m2/f${i}.txt`, `data-${i}`);
-
-    await seed('m2set', srcDir);
-    trashDrive.mockClear();
-
-    // Remove the ENTIRE source directory: every file is now "stale", but because the
-    // configured source path itself is gone, the engine must NOT trash anything.
-    await fsp.rm(srcDir, { recursive: true, force: true });
-    setMirrorSafetyConfig({ enabled: false });
-
-    const res = await runCatalogDelta('m2set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(trashDrive).not.toHaveBeenCalled();
-    expect(res.deletedCount).toBe(0);
-    expect(res.ok).toBe(false); // deletionSkipped makes the run not-ok
-    expect(res.message).toContain('deletion skipped for safety');
-    expect(res.message).toContain('missing on disk');
-    // Nothing dropped from the catalog.
-    expect(catalog.getFile('m2set', 'Set/m2/f0.txt')).toBeDefined();
-  });
-
-  it('safety gate: skips deletion when >30% of the catalog would be removed', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'm3');
-    // 5 files seeded.
-    for (let i = 0; i < 5; i++) await writeFixture(`m3/f${i}.txt`, `data-${i}`);
-
-    await seed('m3set', srcDir);
-    trashDrive.mockClear();
-
-    // Delete 3 of 5 files (>30%) while keeping the source dir present (so gate #1
-    // passes) and no upload failures (gate #2 passes) — only the percentage gate
-    // should fire.
-    await fsp.rm(path.join(srcDir, 'f0.txt'));
-    await fsp.rm(path.join(srcDir, 'f1.txt'));
-    await fsp.rm(path.join(srcDir, 'f2.txt'));
-
-    const res = await runCatalogDelta('m3set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(trashDrive).not.toHaveBeenCalled();
-    expect(res.deletedCount).toBe(0);
-    expect(res.message).toContain('deletion skipped for safety');
-    // The wording mentions the >30% bound.
-    expect(res.message).toMatch(/would be removed|>30%/);
-    // Surviving + removed catalog entries are all still present (nothing trashed).
-    expect(catalog.getFile('m3set', 'Set/m3/f0.txt')).toBeDefined();
-  });
-
-  it('uses a custom global threshold for the live Mirror deletion pass', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'm-custom');
-    for (let i = 0; i < 5; i++) await writeFixture(`m-custom/f${i}.txt`, `data-${i}`);
-    await seed('m-custom-set', srcDir);
-    trashDrive.mockClear();
-
-    // Three missing file rows exceed the historical 30% threshold. Raising the
-    // global threshold to 80% must permit this intentional deletion.
-    await fsp.rm(path.join(srcDir, 'f0.txt'));
-    await fsp.rm(path.join(srcDir, 'f1.txt'));
-    await fsp.rm(path.join(srcDir, 'f2.txt'));
-    setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.8 });
-
-    const res = await runCatalogDelta('m-custom-set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(res.ok).toBe(true);
-    expect(res.deletedCount).toBe(3);
-    expect(trashDrive).toHaveBeenCalledTimes(3);
-    expect(res.message).toContain('3 removed');
-  });
-
-  it('can disable only the percentage gate for an intentional full Mirror deletion', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'm-disabled');
-    for (let i = 0; i < 5; i++) await writeFixture(`m-disabled/f${i}.txt`, `data-${i}`);
-    await seed('m-disabled-set', srcDir);
-    trashDrive.mockClear();
-
-    for (let i = 0; i < 5; i++) await fsp.rm(path.join(srcDir, `f${i}.txt`));
-    setMirrorSafetyConfig({ enabled: false });
-
-    const res = await runCatalogDelta('m-disabled-set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(res.ok).toBe(true);
-    expect(res.deletedCount).toBeGreaterThan(0);
-    expect(trashDrive).toHaveBeenCalled();
-    expect(catalog.count('m-disabled-set')).toBe(0);
-  });
-
-  it('backup mode never trashes, even when a file vanished locally', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'm4');
-    for (let i = 0; i < 10; i++) await writeFixture(`m4/f${i}.txt`, `data-${i}`);
-
-    await seed('m4set', srcDir);
-    trashDrive.mockClear();
-
-    await fsp.rm(path.join(srcDir, 'f2.txt'));
-
-    const res = await runCatalogDelta('m4set', [srcDir], '/', 'Set', 'backup');
-
-    expect(trashDrive).not.toHaveBeenCalled();
-    expect(res.deletedCount).toBe(0);
-    // The vanished file's catalog entry is NOT seen this run but backup never prunes.
-    expect(catalog.getFile('m4set', 'Set/m4/f2.txt')).toBeDefined();
-  });
-});
-
-describe('runCatalogDelta — auth + cancel handling', () => {
-  it('stops with the reconnect message when an upload reports a dead session', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'auth1');
-    await writeFixture('auth1/a.txt', 'aaa');
-    // Seed first (seed path), then make the per-file upload fail with an auth error.
-    await runCatalogDelta('authset', [srcDir], '/', 'Set', 'backup');
-
-    // Add a new file so the second run has something to upload, then make upload
-    // return an unauthenticated error (matches looksUnauthenticated → "no session").
-    await writeFixture('auth1/b.txt', 'bbbb');
-    upload.mockResolvedValue({ code: 1, stdout: '', stderr: 'Error: no session found' });
-
-    const res = await runCatalogDelta('authset', [srcDir], '/', 'Set', 'backup');
-
-    expect(res.ok).toBe(false);
-    expect(res.message).toMatch(/Proton session expired/i);
-  });
-
-  it('returns a cancelled result when shouldCancel is set during the seed', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'cancel1');
-    await writeFixture('cancel1/a.txt', 'aaa');
-
-    // shouldCancel true from the start → the seed path's post-upload check returns
-    // the cancelled result.
-    const res = await runCatalogDelta(
-      'cancelset',
-      [srcDir],
-      '/',
-      'Set',
-      'backup',
-      [],
-      () => {},
-      () => {},
-      () => true,
-    );
-
-    expect(res.cancelled).toBe(true);
-    expect(res.ok).toBe(false);
-    expect(res.message).toContain('Cancelled');
-  });
-});
-
-describe('runCatalogDelta — excludes', () => {
-  it('skips excluded files (and they force the per-file path, not the seed)', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'ex1');
-    await writeFixture('ex1/keep.txt', 'keep');
-    await writeFixture('ex1/skip.log', 'log');
-
-    // excludes.length > 0 → seed path is skipped even with an empty catalog; the
-    // engine runs the per-file diff and never uploads the excluded file.
-    const res = await runCatalogDelta('exset', [srcDir], '/', 'Set', 'backup', ['*.log']);
-
-    expect(res.newCount).toBe(1); // only keep.txt
-    expect(catalog.getFile('exset', 'Set/ex1/keep.txt')).toBeDefined();
-    expect(catalog.getFile('exset', 'Set/ex1/skip.log')).toBeUndefined();
-  });
-});
-
-describe('previewDelta (dry run — read-only)', () => {
-  it('first run (empty catalog): everything would upload, nothing unchanged/deleted', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pv1');
-    await writeFixture('pv1/a.txt', 'aaa');
-    await writeFixture('pv1/sub/b.txt', 'bbbb');
-
-    const p = await previewDelta('pvset1', [srcDir], 'Set', 'backup');
-
-    expect(p.ok).toBe(true);
-    expect(p.wouldUploadCount).toBe(2);
-    expect(p.wouldUploadBytes).toBe(7); // 'aaa' (3) + 'bbbb' (4)
-    expect(p.unchangedCount).toBe(0);
-    expect(p.wouldDeleteCount).toBe(0);
-    // Read-only: never touches Drive, never seeds the catalog.
-    expect(upload).not.toHaveBeenCalled();
-    expect(createFolder).not.toHaveBeenCalled();
-    expect(catalog.count('pvset1')).toBe(0);
-  });
-
-  it('after a real run with no changes: 0 to upload, all unchanged, catalog untouched', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pv2');
-    await writeFixture('pv2/a.txt', 'aaa');
-    await writeFixture('pv2/b.txt', 'bbbb');
-    await runCatalogDelta('pvset2', [srcDir], '/', 'Set', 'backup'); // seed
-    const before = catalog.count('pvset2');
-    upload.mockClear();
-
-    const p = await previewDelta('pvset2', [srcDir], 'Set', 'backup');
-
-    expect(p.wouldUploadCount).toBe(0);
-    expect(p.unchangedCount).toBe(2);
-    expect(upload).not.toHaveBeenCalled();
-    expect(catalog.count('pvset2')).toBe(before); // unchanged
-  });
-
-  it('mirror: lists Drive items that vanished locally, without trashing anything', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pv3');
-    await writeFixture('pv3/a.txt', 'aaa');
-    await writeFixture('pv3/b.txt', 'bbbb');
-    await runCatalogDelta('pvset3', [srcDir], '/', 'Set', 'mirror'); // seed both
-
-    await fsp.rm(path.join(LOCAL_ROOT, 'pv3/a.txt')); // a.txt gone locally
-    trashDrive.mockClear();
-
-    const p = await previewDelta('pvset3', [srcDir], 'Set', 'mirror');
-
-    expect(p.wouldUploadCount).toBe(0);
-    expect(p.unchangedCount).toBe(1); // b.txt
-    expect(p.wouldDeleteCount).toBe(1);
-    expect(p.wouldDelete).toContain('Set/pv3/a.txt');
-    expect(p.deletionWouldSkip).toBeNull();
-    // Still read-only: never trashes, catalog row for a.txt survives.
-    expect(trashDrive).not.toHaveBeenCalled();
-    expect(catalog.getFile('pvset3', 'Set/pv3/a.txt')).toBeDefined();
-  });
-
-  it('mirror: flags that the real run would SKIP deletion when a source is missing', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pv4');
-    await writeFixture('pv4/a.txt', 'aaa');
-    await writeFixture('pv4/b.txt', 'bbbb');
-    await runCatalogDelta('pvset4', [srcDir], '/', 'Set', 'mirror'); // seed
-
-    await fsp.rm(srcDir, { recursive: true }); // the whole source mount vanished
-
-    const p = await previewDelta('pvset4', [srcDir], 'Set', 'mirror');
-
-    expect(p.deletionWouldSkip).toBeTruthy();
-    expect(p.deletionWouldSkip).toMatch(/source path is missing/i);
-  });
-
-  it('mirror: uses the same custom or disabled percentage gate as a live run', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pv-safety');
-    for (let i = 0; i < 5; i++) await writeFixture(`pv-safety/f${i}.txt`, `data-${i}`);
-    await runCatalogDelta('pv-safety-set', [srcDir], '/', 'Set', 'mirror');
-    await fsp.rm(path.join(srcDir, 'f0.txt'));
-    await fsp.rm(path.join(srcDir, 'f1.txt'));
-    await fsp.rm(path.join(srcDir, 'f2.txt'));
-
-    setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.2 });
-    const blocked = await previewDelta('pv-safety-set', [srcDir], 'Set', 'mirror');
-    expect(blocked.deletionWouldSkip).toMatch(/>20%/);
-
-    setMirrorSafetyConfig({ enabled: true, deleteSafetyPct: 0.8 });
-    const allowed = await previewDelta('pv-safety-set', [srcDir], 'Set', 'mirror');
-    expect(allowed.deletionWouldSkip).toBeNull();
-    expect(allowed.wouldDeleteCount).toBe(3);
-
-    setMirrorSafetyConfig({ enabled: false });
-    const disabled = await previewDelta('pv-safety-set', [srcDir], 'Set', 'mirror');
-    expect(disabled.deletionWouldSkip).toBeNull();
-    expect(trashDrive).not.toHaveBeenCalled();
-  });
-
-  it('backup mode never reports deletions', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pv5');
-    await writeFixture('pv5/a.txt', 'aaa');
-    await runCatalogDelta('pvset5', [srcDir], '/', 'Set', 'backup');
-    await fsp.rm(path.join(LOCAL_ROOT, 'pv5/a.txt')); // gone locally
-
-    const p = await previewDelta('pvset5', [srcDir], 'Set', 'backup');
-
-    expect(p.wouldDeleteCount).toBe(0);
-    expect(p.deletionWouldSkip).toBeNull();
-  });
-});
-
-describe('runCatalogDelta — per-file failure isolation (issue #22)', () => {
-  it('isolates one poison file so its batch-mates still sync and only it fails', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'iso1');
-    await writeFixture('iso1/good1.txt', 'a');
-    await writeFixture('iso1/good2.txt', 'b');
-    await writeFixture('iso1/bad [1080p].mkv', 'c');
-
-    // Fail any upload whose batch includes the bracketed file; succeed otherwise.
-    // (upload is mocked, so the real escapeGlobPath never runs here — this test
-    // exercises the engine's ISOLATION independently of the cli.ts escaping fix.)
-    upload.mockImplementation(async (absList: string[]) => {
-      if (absList.some((p) => p.includes('bad ['))) return { code: 1, stdout: '', stderr: 'No paths matched' };
-      return { code: 0, stdout: '', stderr: '' };
-    });
-
-    // excludes.length > 0 forces the per-file path (skips the recursive seed), so
-    // every file flows through flush()/bisection. The pattern matches nothing real.
-    const res = await runCatalogDelta('iso1set', [srcDir], '/', 'Set', 'backup', ['__none__']);
-
-    expect(res.failedCount).toBe(1);
-    expect(res.ok).toBe(false);
-    expect(res.message).toContain('1 failed');
-    // The summary NAMES the offending file and gives a human reason, not just a count.
-    expect(res.message).toContain('bad [1080p].mkv');
-    expect(res.message).toMatch(/characters the Drive CLI cannot handle/);
-    // …and the structured failedFiles list (persisted for the UI's skip panel) carries it.
-    expect(res.failedFiles).toContainEqual({
-      rel: 'Set/iso1/bad [1080p].mkv',
-      reason: 'the name has characters the Drive CLI cannot handle',
-    });
-    // The two good files synced and are cataloged; the poison file is not.
-    expect(catalog.getFile('iso1set', 'Set/iso1/good1.txt')).toBeDefined();
-    expect(catalog.getFile('iso1set', 'Set/iso1/good2.txt')).toBeDefined();
-    expect(catalog.getFile('iso1set', 'Set/iso1/bad [1080p].mkv')).toBeUndefined();
-    // Bisection actually happened → more than one upload attempt.
-    expect(upload.mock.calls.length).toBeGreaterThan(1);
-  });
-
-  it('a fully-good batch still uploads in ONE call (no bisection on the happy path)', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'iso2');
-    await writeFixture('iso2/a.txt', 'aaa');
-    await writeFixture('iso2/b.txt', 'bbb');
-
-    const res = await runCatalogDelta('iso2set', [srcDir], '/', 'Set', 'backup', ['__none__']);
-
-    expect(res.failedCount).toBe(0);
-    expect(res.ok).toBe(true);
-    // One bucket, one successful upload — no per-file slowdown when nothing fails.
-    expect(upload).toHaveBeenCalledTimes(1);
-  });
-
-  it('includeHidden: dotfiles are skipped by default but backed up when the flag is set', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'hid');
-    await writeFixture('hid/visible.txt', 'a');
-    await writeFixture('hid/.secret', 'b');
-    await writeFixture('hid/.config/app.conf', 'c');
-
-    // Default (seed path): dotfiles and dot-directories are skipped.
-    await runCatalogDelta('hidOff', [srcDir], '/', 'Set', 'backup');
-    expect(catalog.getFile('hidOff', 'Set/hid/visible.txt')).toBeDefined();
-    expect(catalog.getFile('hidOff', 'Set/hid/.secret')).toBeUndefined();
-    expect(catalog.getFile('hidOff', 'Set/hid/.config/app.conf')).toBeUndefined();
-
-    // includeHidden: the dotfile AND the file under the dot-directory are backed up.
-    await runCatalogDelta('hidOn', [srcDir], '/', 'Set', 'backup', [], undefined, undefined, undefined, {
-      includeHidden: true,
-    });
-    expect(catalog.getFile('hidOn', 'Set/hid/visible.txt')).toBeDefined();
-    expect(catalog.getFile('hidOn', 'Set/hid/.secret')).toBeDefined();
-    expect(catalog.getFile('hidOn', 'Set/hid/.config/app.conf')).toBeDefined();
-  });
-
-  it('mirror: a poison file keeps failedCount>0 so the deletion pass is skipped', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'iso3');
-    for (let i = 0; i < 10; i++) await writeFixture(`iso3/f${i}.txt`, `data-${i}`);
-    await runCatalogDelta('iso3set', [srcDir], '/', 'Set', 'backup'); // seed (all ok)
-    upload.mockClear();
-    trashDrive.mockClear();
-
-    // f0 changes AND its upload fails; f1 vanishes locally (would be "stale").
-    await writeFixture('iso3/f0.txt', 'grown-content-that-differs-in-size');
-    await fsp.rm(path.join(srcDir, 'f1.txt'));
-    upload.mockImplementation(async (absList: string[]) => {
-      if (absList.some((p) => p.endsWith('f0.txt'))) return { code: 1, stdout: '', stderr: 'boom' };
-      return { code: 0, stdout: '', stderr: '' };
-    });
-    setMirrorSafetyConfig({ enabled: false });
-
-    const res = await runCatalogDelta('iso3set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(res.failedCount).toBe(1);
-    // Hard safety gate #2 (an upload failed) remains active when the percentage
-    // gate is disabled → deletion is skipped and nothing is trashed.
-    expect(trashDrive).not.toHaveBeenCalled();
-    expect(res.deletedCount).toBe(0);
-    expect(res.message).toMatch(/failed to upload|deletion skipped/i);
-    // The vanished file's catalog entry survives (never trashed/dropped).
-    expect(catalog.getFile('iso3set', 'Set/iso3/f1.txt')).toBeDefined();
-  });
-});
-
-// Memory-bounding behaviour (the 8 → 16 GiB OOM-kill loop). Two things the engine
-// must do so one kill never becomes a daily kill:
-//  (1) the recursive seed records the catalog PER completed unit (one CLI process per
-//      top-level subtree), so a kill mid-seed leaves a non-empty catalog and the next
-//      run resumes per file instead of re-running the whole seed;
-//  (2) pending upload buckets are capped in TOTAL, so a tree of many small folders
-//      (none ever reaching CHUNK) can't hold every new file in memory until the walk ends.
-describe('runCatalogDelta — bounded memory (seed resumability + pending cap)', () => {
-  it('seed: one CLI process per top-level subtree, catalog recorded after each one', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'seedu');
-    await writeFixture('seedu/d1/a.txt', 'aaa');
-    await writeFixture('seedu/d2/b.txt', 'bbb');
-
-    // Fail the SECOND directory unit (whichever order readdir yields them in).
-    let dirUnits = 0;
-    upload.mockImplementation(async (absList: string[]) => {
-      if (absList.length === 1 && /[/\\]d[12]$/.test(absList[0])) {
-        dirUnits += 1;
-        if (dirUnits === 2) return { code: 1, stdout: '', stderr: 'boom' };
-      }
-      return { code: 0, stdout: '', stderr: '' };
-    });
-
-    const first = await runCatalogDelta('seedu-set', [srcDir], '/', 'Set', 'backup');
-    expect(first.ok).toBe(false);
-    expect(first.message).toMatch(/Initial upload failed/);
-    // Each subtree was its own upload call (not one call with both children)…
-    expect(dirUnits).toBe(2);
-    // …and the one that completed is already in the catalog despite the failure.
-    const a = catalog.getFile('seedu-set', 'Set/seedu/d1/a.txt');
-    const b = catalog.getFile('seedu-set', 'Set/seedu/d2/b.txt');
-    expect([a, b].filter(Boolean)).toHaveLength(1);
-    expect(first.newCount).toBe(1);
-
-    // Next run: catalog is non-empty → per-file path, which uploads ONLY the
-    // subtree that was still missing — no second recursive seed of everything.
-    upload.mockClear();
-    upload.mockResolvedValue({ code: 0, stdout: '', stderr: '' });
-    const second = await runCatalogDelta('seedu-set', [srcDir], '/', 'Set', 'backup');
-    expect(second.ok).toBe(true);
-    expect(second.newCount).toBe(1);
-    expect(second.unchangedCount).toBe(1);
-    expect(upload).toHaveBeenCalledTimes(1);
-    const uploadedAbs = upload.mock.calls[0][0];
-    expect(uploadedAbs).toHaveLength(1);
-    expect(uploadedAbs[0]).toMatch(a ? /d2[/\\]b\.txt$/ : /d1[/\\]a\.txt$/);
-  });
-
-  it('pending cap: flushes mid-walk once the total queued across buckets hits the cap', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'pcap');
-    // 3 folders × 2 files: no bucket ever reaches CHUNK (200), so without a total cap
-    // nothing would be flushed until the walk is over.
-    for (const d of ['x', 'y', 'z']) {
-      await writeFixture(`pcap/${d}/f1.txt`, 'a');
-      await writeFixture(`pcap/${d}/f2.txt`, 'b');
+  it('an offline share stays blocked on EVERY run until confirmed (its state never becomes the reference)', async () => {
+    setMirrorSafetyConfig({ enabled: false, deleteSafetyPct: 0.3 });
+    const spec = await seeded(5);
+    backupSets.setSourceMarks(spec.setId, { [src]: { mounted: true, nonEmpty: true } });
+    for (const f of fs.readdirSync(src)) fs.rmSync(path.join(src, f), { recursive: true }); // empty mountpoint left behind
+    for (let i = 0; i < 3; i++) {
+      const r = await runSet(drive, spec);
+      expect(r.deletionSkipped).toMatch(/no longer a mounted share/);
     }
-    // Count how many files the walk had stat'ed when the FIRST upload started (the
-    // walk stats the source root once, then one stat per file; nothing else in the
-    // per-file path stats before the first flush).
-    const statSpy = vi.spyOn(fsp, 'stat');
-    let statsAtFirstUpload = -1;
-    upload.mockImplementation(async () => {
-      if (statsAtFirstUpload < 0) statsAtFirstUpload = statSpy.mock.calls.length;
-      return { code: 0, stdout: '', stderr: '' };
-    });
+    expect(drive.calls.trash).toBe(0);
+    expect(backupSets.get(spec.setId)!.sourceMarks[src]).toEqual({ mounted: true, nonEmpty: true });
+  });
 
-    process.env.PDB_PENDING_CAP = '3';
-    try {
-      // excludes.length > 0 forces the per-file path (not the recursive seed).
-      const res = await runCatalogDelta('pcap-set', [srcDir], '/', 'Set', 'backup', ['__none__']);
-      expect(res.ok).toBe(true);
-      expect(res.newCount).toBe(6);
-    } finally {
-      delete process.env.PDB_PENDING_CAP;
-      statSpy.mockRestore();
-    }
-    // Flushed while the walk was still in progress (root + 3 files stat'ed), not only
-    // after all 6 files (root + 6 stats) were walked.
-    expect(statsAtFirstUpload).toBeGreaterThanOrEqual(1);
-    expect(statsAtFirstUpload).toBeLessThanOrEqual(4);
-    // Every file still made it into the catalog exactly once.
-    for (const d of ['x', 'y', 'z']) {
-      expect(catalog.getFile('pcap-set', `Set/pcap/${d}/f1.txt`)).toBeDefined();
-      expect(catalog.getFile('pcap-set', `Set/pcap/${d}/f2.txt`)).toBeDefined();
-    }
+  it('a source that was a mount and is now a plain directory blocks deletion', async () => {
+    setMirrorSafetyConfig({ enabled: false, deleteSafetyPct: 0.3 });
+    const spec = await seeded(3);
+    backupSets.setSourceMarks(spec.setId, { [src]: { mounted: true, nonEmpty: true } });
+    fs.rmSync(path.join(src, 'f0.txt'));
+    const r = await runSet(drive, spec);
+    expect(r.deletionSkipped).toMatch(/no longer a mounted share/);
+    expect(drive.calls.trash).toBe(0);
+  });
+
+  it('a missing source is reported as a failure, never as a successful "0 uploaded" backup', async () => {
+    write('a.txt', 'a');
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    fs.rmSync(src, { recursive: true });
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/missing on disk/);
+  });
+
+  it('a missing source path blocks deletion', async () => {
+    const spec = await seeded(3);
+    fs.rmSync(src, { recursive: true });
+    const r = await runSet(drive, spec);
+    expect(r.deletionSkipped).toMatch(/missing/);
+  });
+
+  it('never trashes a folder that holds files the backup did not upload', async () => {
+    write('keep/k.txt', 'k');
+    write('gone/a.txt', 'a');
+    write('gone/b.txt', 'b');
+    for (let i = 0; i < 10; i++) write(`x${i}.txt`, 'x');
+    const spec = makeSet('mirror');
+    await runSet(drive, spec);
+    drive.putFile(remote(spec, 'gone/foreign.pdf'), 'not ours');
+    fs.rmSync(path.join(src, 'gone'), { recursive: true });
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    const folder = drive.at(remote(spec, 'gone'));
+    expect(folder?.trashed).toBe(false);
+    expect(drive.at(remote(spec, 'gone/foreign.pdf'))).toBeDefined();
+    expect(drive.at(remote(spec, 'gone/a.txt'))).toBeUndefined(); // ours: trashed
+  });
+
+  it('a file replaced on Drive by someone else is not trashed', async () => {
+    const spec = await seeded(10);
+    const node = drive.at(remote(spec, 'f1.txt'))!;
+    node.name = 'renamed-by-user.txt';
+    drive.putFile(remote(spec, 'f1.txt'), 'someone else');
+    fs.rmSync(path.join(src, 'f1.txt'));
+    await runSet(drive, spec);
+    expect(drive.at(remote(spec, 'f1.txt'))?.trashed).toBe(false);
+    expect(node.trashed).toBe(false);
+  });
+
+  it('an upload failure blocks deletion; a network error on Drive is never "not found"', async () => {
+    const spec = await seeded(10);
+    fs.rmSync(path.join(src, 'f2.txt'));
+    write('new.txt', 'n');
+    drive.faults.push({ op: 'uploadNew', code: 'QUOTA', times: 5 });
+    const r = await runSet(drive, spec);
+    expect(r.deletionSkipped).toMatch(/failed to upload/);
+    expect(drive.calls.trash).toBe(0);
+
+    drive.faults.push({ op: 'getNode', code: 'NETWORK', times: 99 });
+    await expect(runSet(drive, spec)).rejects.toThrow(/NETWORK/);
+    expect(drive.at(remote(spec, 'f2.txt'))?.trashed).toBe(false);
+  });
+
+  it('dry run predicts exactly what the live run deletes (hidden files, empty folders, excludes)', async () => {
+    write('.hidden', 'h');
+    write('a/a.txt', 'a');
+    write('b/b.txt', 'b');
+    write('skip.tmp', 't');
+    for (let i = 0; i < 12; i++) write(`z${i}.txt`, 'z');
+    const spec = makeSet('mirror', { includeHidden: true });
+    await runSet(drive, spec);
+    // Now: hidden files off, a/ emptied (dir stays), b/ deleted, skip.tmp excluded.
+    fs.rmSync(path.join(src, 'a/a.txt'));
+    fs.rmSync(path.join(src, 'b'), { recursive: true });
+    const next = { ...spec, includeHidden: false, excludes: ['*.tmp'] };
+    const preview = await previewSet(drive, next);
+    const live = await runSet(drive, next);
+    expect(live.deletedCount).toBe(preview.wouldDeleteCount);
+    expect(preview.wouldDelete.sort()).toEqual([remote(spec, 'a/a.txt'), remote(spec, 'b')].sort());
+    // Hidden files switched off = like an exclude: left alone, never trashed.
+    expect(drive.at(remote(spec, '.hidden'))?.trashed).toBe(false);
+    expect(drive.at(remote(spec, 'a'))?.trashed).toBe(false); // empty folder kept
+    expect(drive.at(remote(spec, 'skip.tmp'))?.trashed).toBe(false); // excluded = kept
   });
 });
 
-// Scale hazards found in the Oct 2026 review: the top-most computation of the mirror
-// deletion pass / dry-run was O(n²) over stale entries, and every direct child file of
-// a source folder went into ONE argv (E2BIG for folders with tens of thousands of files).
-describe('runCatalogDelta — scale: top-most deletion set and argv-sized file units', () => {
-  it('mirror: trashes a vanished folder ONCE (not each child) and drops all its catalog rows', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'tops');
-    for (let i = 0; i < 8; i++) await writeFixture(`tops/keep/f${i}.txt`, `k${i}`);
-    await writeFixture('tops/gone/a.txt', 'a');
-    await writeFixture('tops/gone/deep/b.txt', 'b');
-    await runCatalogDelta('tops-set', [srcDir], '/', 'Set', 'backup'); // seed
-    trashDrive.mockClear();
+describe('target folder identity', () => {
+  it('follows a rename of the set folder; refuses a deleted or re-created one', async () => {
+    write('a.txt', 'a');
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    const folder = drive.at(spec.subfolder)!;
+    folder.name = 'Renamed';
+    write('b.txt', 'b');
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(backupSets.get(spec.setId)!.targetSubfolder).toBe('Renamed');
+    expect(drive.at('Renamed/' + remote({ ...spec, subfolder: 'Renamed' }, 'b.txt').split('/').slice(1).join('/'))).toBeDefined();
 
-    // 4 stale rows (gone, gone/a.txt, gone/deep, gone/deep/b.txt) of ~14 → under 30%.
-    await fsp.rm(path.join(srcDir, 'gone'), { recursive: true });
-    const res = await runCatalogDelta('tops-set', [srcDir], '/', 'Set', 'mirror');
-
-    expect(res.ok).toBe(true);
-    expect(trashDrive).toHaveBeenCalledTimes(1);
-    expect(trashDrive).toHaveBeenCalledWith('/my-files/Set/tops/gone');
-    expect(res.deletedCount).toBe(1);
-    expect(catalog.hasDir('tops-set', 'Set/tops/gone')).toBe(false);
-    expect(catalog.getFile('tops-set', 'Set/tops/gone/a.txt')).toBeUndefined();
-    expect(catalog.getFile('tops-set', 'Set/tops/gone/deep/b.txt')).toBeUndefined();
-    expect(catalog.getFile('tops-set', 'Set/tops/keep/f0.txt')).toBeDefined();
-
-    // The dry-run reports the same single top-most path.
-    await fsp.rm(path.join(srcDir, 'keep', 'f7.txt'));
-    const p = await previewDelta('tops-set', [srcDir], 'Set', 'mirror');
-    expect(p.wouldDelete).toEqual(['Set/tops/keep/f7.txt']);
+    folder.trashed = true;
+    drive.mkdirp('Renamed'); // same name, different folder
+    drive.reset();
+    const r2 = await runSet(drive, { ...spec, subfolder: 'Renamed' });
+    expect(r2.ok).toBe(false);
+    expect(r2.message).toMatch(/trash/);
+    expect(drive.calls.uploadNew + drive.calls.uploadRevision).toBe(0);
   });
 
-  it('topMost: O(n·depth) on a large stale set, same answer as the pairwise definition', async () => {
-    const { topMost } = await import('@/server/engine');
-    const entries: { rel: string }[] = [];
-    for (let d = 0; d < 200; d++) {
-      entries.push({ rel: `S/y/${d}` });
-      for (let f = 0; f < 50; f++) entries.push({ rel: `S/y/${d}/f${f}` });
-    }
-    entries.push({ rel: 'S/z/lonely.txt' }); // no ancestor in the set → top-most itself
-    const t0 = Date.now();
-    const tops = topMost(entries);
-    expect(Date.now() - t0).toBeLessThan(1000); // 10k entries; the O(n²) version took ~seconds+
-    expect(tops).toHaveLength(201);
-    expect(tops.map((e) => e.rel)).toContain('S/z/lonely.txt');
-    expect(tops.some((e) => e.rel.startsWith('S/y/0/'))).toBe(false);
+  it('after following a rename, excludes still apply in the same run', async () => {
+    write('keep.txt', 'k');
+    // A PATH pattern (relative to the sources root): basename patterns would hide the bug.
+    const spec = makeSet('backup', { excludes: [`src${n}/cache/**`] });
+    await runSet(drive, spec);
+    drive.at(spec.subfolder)!.name = 'Moved';
+    write('cache/junk.tmp', 'j');
+    write('new.txt', 'n');
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(r.newCount).toBe(1);
+    const base = remote({ ...spec, subfolder: 'Moved' }, '').replace(/\/$/, '');
+    expect(drive.at(base + '/cache/junk.tmp')).toBeUndefined();
+    expect(drive.at(base + '/new.txt')).toBeDefined();
   });
 
-  it('seed: a folder with many direct files is uploaded in argv-sized chunks, all cataloged', async () => {
-    const srcDir = path.join(LOCAL_ROOT, 'flat');
-    const N = 1100; // > 2 × FILE_UNIT_CHUNK (500)
-    await fsp.mkdir(srcDir, { recursive: true });
-    await Promise.all(Array.from({ length: N }, (_, i) => fsp.writeFile(path.join(srcDir, `f${i}.txt`), 'x')));
+  it('a missing target folder stops the run without uploading', async () => {
+    write('a.txt', 'a');
+    const spec = makeSet('backup', { targetPath: '/my-files/Nope' });
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/no longer exists/);
+    expect(drive.calls.uploadNew).toBe(0);
+  });
+});
 
-    const res = await runCatalogDelta('flat-set', [srcDir], '/', 'Set', 'backup');
+describe('failures inside a batch', () => {
+  it('one bad file does not stop the others; transient errors are retried once each', async () => {
+    for (let i = 0; i < 5; i++) write(`f${i}.txt`, `c${i}`);
+    const spec = makeSet('backup');
+    drive.faults.push({ op: 'uploadNew', code: 'INVALID_NAME', times: 1, match: (nm) => nm === 'f3.txt' });
+    drive.faults.push({ op: 'uploadNew', code: 'RATE_LIMITED', times: 1, match: (nm) => nm === 'f1.txt' });
+    const r = await runSet(drive, spec);
+    expect(r.failedFiles).toEqual([expect.objectContaining({ rel: expect.stringMatching(/f3\.txt$/) })]);
+    expect(r.failedCount).toBe(1);
+    expect(drive.at(remote(spec, 'f1.txt'))?.revisions).toHaveLength(1);
+  });
 
-    expect(res.ok).toBe(true);
-    expect(res.newCount).toBe(N);
-    expect(upload).toHaveBeenCalledTimes(3); // 500 + 500 + 100
-    for (const call of upload.mock.calls) expect(call[0].length).toBeLessThanOrEqual(500);
-    expect(catalog.count('flat-set')).toBeGreaterThanOrEqual(N);
+  it('session expiry stops the run with the reconnect message', async () => {
+    for (let i = 0; i < 4; i++) write(`f${i}.txt`, `c${i}`);
+    const spec = makeSet('mirror');
+    drive.faults.push({ op: 'uploadNew', code: 'UNAUTHENTICATED', times: 99 });
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(false);
+    expect(r.message).toMatch(/session expired/);
+    expect(drive.calls.trash).toBe(0);
+  });
+});
+
+describe('cancel and pause', () => {
+  it('stops promptly: confirmed files are recorded, the rest is not, nothing is deleted', async () => {
+    for (let i = 0; i < 30; i++) write(`f${i}.txt`, `c${i}`);
+    const spec = makeSet('mirror');
+    let uploads = 0;
+    const orig = drive.uploadNew.bind(drive);
+    drive.uploadNew = async (...a: Parameters<FakeDrive['uploadNew']>) => {
+      uploads++;
+      return orig(...a);
+    };
+    const r = await runSet(drive, spec, { shouldCancel: () => uploads >= 5 });
+    expect(r.cancelled).toBe(true);
+    expect(r.ok).toBe(false);
+    expect(drive.calls.trash).toBe(0);
+    const recorded = catalog.countFiles(spec.setId);
+    expect(recorded).toBeGreaterThanOrEqual(5);
+    expect(recorded).toBeLessThan(30);
+    // Resume: only the rest is uploaded.
+    drive.reset();
+    const r2 = await runSet(drive, spec);
+    expect(r2.ok).toBe(true);
+    expect(drive.calls.uploadNew).toBe(30 - recorded);
+  });
+});
+
+describe('add mode', () => {
+  it('never updates; a different file already on Drive is left alone, and Backup later uploads it', async () => {
+    write('a.txt', 'local');
+    const spec = makeSet('add');
+    drive.putFile(remote(spec, 'a.txt'), 'remote!');
+    const r = await runSet(drive, spec);
+    expect(r.ok).toBe(true);
+    expect(drive.at(remote(spec, 'a.txt'))!.revisions).toHaveLength(1);
+    const r2 = await runSet(drive, { ...spec, mode: 'backup' });
+    expect(r2.changedCount).toBe(1);
+    expect(drive.at(remote(spec, 'a.txt'))!.revisions.at(-1)!.content.toString()).toBe('local');
+  });
+});
+
+describe('content verification', () => {
+  it('same size + same mtime change is invisible to the delta, found by a content verify', async () => {
+    const t = Date.now() - 50_000;
+    write('a.txt', 'AAAA', t);
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    write('a.txt', 'BBBB', t); // same size, same mtime
+    drive.reset();
+    const r = await runSet(drive, spec);
+    expect(r.unchangedCount).toBe(1);
+    expect(drive.calls.uploadRevision).toBe(0);
+    const v = await verifySet(drive, spec, { content: true });
+    expect(v.contentMismatches).toBe(1);
+    const r2 = await runSet(drive, spec);
+    expect(r2.newCount + r2.changedCount).toBe(1);
+    expect(drive.at(remote(spec, 'a.txt'))!.revisions.at(-1)!.content.toString()).toBe('BBBB');
+  });
+
+  it('verify fills node ids for CLI-era rows and drops rows Drive no longer has', async () => {
+    write('a.txt', 'a');
+    write('b.txt', 'b');
+    const spec = makeSet('backup');
+    await runSet(drive, spec);
+    getDb().exec(`UPDATE backup_catalog SET node_uid = NULL WHERE set_id = '${spec.setId}'`);
+    drive.at(remote(spec, 'b.txt'))!.trashed = true;
+    const v = await verifySet(drive, spec);
+    expect(v.repaired).toBe(1);
+    expect(catalog.getFile(spec.setId, remote(spec, 'a.txt'))?.nodeUid).toBe(drive.at(remote(spec, 'a.txt'))!.uid);
+  });
+});
+
+describe('topMost', () => {
+  it('keeps only entries without an ancestor in the list', () => {
+    expect(topMost([{ rel: 'a' }, { rel: 'a/b' }, { rel: 'c/d' }, { rel: 'c/d/e' }]).map((x) => x.rel)).toEqual(['a', 'c/d']);
   });
 });

@@ -53,7 +53,7 @@ describe('POST /api/backup-sets/:id/source-paths', () => {
     expect(backupSets.get(set.id)!.sourcePaths).toEqual([original, added]);
     expect(backupSets.get(set.id)!.excludes).toEqual(['*.tmp', 'added/private', 'added/private/**']);
     expect(catalog.count(set.id)).toBe(beforeCount);
-    expect(catalog.getFile(set.id, 'Safe/original/keep.txt')).toEqual({
+    expect(catalog.getFile(set.id, 'Safe/original/keep.txt')).toMatchObject({
       size: 4,
       mtimeMs: 1,
       sha1: 'old-sha',
@@ -74,7 +74,7 @@ describe('POST /api/backup-sets/:id/source-paths', () => {
     expect(response.status).toBe(200);
     expect(backupSets.get(a.id)!.sourcePaths).toEqual([aSource, aAdded]);
     expect(backupSets.get(b.id)!.sourcePaths).toEqual([bSource]);
-    expect(catalog.getFile(b.id, 'B/b/file.txt')).toEqual({ size: 2, mtimeMs: 2, sha1: 'b-sha' });
+    expect(catalog.getFile(b.id, 'B/b/file.txt')).toMatchObject({ size: 2, mtimeMs: 2, sha1: 'b-sha' });
   });
 
   it('rejects changes while the set is running and preserves state', async () => {

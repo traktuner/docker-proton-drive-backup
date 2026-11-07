@@ -8,3 +8,4 @@ sources
 *.db-*
 npm-debug.log*
 .DS_Store
+dist-proton

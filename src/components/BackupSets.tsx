@@ -1,69 +1,27 @@
 'use client';
 
+import type { BackupSet as StoredSet } from '@/server/db';
+import type { Progress } from '@/server/progress';
+import type { RunRow } from '@/server/runs';
+import type { PreviewResult as EnginePreview } from '@/server/engine';
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { useToast } from './Toast';
 import { useAuth } from './AuthProvider';
-import { formatBytes } from '@/lib/format';
+import { formatBytes, sanitizeSegment, targetLabel } from '@/lib/format';
 import { DOW, DOW_ORDER, pad } from '@/lib/schedule';
 
-export interface SkippedFile {
-  rel: string;
-  reason: string;
-}
-export interface RunRow {
-  id: number;
-  startedAt: number;
-  finishedAt: number;
-  status: 'success' | 'error' | 'cancelled';
-  message: string | null;
-  files: number;
-  bytes: number;
-  skipped?: SkippedFile[];
-}
-
-export interface BackupSet {
-  id: string;
-  name: string;
-  sourcePaths: string[];
-  targetPath: string;
-  targetSubfolder: string;
-  mode: 'add' | 'backup' | 'mirror';
-  schedule: 'off' | 'hourly' | 'daily' | 'weekly';
-  scheduleHour: number;
-  scheduleMinute: number;
-  scheduleDow: number;
-  excludes: string[];
-  skipThumbnails: boolean;
-  includeHidden: boolean;
-  watch: boolean;
-  lastRunAt: number | null;
-  lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
-  lastMessage: string | null;
+/** A set as GET /api/backup-sets returns it: the stored set plus live status. */
+interface BackupSet extends Omit<StoredSet, 'folderUid' | 'sourceMarks'> {
   nextRunAt?: number | null;
   recentRuns?: RunRow[];
   lastSuccessAt?: number | null;
-  progress?: {
-    doneFiles: number;
-    totalFiles: number;
-    doneBytes: number;
-    totalBytes: number;
-    current: string;
-    bytesPerSec?: number;
-  } | null;
+  /** Local folders continued in "<name> · part N" on Drive (parts = highest part number). */
+  splitFolders?: { rel: string; parts: number }[];
+  progress?: Progress | null;
 }
 
-interface PreviewResult {
-  mode: 'backup' | 'mirror';
-  wouldUploadCount: number;
-  wouldUploadBytes: number;
-  unchangedCount: number;
-  wouldDelete: string[];
-  wouldDeleteCount: number;
-  wouldDeleteTruncated: boolean;
-  deletionWouldSkip: string | null;
-  message: string;
-}
+type PreviewResult = Omit<EnginePreview, 'ok' | 'newCount' | 'changedCount'>;
 
 function fmtWhen(ts: number): string {
   const d = new Date(ts);
@@ -119,7 +77,6 @@ function scheduleLabel(s: BackupSet): string {
         ? `${DOW[s.scheduleDow]} ${t}`
         : 'manual';
 }
-const targetLabel = (p: string) => (p === '/' ? 'Drive (root)' : `Drive${p}`);
 
 function cleanPath(value: string): string {
   const clean = value.replace(/\/+/g, '/').replace(/\/$/, '');
@@ -154,10 +111,6 @@ function excludesForSources(excludes: string[], sources: string[]): string[] {
 }
 
 /** Live preview of the Drive folder name — mirrors the server's sanitizeSegment. */
-function sanitizePreview(name: string): string {
-  // eslint-disable-next-line no-control-regex
-  return (name || '').replace(/[/\\\x00-\x1f]+/g, '-').replace(/^[.\s]+|[.\s]+$/g, '') || 'set';
-}
 
 export default function BackupSets({
   refreshKey,
@@ -187,6 +140,7 @@ export default function BackupSets({
   const [previews, setPreviews] = useState<Record<string, PreviewResult>>({});
   // Which sets have their "skipped files" panel expanded.
   const [openSkips, setOpenSkips] = useState<Record<string, boolean>>({});
+  const [openSplits, setOpenSplits] = useState<Record<string, boolean>>({});
   const [confirmDel, setConfirmDel] = useState<string | null>(null);
   const [addingSources, setAddingSources] = useState(false);
 
@@ -226,7 +180,9 @@ export default function BackupSets({
 
   useEffect(() => {
     if (!sets.some((s) => s.lastStatus === 'running')) return;
-    const t = setInterval(load, 1500);
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 1500);
     return () => clearInterval(t);
   }, [sets]);
 
@@ -249,18 +205,16 @@ export default function BackupSets({
     await fetch(`/api/backup-sets/${id}/pause`, { method: 'POST' });
     load();
   };
-  const verify = async (id: string) => {
+  const verify = async (id: string, content = false) => {
     const name = sets.find((s) => s.id === id)?.name;
     setVerifying((prev) => new Set(prev).add(id));
-    toast(`Verifying${name ? ` “${name}”` : ''} against Drive…`, 'info');
+    toast(`Verifying${content ? ' content of' : ''}${name ? ` “${name}”` : ''} against Drive…`, 'info');
     try {
-      const res = await fetch(`/api/backup-sets/${id}/verify`, { method: 'POST' });
+      const res = await fetch(`/api/backup-sets/${id}/verify${content ? '?content=1' : ''}`, { method: 'POST' });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || 'Verify failed');
       toast(
-        d.repaired > 0
-          ? `Verify: ${d.repaired} item(s) will re-upload next run (${d.checked} checked)`
-          : `Verify: all ${d.checked} item(s) match Drive`,
+        d.repaired > 0 ? `Verify: ${d.message}` : `Verify: all ${d.checked} item(s) match Drive${d.foreign ? ` (${d.foreign} other item(s) on Drive)` : ''}`,
         d.repaired > 0 ? 'info' : 'success',
       );
     } catch (e) {
@@ -274,6 +228,29 @@ export default function BackupSets({
         return n;
       });
       load();
+    }
+  };
+  // Restore test: download a sample of backed-up files and compare them with the originals.
+  const [restoring, setRestoring] = useState<Set<string>>(new Set());
+  const testRestore = async (id: string) => {
+    const name = sets.find((s) => s.id === id)?.name;
+    setRestoring((prev) => new Set(prev).add(id));
+    toast(`Restore test${name ? ` for “${name}”` : ''}: downloading 20 random files from Drive…`, 'info');
+    try {
+      const res = await fetch(`/api/backup-sets/${id}/restore-test?files=20`, { method: 'POST' });
+      const d = await res.json();
+      if (d.error) throw new Error(d.error);
+      toast(d.message, d.ok ? 'success' : d.tested === 0 ? 'info' : 'error');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast(msg, 'error');
+      reportAuthError(msg);
+    } finally {
+      setRestoring((prev) => {
+        const n = new Set(prev);
+        n.delete(id);
+        return n;
+      });
     }
   };
   const closePreview = (id: string) =>
@@ -358,7 +335,6 @@ export default function BackupSets({
       excludes: draft.excludes,
       skipThumbnails: draft.skipThumbnails,
       includeHidden: draft.includeHidden,
-      watch: draft.watch,
       // Changing this renames the Drive folder + rewrites catalog keys server-side.
       targetSubfolder: draft.targetSubfolder,
     };
@@ -389,7 +365,7 @@ export default function BackupSets({
           </svg>
         </span>
         <p className="text-sm font-medium text-[color:var(--text)]">No backup sets yet</p>
-        <p className="mt-1 max-w-xs text-xs leading-relaxed text-[color:var(--muted)]">
+        <p className="mt-1 max-w-xs text-[0.8125rem] leading-relaxed text-[color:var(--muted)]">
           Tick folders in <span className="text-[color:var(--text)]">Local files</span>, choose a target in{' '}
           <span className="text-[color:var(--text)]">Proton Drive</span>, then create your first set above.
         </p>
@@ -397,13 +373,13 @@ export default function BackupSets({
     );
 
   return (
-    <ul className="space-y-2">
+    <ul className="grid grid-cols-1 items-start gap-2 xl:grid-cols-2">
       {sets.map((s) => {
         const editing = editId === s.id;
         return (
           <li
             key={s.id}
-            className="rounded-xl border border-[color:var(--border)] bg-[color:var(--panel-2)]/40 p-3 transition hover:border-[color:var(--border-strong)]"
+            className={`min-w-0 rounded-xl border border-[color:var(--border)] bg-[color:var(--panel-2)]/40 p-3 transition hover:border-[color:var(--border-strong)] ${editing ? 'xl:col-span-2' : ''}`}
           >
             {editing ? (
               <div className="space-y-2">
@@ -413,7 +389,7 @@ export default function BackupSets({
                   className="w-full pfield px-2 py-1 text-sm"
                 />
                 <div className="space-y-1">
-                  <label className="block text-[10px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+                  <label className="block text-[0.6875rem] font-medium uppercase tracking-wide text-[color:var(--muted)]">
                     Drive folder
                   </label>
                   <input
@@ -422,12 +398,12 @@ export default function BackupSets({
                     placeholder="Drive subfolder"
                     className="w-full pfield px-2 py-1 text-sm"
                   />
-                  <p className="truncate text-[11px] text-[color:var(--muted)]">
+                  <p className="clip text-xs text-[color:var(--muted)]">
                     Files go to{' '}
                     <span className="text-[color:var(--accent-2)]">
-                      {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizePreview(draft.targetSubfolder ?? '')}/…
+                      {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizeSegment(draft.targetSubfolder ?? '')}/…
                     </span>
-                    {sanitizePreview(draft.targetSubfolder ?? '') !== s.targetSubfolder && (
+                    {sanitizeSegment(draft.targetSubfolder ?? '') !== s.targetSubfolder && (
                       <span className="text-[color:var(--signal-warning)]"> · renames the Drive folder on save</span>
                     )}
                   </p>
@@ -443,32 +419,32 @@ export default function BackupSets({
                   return (
                     <div className="space-y-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5">
                       <div className="flex items-center justify-between gap-2">
-                        <label className="text-[10px] font-medium uppercase tracking-wide text-[color:var(--muted)]">
+                        <label className="text-[0.6875rem] font-medium uppercase tracking-wide text-[color:var(--muted)]">
                           Sources
                         </label>
-                        <span className="text-[10px] text-[color:var(--signal-success)]">no existing re-uploads</span>
+                        <span className="text-[0.6875rem] text-[color:var(--signal-success)]">no existing re-uploads</span>
                       </div>
-                      <ul className="max-h-24 space-y-1 overflow-y-auto font-mono text-[11px] text-[color:var(--text)]">
+                      <ul className="max-h-24 space-y-1 overflow-y-auto font-mono text-xs text-[color:var(--text)]">
                         {existing.map((source) => (
                           <li key={source} className="break-all rounded bg-black/10 px-2 py-1">
                             {sourceLabel(source, localRoot)}
                           </li>
                         ))}
                       </ul>
-                      <p className="text-[11px] leading-relaxed text-[color:var(--muted)]">
+                      <p className="text-xs leading-relaxed text-[color:var(--muted)]">
                         Existing sources stay attached and cannot be removed here. Select separate folders in Local files,
                         then add them below. Unchanged files will not be re-uploaded.
                       </p>
                       {selectedSources.length === 0 ? (
-                        <p className="text-[11px] text-[color:var(--muted)]">No new source selected in Local files.</p>
+                        <p className="text-xs text-[color:var(--muted)]">No new source selected in Local files.</p>
                       ) : (
                         <div className="space-y-1.5">
-                          <p className="text-[11px] text-[color:var(--muted)]">
+                          <p className="text-xs text-[color:var(--muted)]">
                             {additions.length} new source{additions.length === 1 ? '' : 's'} selected
                             {extraExcludes.length > 0 ? ` · ${extraExcludes.length} exclusion patterns` : ''}
                           </p>
                           {blocked > 0 && (
-                            <p className="text-[11px]" style={{ color: 'var(--signal-warning)' }}>
+                            <p className="text-xs" style={{ color: 'var(--signal-warning)' }}>
                               {blocked} selection{blocked === 1 ? '' : 's'} already belong to or overlap this set.
                             </p>
                           )}
@@ -476,7 +452,7 @@ export default function BackupSets({
                             type="button"
                             onClick={() => addSources(s, additions, extraExcludes)}
                             disabled={addingSources || additions.length === 0}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
                           >
                             {addingSources && (
                               <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--accent)]" />
@@ -485,7 +461,7 @@ export default function BackupSets({
                               ? 'Checking sources…'
                               : `Add ${additions.length || ''} selected source${additions.length === 1 ? '' : 's'} now`}
                           </button>
-                          <p className="text-[10px] leading-relaxed text-[color:var(--muted)]">
+                          <p className="text-[0.6875rem] leading-relaxed text-[color:var(--muted)]">
                             This action applies immediately. Cancel below only discards the other form changes.
                           </p>
                         </div>
@@ -493,7 +469,7 @@ export default function BackupSets({
                     </div>
                   );
                 })()}
-                <div className="flex flex-wrap items-center gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2 text-[0.8125rem]">
                   <select
                     value={draft.mode}
                     onChange={(e) => setDraft((d) => ({ ...d, mode: e.target.value as BackupSet['mode'] }))}
@@ -571,53 +547,167 @@ export default function BackupSets({
                     }
                     rows={2}
                     placeholder="Exclude patterns, one per line"
-                    className="w-full resize-y pfield px-2 py-1 text-xs"
+                    className="w-full resize-y pfield px-2 py-1 text-[0.8125rem]"
                   />
                 )}
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--muted)]">
+                <label className="flex cursor-pointer items-center gap-2 text-[0.8125rem] text-[color:var(--muted)]">
                   <input
                     type="checkbox"
                     checked={!!draft.skipThumbnails}
                     onChange={(e) => setDraft((d) => ({ ...d, skipThumbnails: e.target.checked }))}
-                    className="accent-[color:var(--accent)]"
+                    className="h-[1.1em] w-[1.1em] shrink-0 accent-[color:var(--accent)]"
                   />
                   Skip thumbnails on Drive
                 </label>
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-[color:var(--muted)]">
+                <label className="flex cursor-pointer items-center gap-2 text-[0.8125rem] text-[color:var(--muted)]">
                   <input
                     type="checkbox"
                     checked={!!draft.includeHidden}
                     onChange={(e) => setDraft((d) => ({ ...d, includeHidden: e.target.checked }))}
-                    className="accent-[color:var(--accent)]"
+                    className="h-[1.1em] w-[1.1em] shrink-0 accent-[color:var(--accent)]"
                   />
                   Include hidden files (dotfiles)
                 </label>
                 <div className="flex gap-2">
-                  <button onClick={saveEdit} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
+                  <button onClick={saveEdit} className="pbtn pbtn--solid px-3 py-1.5 text-[0.8125rem]">
                     Save
                   </button>
-                  <button onClick={() => setEditId(null)} className="pbtn pbtn--ghost px-3 py-1.5 text-xs">
+                  <button onClick={() => setEditId(null)} className="pbtn pbtn--ghost px-3 py-1.5 text-[0.8125rem]">
                     Cancel
                   </button>
                 </div>
               </div>
             ) : (
               <>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
-                <div className="min-w-0">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="truncate font-medium">{s.name}</span>
-                    <span className="shrink-0 rounded px-1.5 py-0.5 text-[11px]" style={statusStyle(s.lastStatus)}>
+              {/* Name + status and the buttons share the first row; every detail line
+                  below spans the full card width (the buttons no longer squeeze them). */}
+              <div>
+                <div>
+                  <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+                  <div className="flex min-w-[min(100%,12rem)] flex-1 items-start gap-2">
+                    <span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]" title={s.name}>{s.name}</span>
+                    <span className="mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs" style={statusStyle(s.lastStatus)}>
                       {s.lastStatus}
                     </span>
                   </div>
-                  <p className="mt-1 truncate text-xs text-[color:var(--muted)]">
+                  <div className="flex flex-wrap items-center justify-end gap-1.5">
+                  {confirmDel === s.id ? (
+                    <span className="flex items-center gap-1.5 text-[0.8125rem]">
+                      <span className="text-[color:var(--muted)]">Delete?</span>
+                      <button
+                        onClick={() => {
+                          setConfirmDel(null);
+                          remove(s.id);
+                        }}
+                        className="pbtn rounded px-2.5 py-1 text-white"
+                        style={{ background: 'var(--signal-danger)' }}
+                      >
+                        Yes
+                      </button>
+                      <button onClick={() => setConfirmDel(null)} className="pbtn pbtn--ghost px-2.5 py-1">
+                        No
+                      </button>
+                    </span>
+                  ) : (
+                    <>
+                      {s.lastStatus === 'running' ? (
+                        <>
+                          <button
+                            onClick={() => pause(s.id)}
+                            disabled={pausing.has(s.id) || cancelling.has(s.id)}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
+                            style={{ color: 'var(--signal-warning)' }}
+                            title="Pause now and resume later (continues from where it left off)"
+                          >
+                            {pausing.has(s.id) && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
+                            )}
+                            {pausing.has(s.id) ? 'Pausing…' : 'Pause'}
+                          </button>
+                          <button
+                            onClick={() => cancel(s.id)}
+                            disabled={cancelling.has(s.id) || pausing.has(s.id)}
+                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-[0.8125rem]"
+                            style={{ color: 'var(--signal-danger)' }}
+                          >
+                            {cancelling.has(s.id) && (
+                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
+                            )}
+                            {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
+                          </button>
+                        </>
+                      ) : (
+                        <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-[0.8125rem]">
+                          {s.lastStatus === 'paused' ? 'Resume' : 'Run'}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => startEdit(s)}
+                        disabled={s.lastStatus === 'running'}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title={s.lastStatus === 'running' ? 'Pause or cancel this backup before editing it' : 'Edit backup set'}
+                      >
+                        Edit
+                      </button>
+                      {s.mode !== 'add' && (
+                        <button
+                          onClick={() => preview(s.id)}
+                          disabled={s.lastStatus === 'running' || previewing.has(s.id)}
+                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                          title="Dry run — show what the next backup would upload, and (mirror) which Drive files it would delete, without changing anything"
+                        >
+                          {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
+                        </button>
+                      )}
+                      <button
+                        onClick={(e) => verify(s.id, e.shiftKey)}
+                        disabled={s.lastStatus === 'running' || verifying.has(s.id)}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title="Reconcile the catalog against Drive — re-upload anything deleted or changed there. Shift-click: also compare every file's content (SHA-1) with Drive (reads all files)."
+                      >
+                        {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
+                      </button>
+                      <button
+                        onClick={() => testRestore(s.id)}
+                        disabled={restoring.has(s.id)}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-[0.8125rem]"
+                        title="Restore test — download 20 random backed-up files from Drive and compare them byte for byte with the originals. Changes nothing; works during a backup."
+                      >
+                        {restoring.has(s.id) ? 'Testing…' : 'Test restore'}
+                      </button>
+                      {s.mode === 'mirror' && s.lastStatus === 'error' && /confirm (the deletion )?in the set's row/.test(s.lastMessage ?? '') && (
+                        <button
+                          onClick={() => {
+                            if (window.confirm('A source is empty or no longer a mounted share. Apply the deletions this causes (items go to the Drive trash)? Only do this if you changed the folder on purpose — not if a NAS share is offline.'))
+                              void fetch(`/api/backup-sets/${s.id}/run?confirmSources=1`, { method: 'POST' }).then(load);
+                          }}
+                          className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
+                          title="Confirm that the empty source was emptied on purpose and apply the deletions once"
+                        >
+                          Apply deletions
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setConfirmDel(s.id)}
+                        disabled={s.lastStatus === 'running'}
+                        className="pbtn pbtn--danger px-2.5 py-1.5 text-[0.8125rem]"
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                </div>
+                  </div>
+                  <p
+                    className="clip mt-1 text-[0.8125rem] text-[color:var(--muted)]"
+                    title={`${s.sourcePaths.join('\n')}\n→ ${targetLabel(s.targetPath)}/${s.targetSubfolder}`}
+                  >
                     {s.sourcePaths.length} source{s.sourcePaths.length > 1 ? 's' : ''} →{' '}
                     <span className="text-[color:var(--accent-2)]">
                       {targetLabel(s.targetPath)}/{s.targetSubfolder}
                     </span>
                   </p>
-                  <p className="mt-0.5 text-xs text-[color:var(--muted)]">
+                  <p className="mt-0.5 text-[0.8125rem] text-[color:var(--muted)]">
                     {MODE_LABEL[s.mode]} · {scheduleLabel(s)}
                     {s.schedule !== 'off' &&
                       s.nextRunAt &&
@@ -642,7 +732,7 @@ export default function BackupSets({
                     const message = last?.message ?? s.lastMessage ?? undefined;
                     const tip = `${status}${when ? ` · ${relTime(when)}` : ''}${message ? ` · ${message}` : ''}`;
                     return (
-                      <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-[color:var(--muted)]">
+                      <div className="mt-1.5 flex items-center gap-1.5 text-xs text-[color:var(--muted)]">
                         <span
                           className="h-1.5 w-1.5 shrink-0 cursor-help rounded-full"
                           style={{ background: RUN_DOT[status] }}
@@ -669,7 +759,7 @@ export default function BackupSets({
                           <div className="pd-indeterminate" />
                         )}
                       </div>
-                      <p className="tnum mt-1 truncate text-[11px] text-[color:var(--muted)]">
+                      <p className="clip tnum mt-1 text-xs text-[color:var(--muted)]" title={s.progress.current}>
                         {s.progress.totalBytes
                           ? `${s.progress.doneFiles}/${s.progress.totalFiles} files · ${formatBytes(s.progress.doneBytes)}/${formatBytes(s.progress.totalBytes)}`
                           : `${s.progress.doneFiles.toLocaleString()} uploaded · ${formatBytes(s.progress.doneBytes)}`}
@@ -680,11 +770,51 @@ export default function BackupSets({
                     </div>
                   ) : (
                     s.lastMessage && (
-                      <p className="mt-1 truncate text-xs text-[color:var(--muted)]" title={s.lastMessage}>
+                      <p className="clip mt-1 text-[0.8125rem] text-[color:var(--muted)]" title={s.lastMessage}>
                         {s.lastMessage}
                       </p>
                     )
                   )}
+
+                  {/* Proton allows a limited number of items per Drive folder; bigger
+                      local folders continue in "<name> · part N" next to it. Nothing is
+                      skipped — this only explains the extra folders on Drive. */}
+                  {(() => {
+                    const sp = s.splitFolders ?? [];
+                    if (sp.length === 0) return null;
+                    const open = !!openSplits[s.id];
+                    const shown = (rel: string) => (rel.startsWith(`${s.targetSubfolder}/`) ? rel.slice(s.targetSubfolder.length + 1) : rel);
+                    return (
+                      <div className="mt-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setOpenSplits((o) => ({ ...o, [s.id]: !o[s.id] }))}
+                          className="inline-flex items-center gap-1 text-xs text-[color:var(--muted)] hover:underline"
+                          aria-expanded={open}
+                        >
+                          <span aria-hidden>{open ? '▾' : '▸'}</span>
+                          {sp.length}
+                          {sp.length >= 50 ? '+' : ''} large folder{sp.length === 1 ? '' : 's'} split on Drive
+                        </button>
+                        {open && (
+                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-xs">
+                            <p className="text-[color:var(--muted)]">
+                              Proton Drive allows a limited number of items per folder (about 30,000). Everything is backed up: what does not fit
+                              continues in “&lt;folder&gt; · part 2”, “· part 3”, … right next to it. A restore needs all parts.
+                            </p>
+                            <ul className="mt-1.5 max-h-40 space-y-1 overflow-y-auto pr-1">
+                              {sp.map((f) => (
+                                <li key={f.rel} className="min-w-0 break-all">
+                                  <span className="font-mono text-[color:var(--text)]">{shown(f.rel)}</span>
+                                  <span className="text-[color:var(--muted)]"> → {f.parts} parts</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
 
                   {/* Skipped-files panel: files the last run couldn't back up (name
                       unsupported / unreadable). Skipping is never fatal — the rest
@@ -701,7 +831,7 @@ export default function BackupSets({
                         <button
                           type="button"
                           onClick={() => setOpenSkips((o) => ({ ...o, [s.id]: !o[s.id] }))}
-                          className="inline-flex items-center gap-1 text-[11px] hover:underline"
+                          className="inline-flex items-center gap-1 text-xs hover:underline"
                           style={{ color: 'var(--signal-warning)' }}
                           aria-expanded={open}
                         >
@@ -710,7 +840,7 @@ export default function BackupSets({
                           {more ? '+' : ''} file{sk.length === 1 ? '' : 's'} skipped
                         </button>
                         {open && (
-                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-[11px]">
+                          <div className="mt-1 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2 text-xs">
                             <p className="text-[color:var(--muted)]">
                               Skipped — everything else was backed up, and a backup is never paused or stopped for these:
                             </p>
@@ -731,101 +861,12 @@ export default function BackupSets({
                     );
                   })()}
                 </div>
-                <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
-                  {confirmDel === s.id ? (
-                    <span className="flex items-center gap-1.5 text-xs">
-                      <span className="text-[color:var(--muted)]">Delete?</span>
-                      <button
-                        onClick={() => {
-                          setConfirmDel(null);
-                          remove(s.id);
-                        }}
-                        className="pbtn rounded px-2.5 py-1 text-white"
-                        style={{ background: 'var(--signal-danger)' }}
-                      >
-                        Yes
-                      </button>
-                      <button onClick={() => setConfirmDel(null)} className="pbtn pbtn--ghost px-2.5 py-1">
-                        No
-                      </button>
-                    </span>
-                  ) : (
-                    <>
-                      {s.lastStatus === 'running' ? (
-                        <>
-                          <button
-                            onClick={() => pause(s.id)}
-                            disabled={pausing.has(s.id) || cancelling.has(s.id)}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
-                            style={{ color: 'var(--signal-warning)' }}
-                            title="Pause now and resume later (continues from where it left off)"
-                          >
-                            {pausing.has(s.id) && (
-                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-warning)]" />
-                            )}
-                            {pausing.has(s.id) ? 'Pausing…' : 'Pause'}
-                          </button>
-                          <button
-                            onClick={() => cancel(s.id)}
-                            disabled={cancelling.has(s.id) || pausing.has(s.id)}
-                            className="pbtn pbtn--ghost inline-flex items-center gap-1.5 px-3 py-1.5 text-xs"
-                            style={{ color: 'var(--signal-danger)' }}
-                          >
-                            {cancelling.has(s.id) && (
-                              <span className="h-3 w-3 animate-spin rounded-full border-2 border-[color:var(--border)] border-t-[color:var(--signal-danger)]" />
-                            )}
-                            {cancelling.has(s.id) ? 'Cancelling…' : 'Cancel'}
-                          </button>
-                        </>
-                      ) : (
-                        <button onClick={() => run(s.id)} className="pbtn pbtn--solid px-3 py-1.5 text-xs">
-                          {s.lastStatus === 'paused' ? 'Resume' : 'Run'}
-                        </button>
-                      )}
-                      <button
-                        onClick={() => startEdit(s)}
-                        disabled={s.lastStatus === 'running'}
-                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
-                        title={s.lastStatus === 'running' ? 'Pause or cancel this backup before editing it' : 'Edit backup set'}
-                      >
-                        Edit
-                      </button>
-                      {s.mode !== 'add' && (
-                        <button
-                          onClick={() => preview(s.id)}
-                          disabled={s.lastStatus === 'running' || previewing.has(s.id)}
-                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
-                          title="Dry run — show what the next backup would upload, and (mirror) which Drive files it would delete, without changing anything"
-                        >
-                          {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
-                        </button>
-                      )}
-                      {s.mode !== 'add' && (
-                        <button
-                          onClick={() => verify(s.id)}
-                          disabled={s.lastStatus === 'running' || verifying.has(s.id)}
-                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
-                          title="Reconcile the catalog against Drive — re-upload anything deleted or changed there"
-                        >
-                          {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
-                        </button>
-                      )}
-                      <button
-                        onClick={() => setConfirmDel(s.id)}
-                        disabled={s.lastStatus === 'running'}
-                        className="pbtn pbtn--danger px-2.5 py-1.5 text-xs"
-                      >
-                        Delete
-                      </button>
-                    </>
-                  )}
-                </div>
               </div>
               {previews[s.id] &&
                 (() => {
                   const p = previews[s.id];
                   return (
-                    <div className="mt-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5 text-xs">
+                    <div className="mt-2 rounded-lg border border-[color:var(--border)] bg-[color:var(--panel-2)]/50 p-2.5 text-[0.8125rem]">
                       <div className="flex items-center justify-between">
                         <span className="font-medium text-[color:var(--text)]">Preview · nothing was changed</span>
                         <button
@@ -852,9 +893,9 @@ export default function BackupSets({
                               {p.wouldDeleteCount.toLocaleString()} item{p.wouldDeleteCount === 1 ? '' : 's'} on Drive
                               would be deleted (gone locally):
                             </p>
-                            <ul className="mt-1 max-h-32 space-y-0.5 overflow-auto pr-1 font-mono text-[11px] text-[color:var(--muted)]">
+                            <ul className="mt-1 max-h-32 space-y-0.5 overflow-auto pr-1 font-mono text-xs text-[color:var(--muted)]">
                               {p.wouldDelete.map((r) => (
-                                <li key={r} className="truncate" title={r}>
+                                <li key={r} className="clip" title={r}>
                                   {r}
                                 </li>
                               ))}

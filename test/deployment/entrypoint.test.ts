@@ -56,17 +56,12 @@ describe('docker-entrypoint.sh — PUID/PGID privilege drop (issue #20)', () => 
   });
 });
 
-describe('Dockerfile / cli.ts — HOME on the writable volume, never /home/app (#19, #20)', () => {
+describe('Dockerfile — HOME on the writable volume, never /home/app (#19, #20)', () => {
   const dockerfile = read('Dockerfile');
-  const cli = read('src/server/cli.ts');
 
   it('Dockerfile bakes HOME onto /data, not the nonexistent /home/app', () => {
     expect(dockerfile).toMatch(/HOME=\/data\//);
     expect(dockerfile).not.toMatch(/HOME=\/home\/app/);
   });
 
-  it('cli.ts falls HOME back to the writable CACHE_DIR, not /home/app', () => {
-    expect(cli).not.toContain("'/home/app'");
-    expect(cli).toMatch(/HOME:\s*process\.env\.HOME\s*\|\|\s*CACHE_DIR/);
-  });
 });

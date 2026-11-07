@@ -1,4 +1,5 @@
 import { runtime, uploadsBusy } from '@/server/drive';
+import { catalog } from '@/server/catalog';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,5 +16,7 @@ export async function GET() {
     requests: rt.requestStats(),
     caches: rt.cacheStats(),
     notices: rt.notices(),
+    // Drive folders fully listed once (never listed again), per backup set.
+    listedDirs: catalog.listedSummary(),
   });
 }

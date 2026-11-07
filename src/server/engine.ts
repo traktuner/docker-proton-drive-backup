@@ -827,7 +827,11 @@ export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHoo
       }
     });
   };
-  ctx.onListing = (_uid, count) => report(`reading a large Drive folder (${count.toLocaleString('en')} items so far)`);
+  ctx.onListing = (uid, count) => {
+    const rel = ctx.relOf(uid);
+    const name = rel && rel !== ctx.spec.subfolder ? ` "${rel.startsWith(ctx.prefix) ? rel.slice(ctx.prefix.length) : rel}"` : '';
+    report(`reading Drive folder${name} (${count.toLocaleString('en')} items so far)`);
+  };
   const report = (where: string, force = false) => {
     const now = Date.now();
     if (!force && now - lastReport < 250) return;

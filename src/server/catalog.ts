@@ -71,6 +71,9 @@ const SQL = {
   markListed: 'INSERT OR REPLACE INTO listed_dirs (set_id, rel, listed_at) VALUES (?, ?, ?)',
   removeListedTree: 'DELETE FROM listed_dirs WHERE set_id = ? AND (rel = ? OR (rel > ? AND rel < ?))',
   clearListed: 'DELETE FROM listed_dirs WHERE set_id = ?',
+  listedSummary: `SELECT set_id AS setId, count(*) AS count, max(listed_at) AS lastAt,
+    (SELECT rel FROM listed_dirs l2 WHERE l2.set_id = l.set_id ORDER BY listed_at DESC LIMIT 1) AS lastRel
+    FROM listed_dirs l GROUP BY set_id`,
   anyBelow: 'SELECT 1 FROM backup_catalog WHERE set_id = ? AND rel > ? AND rel < ? LIMIT 1',
 } as const;
 
@@ -255,6 +258,12 @@ export const catalog = {
   isListed(setId: string, rel: string): boolean {
     ensure();
     return !!stmt(SQL.isListed).get(setId, rel);
+  },
+
+  /** Per set: how many folders were fully listed, and the latest one (diagnostics). */
+  listedSummary(): { setId: string; count: number; lastAt: number; lastRel: string }[] {
+    ensure();
+    return stmt(SQL.listedSummary).all() as { setId: string; count: number; lastAt: number; lastRel: string }[];
   },
 
   markListed(setId: string, rel: string): void {

@@ -191,6 +191,22 @@ describe('an existing Drive folder is listed once, ever', () => {
     expect(listedOld).toBe(0);
   });
 
+  it('names the folder being listed in the progress and records the finished listing', async () => {
+    const t = Date.now() - 3_600_000;
+    const spec = makeSet('backup');
+    drive.mkdirp(remote(spec, 'graph'));
+    for (let i = 0; i < 1000; i++) drive.putFile(remote(spec, `graph/old${i}.jpg`), 'x', t);
+    write('graph/new.jpg', 'new', t);
+    drive.listDelayMs = 300; // keep the listing on screen past the progress throttle
+    const seen: string[] = [];
+    const r = await runSet(drive, spec, { onProgress: (p) => seen.push(p.current) });
+    expect(r.ok).toBe(true);
+    expect(seen.some((c) => /reading Drive folder "[^"]*\/graph" \(1,000 items so far\)/.test(c))).toBe(true);
+    const summary = catalog.listedSummary().find((s) => s.setId === spec.setId);
+    expect(summary?.count).toBeGreaterThanOrEqual(1);
+    expect(summary?.lastRel).toMatch(/\/graph$/);
+  });
+
   it('never adopts hidden files when the set excludes them', async () => {
     const t = Date.now() - 3_600_000;
     const spec = makeSet('backup');

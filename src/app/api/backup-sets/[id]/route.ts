@@ -2,7 +2,7 @@ import { backupSets, type BackupMode, type Schedule } from '@/server/db';
 import { sanitizeSegment } from '@/server/local';
 import { catalog } from '@/server/catalog';
 import { runs } from '@/server/runs';
-import { renameDrive, normalizeProtonPath, cleanCliError } from '@/server/cli';
+import { renameDrive, normalizeProtonPath, cleanDriveError, drive, invalidateFolder } from '@/server/drive';
 import { claimBackupSet, isBackupSetBusy, releaseBackupSet } from '@/server/backup-lock';
 
 export const dynamic = 'force-dynamic';
@@ -90,13 +90,25 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
       // Rename the actual Drive folder first. If it fails for any reason other than
       // "it isn't there yet" (set never ran), abort WITHOUT touching the DB/catalog —
       // so a failed rename never desyncs our keys into a full re-upload.
-      const target = normalizeProtonPath(cur.targetPath);
-      const res = await renameDrive(`${target}/${cur.targetSubfolder}`, newSub!);
-      const errText = (res.ok ? '' : (res.error || '') + ((res as { raw?: string }).raw || '')).toLowerCase();
-      const notThere = /not found|no such|does not exist|cannot be found/.test(errText);
-      if (!res.ok && !notThere) {
+      // Rename by node id when the set is bound to its folder (the folder may have
+      // moved name-wise on Drive); fall back to the path for sets that never ran.
+      let renamed: { ok: boolean; code: string | null } = { ok: true, code: null };
+      if (cur.folderUid) {
+        try {
+          const node = await (await drive()).rename(cur.folderUid, newSub!);
+          invalidateFolder(node.parentUid);
+        } catch (e) {
+          renamed = { ok: false, code: (e as { code?: string })?.code ?? null };
+        }
+      } else {
+        const res = await renameDrive(`${normalizeProtonPath(cur.targetPath)}/${cur.targetSubfolder}`, newSub!);
+        renamed = res.ok ? { ok: true, code: null } : { ok: false, code: res.code };
+      }
+      // Only an explicit "not found" (set never ran) may proceed without a rename;
+      // anything else aborts WITHOUT touching the DB/catalog.
+      if (!renamed.ok && renamed.code !== 'NOT_FOUND') {
         return Response.json(
-          { error: `Could not rename the Drive folder: ${cleanCliError(errText)}` },
+          { error: `Could not rename the Drive folder: ${cleanDriveError(null, renamed.code)}` },
           { status: 502 },
         );
       }
@@ -108,7 +120,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
     // A Drive target change invalidates the catalog. Source replacement is rejected
     // above; additive source edits use a separate route that preserves the catalog.
     // A subfolder rename rewrites keys above instead of clearing them.
-    if (targetChanged) catalog.clear(id);
+    if (targetChanged) {
+      catalog.clear(id);
+      backupSets.setFolderUid(id, null);
+      backupSets.setSourceMarks(id, {});
+    }
 
     const updated = backupSets.update(id, patch);
     return Response.json({ backupSet: updated });

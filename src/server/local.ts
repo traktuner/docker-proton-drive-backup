@@ -70,6 +70,8 @@ export interface WalkOptions {
    * deletion pass from mistaking an unreadable-but-present file for "gone").
    */
   onSkip?: (rel: string, reason: string) => void;
+  /** Called for every directory the walk enters (rel), including the source root. */
+  onDir?: (rel: string) => void;
 }
 
 /** The errno code of a filesystem error (EACCES/EPERM/EIO…), for a readable reason. */
@@ -95,7 +97,7 @@ export async function* walkSourceStream(
   relBase: string = path.basename(absPath),
   opts: WalkOptions = {},
 ): AsyncGenerator<WalkedFile> {
-  const { includeHidden = false, onSkip } = opts;
+  const { includeHidden = false, onSkip, onDir } = opts;
   let st;
   try {
     st = await fs.stat(absPath);
@@ -111,6 +113,7 @@ export async function* walkSourceStream(
   if (!st.isDirectory()) return;
 
   async function* recur(dir: string, relPrefix: string): AsyncGenerator<WalkedFile> {
+    onDir?.(relPrefix);
     let ents;
     try {
       ents = await fs.readdir(dir, { withFileTypes: true });
@@ -180,4 +183,37 @@ export async function listLocal(relPath: string): Promise<LocalEntry[]> {
     if (a.type !== b.type) return a.type === 'folder' ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+/**
+ * Mount state of a source root: whether it is its own mount (its st_dev differs
+ * from its parent directory's) and whether it currently holds any entry. Used by
+ * Mirror to tell an offline NAS share — whose mountpoint is still there but is now
+ * an empty directory of the parent filesystem — from a folder the user emptied.
+ */
+export async function sourceMark(abs: string): Promise<{ exists: boolean; mounted: boolean; nonEmpty: boolean }> {
+  let st;
+  try {
+    st = await fs.stat(abs);
+  } catch {
+    return { exists: false, mounted: false, nonEmpty: false };
+  }
+  let mounted = false;
+  try {
+    const parent = await fs.stat(path.dirname(abs));
+    mounted = parent.dev !== st.dev;
+  } catch {
+    mounted = false;
+  }
+  let nonEmpty = st.isFile();
+  if (st.isDirectory()) {
+    try {
+      const dir = await fs.opendir(abs);
+      nonEmpty = (await dir.read()) !== null;
+      await dir.close();
+    } catch {
+      nonEmpty = false;
+    }
+  }
+  return { exists: true, mounted, nonEmpty };
 }

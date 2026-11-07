@@ -17,6 +17,18 @@ export async function register() {
       console.error('[heal] source-path recovery failed:', e);
     }
 
+    // Opens (and, on the first start of this release, migrates) the DB, then
+    // records whether an existing CLI-era session is being taken over.
+    try {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const { initAccountOrigin, SESSION_DIR } = await import('./server/drive');
+      initAccountOrigin(fs.existsSync(path.join(SESSION_DIR, 'auth-session.json')));
+    } catch (e) {
+      console.error('[startup] migration/session check failed:', e);
+      throw e;
+    }
+
     // Declarative deploy: import backup sets from CONFIG_DIR if present.
     const { autoImportFromConfigDir } = await import('./server/config');
     autoImportFromConfigDir();

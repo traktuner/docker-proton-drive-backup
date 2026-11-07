@@ -1,57 +1,49 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { createReadStream, promises as fsp } from 'node:fs';
-import { walkSourceStream, relToLocalRoot, LOCAL_ROOT, type WalkedFile } from './local';
-import { catalog, diffFile } from './catalog';
+import { walkSourceStream, relToLocalRoot, sourceMark } from './local';
+import { catalog, diffFile, type CatalogEntry, type CatalogFile } from './catalog';
+import { backupSets, getDb, type SourceMark } from './db';
 import { getUploadConfig } from './upload-config';
 import { getMirrorSafetyConfig } from './mirror-safety';
-import {
-  createFolder,
-  upload,
-  trashDrive,
-  listDrive,
-  normalizeProtonPath,
-  looksUnauthenticated,
-  describeUploadError,
-  type FileStrategy,
-  type FolderStrategy,
-  type RunResult,
-} from './cli';
-
-/** Message shown when a run stops because the Proton session expired mid-flight. */
-const SESSION_EXPIRED_MSG =
-  'Proton session expired — reconnect to Proton Drive to resume. Nothing was deleted and your backup set is unchanged.';
-
-/** Snapshot the global percentage gate at the start of a run or preview. `null`
- *  disables only this gate; missing-source and failed-upload gates stay active. */
-function configuredDeleteSafetyPct(): number | null {
-  const config = getMirrorSafetyConfig();
-  return config.enabled ? config.deleteSafetyPct : null;
-}
-
-/** Base backoff between the transient upload retries (exponential: base, 2×, 4×).
- *  Overridable via env so the test suite doesn't wait out real seconds. */
-const RETRY_BASE_MS = Number(process.env.PDB_UPLOAD_RETRY_BASE_MS) || 5000;
+import { mediaTypeFor } from './mime';
+import { makeThrottle } from './traffic';
+import { DriveError, driveErrorCode, type DriveService, type RemoteNode } from './proton/types';
 
 /**
- * Delta backup engine.
+ * Backup engine on the Proton Drive SDK.
  *
- * Compares the local source tree against the Drive target and only uploads
- * files that are new or changed - so unchanged files (even 60 GB ones) are never
- * re-uploaded. Change detection: size first, then mtime (round-trips exactly via
- * the CLI's claimedModificationTime), then sha1 as a tie-breaker when only the
- * mtime drifted (Drive exposes claimedDigests.sha1 == the local file's sha1, so
- * no download is needed).
+ * One pass over the local tree, diffed against the per-set catalog (catalog.ts).
+ * Unchanged files cost a stat and an indexed SQLite lookup — no Drive request and
+ * no file read. Changed and new files are read ONCE: the same read feeds the
+ * encryption, the SHA-1 Drive stores as the revision digest and the speed limit.
  *
- *  - mode 'backup': upload new + changed, never delete.
- *  - mode 'mirror': same, plus trash Drive items that no longer exist locally
- *    (scoped to the source subtrees, so unrelated Drive content is never touched).
+ * Modes
+ *  - add:    upload files that are not on Drive yet; never updates or deletes.
+ *  - backup: upload new files and a NEW REVISION of every changed file (the
+ *            previous version stays restorable in Drive); never deletes.
+ *  - mirror: backup + move Drive items of locally removed files to the Drive trash.
+ *
+ * Correctness rules (each has a regression test in engine.test.ts):
+ *  1. The catalog only records what Drive confirmed (after `completion()`).
+ *  2. Before uploading a revision, the remote node is checked: if Drive already
+ *     holds exactly the local content (e.g. the container died after Drive
+ *     confirmed the revision but before the SQLite commit) it is adopted — no
+ *     second revision. The same applies when a "new" file's name already exists.
+ *  3. "Not found" is only ever concluded from Drive's explicit answer; network,
+ *     auth, rate-limit and decryption errors abort or retry, never delete or skip.
+ *  4. Deletions (mirror) run only if every source is present AND looks like it did
+ *     on the last run (an offline NAS share leaves an EMPTY mountpoint behind),
+ *     no upload failed, and the share of removed items is within the safety limit.
+ *     Each item is re-read from Drive and must still be our node at the expected
+ *     place; a folder that contains anything we did not upload is never trashed
+ *     as a whole.
+ *  5. Dry run uses the very same scan, decisions and deletion planner — only the
+ *     final write/trash calls are skipped.
  */
 
 export interface SkippedFile {
-  /** Catalog-style rel path ("<subfolder>/…") of the file that was skipped. */
   rel: string;
-  /** Human reason (e.g. "name too long…", "not readable (EACCES)"). */
   reason: string;
 }
 
@@ -61,66 +53,15 @@ export interface DeltaResult {
   newCount: number;
   changedCount: number;
   unchangedCount: number;
+  /** Files Drive already had with identical content; recorded without uploading. */
+  adoptedCount: number;
   deletedCount: number;
   failedCount: number;
-  /** A bounded sample of the files skipped this run (rel + reason), for the UI panel.
-   *  `failedCount` is the true total; this list is capped at FAILED_SAMPLE_CAP. */
   failedFiles: SkippedFile[];
+  uploadedBytes: number;
+  /** Why the deletion pass did not run (mirror), if it was skipped. */
+  deletionSkipped: string | null;
   message: string;
-}
-
-/** How many skipped files we keep the details of (bounded memory; count is exact). */
-const FAILED_SAMPLE_CAP = 100;
-
-/** Minimal glob → RegExp ( * within a segment, ** across, ? one char ). */
-function globToRegExp(glob: string): RegExp {
-  let re = glob.trim().replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  re = re.replace(/\*\*/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\u0000/g, '.*').replace(/\?/g, '[^/]');
-  return new RegExp(`^${re}$`, 'i');
-}
-
-/** True if rel (or its basename, or any path segment) matches an exclude glob. */
-function makeExcluder(patterns: string[]): (rel: string) => boolean {
-  const res = patterns.filter((p) => p.trim()).map(globToRegExp);
-  if (res.length === 0) return () => false;
-  return (rel: string) => {
-    const segs = rel.split('/');
-    const base = segs[segs.length - 1];
-    return res.some((r) => r.test(rel) || r.test(base) || segs.some((s) => r.test(s)));
-  };
-}
-
-/** True if `rel` or any of its ancestor directories is in `set`. */
-function hasAncestorIn(rel: string, set: Set<string>, includeSelf: boolean): boolean {
-  if (includeSelf && set.has(rel)) return true;
-  let dir = path.dirname(rel);
-  while (dir && dir !== '.') {
-    if (set.has(dir)) return true;
-    dir = path.dirname(dir);
-  }
-  return false;
-}
-
-/**
- * The top-most entries of a set of rel paths: those with no ancestor also in the
- * set. Trashing a folder on Drive removes its children, so only these need a
- * `trash` call. O(n × depth) via a Set of ancestors — the obvious pairwise
- * `filter(some(startsWith))` is O(n²) and pins the server at 100% CPU for hours
- * once a mirror run has ~10⁵ stale entries (a removed photo year, say).
- */
-export function topMost<T extends { rel: string }>(entries: T[]): T[] {
-  const all = new Set(entries.map((e) => e.rel));
-  return entries.filter((e) => !hasAncestorIn(e.rel, all, false));
-}
-
-function sha1File(abs: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const h = createHash('sha1');
-    const s = createReadStream(abs);
-    s.on('data', (d) => h.update(d));
-    s.on('end', () => resolve(h.digest('hex')));
-    s.on('error', reject);
-  });
 }
 
 export interface EngineProgress {
@@ -132,19 +73,95 @@ export interface EngineProgress {
   bytesPerSec?: number;
 }
 
-/** Smoothed bytes/sec from a monotonically growing total, sampled ≥0.5s apart. */
+export type Mode = 'add' | 'backup' | 'mirror';
+
+export interface RunSpec {
+  setId: string;
+  sourcePaths: string[];
+  /** Proton path of the target folder ("/my-files/…"). */
+  targetPath: string;
+  subfolder: string;
+  mode: Mode;
+  excludes?: string[];
+  skipThumbnails?: boolean;
+  includeHidden?: boolean;
+  /** One-shot: the user confirmed that a now-empty source really was emptied. */
+  allowEmptySource?: boolean;
+}
+
+export interface RunHooks {
+  log?: (msg: string) => void;
+  onProgress?: (p: EngineProgress) => void;
+  shouldCancel?: () => boolean;
+  /** Aborted on cancel: interrupts in-flight transfers immediately. */
+  signal?: AbortSignal;
+}
+
+const FAILED_SAMPLE_CAP = 100;
+const RETRY_BASE_MS = Number(process.env.PDB_UPLOAD_RETRY_BASE_MS) || 2000;
+const SESSION_EXPIRED_MSG =
+  'Proton session expired — reconnect to Proton Drive to resume. Nothing was deleted and your backup set is unchanged.';
+
+/* ------------------------------------------------------------------ */
+/* Small helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/** Minimal glob → RegExp ( * within a segment, ** across, ? one char ). */
+function globToRegExp(glob: string): RegExp {
+  let re = glob.trim().replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  re = re.replace(/\*\*/g, '\u0000').replace(/\*/g, '[^/]*').replace(/\u0000/g, '.*').replace(/\?/g, '[^/]');
+  return new RegExp(`^${re}$`, 'i');
+}
+
+/** True if rel (or its basename, or any path segment) matches an exclude glob. */
+export function makeExcluder(patterns: string[]): (rel: string) => boolean {
+  const res = patterns.filter((p) => p.trim()).map(globToRegExp);
+  if (res.length === 0) return () => false;
+  return (rel: string) => {
+    const segs = rel.split('/');
+    const base = segs[segs.length - 1];
+    return res.some((r) => r.test(rel) || r.test(base) || segs.some((s) => r.test(s)));
+  };
+}
+
+function hasAncestorIn(rel: string, set: Set<string>, includeSelf: boolean): boolean {
+  if (includeSelf && set.has(rel)) return true;
+  let dir = path.posix.dirname(rel);
+  while (dir && dir !== '.') {
+    if (set.has(dir)) return true;
+    dir = path.posix.dirname(dir);
+  }
+  return false;
+}
+
+/** Entries with no ancestor also in the list (trashing a folder trashes its children). */
+export function topMost<T extends { rel: string }>(entries: T[]): T[] {
+  const all = new Set(entries.map((e) => e.rel));
+  return entries.filter((e) => !hasAncestorIn(e.rel, all, false));
+}
+
+export function sha1File(abs: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const h = createHash('sha1');
+    const s = createReadStream(abs, { highWaterMark: 1 << 20 });
+    s.on('data', (d) => h.update(d));
+    s.on('end', () => resolve(h.digest('hex')));
+    s.on('error', reject);
+  });
+}
+
 function makeSpeedMeter() {
   let lastT = Date.now();
   let lastB = 0;
   let rate = 0;
-  return (totalBytes: number): number => {
+  return (total: number): number => {
     const now = Date.now();
     const dt = (now - lastT) / 1000;
     if (dt >= 0.5) {
-      const inst = Math.max(0, (totalBytes - lastB) / dt);
+      const inst = Math.max(0, (total - lastB) / dt);
       rate = rate ? rate * 0.6 + inst * 0.4 : inst;
       lastT = now;
-      lastB = totalBytes;
+      lastB = total;
     }
     return rate;
   };
@@ -156,739 +173,652 @@ export function relBaseFor(subfolder: string, abs: string): string {
   return rel ? `${subfolder}/${rel}` : subfolder;
 }
 
-/**
- * Bulk-upload whole source trees while preserving their structure under
- * `<target>/<relBase>`. The CLI always names an uploaded folder after its
- * basename, so we never upload a source folder directly (its basename wouldn't
- * match the desired relBase). Instead:
- *   - a directory source → ensure `<target>/<relBase>` exists, then upload its
- *     (non-dot) immediate children into it; the CLI recurses each child.
- *   - a file source → upload it into `<target>/<dirname(relBase)>` (basename matches).
- * This keeps the layout exactly `<target>/<relBase>/…` regardless of basenames and
- * matches what the per-file engine/catalog records. Used by the fast first-run
- * seed and the lightweight 'add' mode. Returns the first failing CLI result, else
- * the last success.
- *
- * Work is split into UNITS, each its own CLI process: one per immediate child
- * DIRECTORY of a directory source, plus one for all of that source's direct child
- * files, plus one per destination folder for file sources. Two reasons, both about
- * memory: a single process recursing a whole multi-TB tree holds that whole job's
- * state in its own (Bun) heap for hours, and if it dies the caller has nothing to
- * show for the completed part. `onUnitUploaded` fires after each unit's process
- * exits 0 with the local roots it covered, so the seed can record the catalog
- * incrementally — a kill mid-seed then costs only the unit in flight, not the
- * whole tree (the next run finds a non-empty catalog and resumes per file).
- */
-export type UploadUnit = { abs: string; relBase: string };
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).split('\n')[0].slice(0, 160);
 
-/**
- * Max single-file paths handed to one CLI process as argv. Every direct child file
- * of a source folder used to go into ONE argv; a folder with tens of thousands of
- * files then fails at spawn with E2BIG (ARG_MAX is ~2 MiB on Linux, and a NAS path
- * is easily 100+ bytes) and takes the whole run down. 500 keeps argv well under
- * 100 KiB even for long paths while still amortising process start-up.
- */
-const FILE_UNIT_CHUNK = 500;
+/** Human reason for one file's failure (run summary / skipped-files panel). */
+export function describeUploadError(e: unknown): string {
+  const code = driveErrorCode(e);
+  const fsCode = code ? undefined : (e as NodeJS.ErrnoException)?.code;
+  if (fsCode && /^E[A-Z]+$/.test(fsCode)) return `not readable (${fsCode})`;
+  switch (code) {
+    case 'UNAUTHENTICATED':
+      return 'Proton session expired';
+    case 'INVALID_NAME':
+      return 'name not allowed by Proton Drive (at most 255 characters, no "/")';
+    case 'QUOTA':
+      return 'Drive storage is full';
+    case 'NAME_CONFLICT':
+      return 'a conflicting item already exists on Drive';
+    case 'NETWORK':
+      return 'network error talking to Proton';
+    case 'RATE_LIMITED':
+      return 'rate-limited by Proton';
+    case 'INTEGRITY':
+      return 'the file changed while it was being uploaded';
+    case 'DECRYPTION':
+      return 'Drive metadata could not be decrypted';
+    default:
+      return errMsg(e) || 'upload failed';
+  }
+}
 
-export async function uploadSourceTrees(
-  sources: UploadUnit[],
-  target: string,
-  fileStrategy: FileStrategy,
-  folderStrategy: FolderStrategy,
-  onUploadedFile?: (bytes: number) => void,
-  shouldCancel: () => boolean = () => false,
-  skipThumbnails = false,
-  includeHidden = false,
-  onUnitUploaded?: (roots: UploadUnit[]) => Promise<void>,
-): Promise<RunResult> {
-  // Ensure a "<target>/<relDir>" folder chain exists (idempotent, shallow→deep).
-  const ensured = new Set<string>();
-  const ensureChain = async (relDir: string) => {
-    if (relDir === '' || relDir === '.') return;
-    const parts = relDir.split('/');
-    for (let i = 1; i <= parts.length; i++) {
-      const sub = parts.slice(0, i).join('/');
-      if (ensured.has(sub)) continue;
-      ensured.add(sub);
-      const parentRel = parts.slice(0, i - 1).join('/');
-      await createFolder(parentRel ? `${target}/${parentRel}` : target, parts[i - 1]);
-    }
-  };
+const TRANSIENT = new Set(['NETWORK', 'RATE_LIMITED', 'SERVER', 'INTEGRITY', 'UNKNOWN']);
 
-  let last: RunResult = { code: 0, stdout: '', stderr: '' };
-  // Upload one unit (one CLI process). On success, report the roots it covered.
-  const runOne = async (roots: UploadUnit[], parentDrive: string): Promise<boolean> => {
-    if (roots.length === 0) return true;
-    const res = await upload(
-      roots.map((r) => r.abs),
-      parentDrive,
-      fileStrategy,
-      folderStrategy,
-      onUploadedFile,
-      skipThumbnails,
-    );
-    last = res;
-    if (res.code !== 0) return false;
-    // A cancel that landed during the upload killed the process mid-unit (exit≠0),
-    // so reaching here means the unit completed — safe to record.
-    if (onUnitUploaded) await onUnitUploaded(roots);
-    return true;
-  };
-  // Single-file roots in argv-sized chunks (see FILE_UNIT_CHUNK); directory roots
-  // are always passed one at a time by the callers below.
-  const run = async (roots: UploadUnit[], parentDrive: string): Promise<boolean> => {
-    for (let i = 0; i < roots.length; i += FILE_UNIT_CHUNK) {
-      if (i > 0 && shouldCancel()) return false;
-      if (!(await runOne(roots.slice(i, i + FILE_UNIT_CHUNK), parentDrive))) return false;
-    }
-    return true;
-  };
+/* ------------------------------------------------------------------ */
+/* Shared context: Drive folder resolution for one run                 */
+/* ------------------------------------------------------------------ */
 
-  // File sources grouped by destination parent dir (basename matches relBase).
-  const fileGroups = new Map<string, UploadUnit[]>();
-  const dirSources: UploadUnit[] = [];
-  for (const s of sources) {
-    let st;
-    try {
-      st = await fsp.stat(s.abs);
-    } catch {
-      continue; // unreadable source → skip
-    }
-    if (st.isDirectory()) {
-      dirSources.push(s);
-    } else if (st.isFile()) {
-      const parentRel = path.dirname(s.relBase);
-      const arr = fileGroups.get(parentRel);
-      if (arr) arr.push(s);
-      else fileGroups.set(parentRel, [s]);
-    }
+class RunContext {
+  readonly prefix: string;
+  readonly isExcluded: (rel: string) => boolean;
+  /** rel dir → node uid, for this run (bounded; the catalog persists them). */
+  private dirUids = new Map<string, string>();
+  /** folder uid → children by name, for this run (bounded LRU). */
+  private kids = new Map<string, Map<string, RemoteNode>>();
+  setFolderUid = '';
+  targetUid = '';
+
+  constructor(
+    readonly drive: DriveService,
+    readonly spec: RunSpec,
+    readonly seenAt: number,
+    readonly write: boolean,
+  ) {
+    this.prefix = `${spec.subfolder}/`;
+    const ex = makeExcluder(spec.excludes ?? []);
+    // Exclude globs are authored relative to LOCAL_ROOT (no subfolder prefix).
+    this.isExcluded = (rel) => ex(rel.startsWith(this.prefix) ? rel.slice(this.prefix.length) : rel);
   }
 
-  for (const [parentRel, roots] of fileGroups) {
-    if (shouldCancel()) return last;
-    await ensureChain(parentRel === '.' ? '' : parentRel);
-    const parentDrive = parentRel === '.' ? target : `${target}/${parentRel}`;
-    if (!(await run(roots, parentDrive))) return last;
+  async childMap(folderUid: string, fresh = false): Promise<Map<string, RemoteNode>> {
+    let m = this.kids.get(folderUid);
+    if (m && !fresh) {
+      this.kids.delete(folderUid);
+      this.kids.set(folderUid, m);
+      return m;
+    }
+    m = new Map();
+    for await (const n of this.drive.children(folderUid)) if (n.name !== null) m.set(n.name, n);
+    this.kids.set(folderUid, m);
+    while (this.kids.size > 256) this.kids.delete(this.kids.keys().next().value!);
+    return m;
   }
 
-  for (const s of dirSources) {
-    if (shouldCancel()) return last;
-    await ensureChain(s.relBase); // create <target>/<relBase> in full
-    let ents;
-    try {
-      ents = await fsp.readdir(s.abs, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    const parentDrive = `${target}/${s.relBase}`;
-    const childFiles: UploadUnit[] = [];
-    const childDirs: UploadUnit[] = [];
-    for (const e of ents) {
-      if (!includeHidden && e.name.startsWith('.')) continue;
-      const unit = { abs: path.join(s.abs, e.name), relBase: `${s.relBase}/${e.name}` };
-      if (e.isDirectory()) childDirs.push(unit);
-      else childFiles.push(unit);
-    }
-    // Direct child files: one process for all of them (each is a single file).
-    if (!(await run(childFiles, parentDrive))) return last;
-    // Child directories: one process EACH (the CLI recurses the subtree), so a
-    // process never holds more than one top-level subtree and completed subtrees
-    // are reported as soon as they finish.
-    for (const d of childDirs) {
-      if (shouldCancel()) return last;
-      if (!(await run([d], parentDrive))) return last;
-    }
+  forgetDir(rel: string) {
+    const uid = this.dirUids.get(rel);
+    this.dirUids.delete(rel);
+    if (uid) this.kids.delete(uid);
+    if (this.write) catalog.setNodeUid(this.spec.setId, rel, null);
   }
 
-  return last;
+  /**
+   * Node uid of the Drive folder for catalog dir `rel`, resolving (and with
+   * `create`, creating) the chain below the set folder. Returns null if it does
+   * not exist and `create` is false (or this is a dry run).
+   */
+  async dirUid(rel: string, create: boolean): Promise<string | null> {
+    if (rel === this.spec.subfolder) return this.setFolderUid;
+    const hit = this.dirUids.get(rel);
+    if (hit) return hit;
+    const row = catalog.getDir(this.spec.setId, rel);
+    if (row?.nodeUid) {
+      this.remember(rel, row.nodeUid);
+      return row.nodeUid;
+    }
+    const parentRel = path.posix.dirname(rel);
+    const parent = await this.dirUid(parentRel === '.' ? this.spec.subfolder : parentRel, create);
+    if (!parent) return null;
+    const name = path.posix.basename(rel);
+    const kids = await this.childMap(parent);
+    let n = kids.get(name);
+    if (n && n.kind !== 'folder') throw new DriveError('NAME_CONFLICT', `a file named "${name}" is where a folder belongs`);
+    if (!n) {
+      if (!create || !this.write) return null;
+      n = await this.drive.createFolder(parent, name);
+      kids.set(name, n);
+    }
+    if (this.write) catalog.upsertDir(this.spec.setId, rel, this.seenAt, n.uid);
+    this.remember(rel, n.uid);
+    return n.uid;
+  }
+
+  private remember(rel: string, uid: string) {
+    this.dirUids.set(rel, uid);
+    if (this.dirUids.size > 20_000) this.dirUids.delete(this.dirUids.keys().next().value!);
+  }
+
+  /** Resolve an absolute Proton path ("/my-files/a/b") from the root. */
+  async resolvePath(p: string): Promise<RemoteNode | null> {
+    let node = await this.drive.root();
+    const segs = p.replace(/^\/my-files\/?/, '').split('/').filter(Boolean);
+    for (const s of segs) {
+      const next = (await this.childMap(node.uid, true)).get(s);
+      if (!next) return null;
+      node = next;
+    }
+    return node;
+  }
 }
 
 /**
- * Catalog-based delta engine — scales to millions of files.
- *
- * Never re-lists Drive (a per-folder `list` spawn is fatal at scale) and never
- * holds the whole tree in memory. It streams the local walk, diffs each file
- * against our persisted catalog (catalog.ts), uploads only what changed in
- * bounded per-folder batches, and records the result. Drive is hit only to
- * upload (and, in mirror mode, to trash). Memory stays flat regardless of file
- * count.
- *
- *  - backup: upload new + changed; never delete; only writes the catalog for
- *    files it actually uploads, so an unchanged 4M-file run does ~no DB writes.
- *  - mirror: same, plus marks every seen file and trashes catalog entries that
- *    vanished locally (scoped to the managed source roots).
+ * Find (or create) the set's own folder and check it is still the one the set
+ * wrote to before. Returns an error message when the run must not write.
  */
-export async function runCatalogDelta(
-  setId: string,
-  sourcePaths: string[],
-  targetPath: string,
-  subfolder: string,
-  mode: 'backup' | 'mirror',
-  excludes: string[] = [],
-  log: (msg: string) => void = () => {},
-  onProgress: (p: EngineProgress) => void = () => {},
-  shouldCancel: () => boolean = () => false,
-  opts: { skipThumbnails?: boolean; includeHidden?: boolean } = {},
-): Promise<DeltaResult> {
-  // Keep one stable value for the whole run. Existing installations with no
-  // settings file resolve to the historical 30% default.
-  const DELETE_SAFETY_PCT = configuredDeleteSafetyPct();
-  const { skipThumbnails = false, includeHidden = false } = opts;
-  const target = normalizeProtonPath(targetPath);
-  // Each source is laid out at "<target>/<subfolder>/<source rel to LOCAL_ROOT>",
-  // so same-named folders from different paths never collide and the structure is
-  // preserved. The set's subfolder is the single managed root for mirror scoping.
-  const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
-  const managedRoots = new Set([subfolder]);
-  // Exclude globs are authored relative to LOCAL_ROOT (no subfolder prefix), so we
-  // match them against the rel with the "<subfolder>/" prefix stripped off.
-  const matchExclude = makeExcluder(excludes);
-  const prefix = `${subfolder}/`;
-  const isExcluded = (rel: string) => matchExclude(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
-  // This run's "seen" stamp. The mirror pass treats seen_at < seenAt as gone, so the
-  // stamp must be STRICTLY newer than anything already in the catalog: a run that
-  // starts in the same millisecond the previous one finished (or after the clock
-  // stepped back) would otherwise see none of the vanished files as stale.
-  const seenAt = Math.max(Date.now(), catalog.maxSeenAt(setId) + 1);
+async function bindSetFolder(ctx: RunContext, log: (m: string) => void): Promise<string | null> {
+  const { spec, drive } = ctx;
+  const set = backupSets.get(spec.setId);
+  const known = set?.folderUid ?? null;
+  const hasCatalog = catalog.count(spec.setId) > 0;
+  const where = `"${spec.targetPath.replace(/^\/my-files/, '') || '/'}/${spec.subfolder}"`;
 
-  const CHUNK = 200; // files per upload call
-  // How many upload batches may be in flight at once = the user's configured upload
-  // concurrency, re-read live (cached ~1s) so changing it in Settings takes effect
-  // mid-run: raising it lets more batches start, lowering it makes new batches wait
-  // until the in-flight count drains below the new cap (graceful up/down-scaling).
-  let capCache = 0;
-  let capAt = 0;
-  const maxInflight = (): number => {
-    const now = Date.now();
-    if (now - capAt > 1000) {
-      capCache = Math.max(1, Math.min(8, getUploadConfig().concurrency || 2));
-      capAt = now;
+  if (known) {
+    const n = await drive.getNode(known);
+    if (n && !n.trashed && n.kind === 'folder' && n.parentUid === ctx.targetUid) {
+      if (n.name && n.name !== spec.subfolder) {
+        // Same node, renamed on Drive: follow it (the identity is the node, not the name).
+        log(`The set's Drive folder was renamed to "${n.name}" — following it.`);
+        if (ctx.write) backupSets.renameSubfolder(spec.setId, spec.subfolder, n.name);
+        spec.subfolder = n.name;
+      }
+      ctx.setFolderUid = n.uid;
+      return null;
     }
-    return capCache;
+    if (hasCatalog) {
+      return n?.trashed
+        ? `The set's Drive folder ${where} is in the Drive trash — nothing was uploaded. Restore it from the trash, or run Verify to start this set over.`
+        : `The set's Drive folder ${where} was deleted or moved on Drive — nothing was uploaded. Run Verify to re-check this set; it will re-upload what Drive is missing.`;
+    }
+    if (ctx.write) backupSets.setFolderUid(spec.setId, null);
+  }
+
+  const existing = (await ctx.childMap(ctx.targetUid, true)).get(spec.subfolder);
+  if (existing && existing.kind !== 'folder') return `A file named "${spec.subfolder}" is in the way of the set's Drive folder.`;
+  if (existing) {
+    ctx.setFolderUid = existing.uid;
+    if (ctx.write) backupSets.setFolderUid(spec.setId, existing.uid);
+    return null;
+  }
+  if (hasCatalog) {
+    return `The set's Drive folder ${where} was not found (renamed or deleted on Drive?) — nothing was uploaded. Run Verify to re-check this set.`;
+  }
+  if (!ctx.write) return null; // dry run of a brand-new set: the folder would be created
+  const created = await drive.createFolder(ctx.targetUid, spec.subfolder);
+  ctx.setFolderUid = created.uid;
+  backupSets.setFolderUid(spec.setId, created.uid);
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* Deletion planner (shared by mirror runs and the dry run)            */
+/* ------------------------------------------------------------------ */
+
+interface DeletionOutcome {
+  deleted: number;
+  wouldDelete: string[];
+  wouldDeleteCount: number;
+  kept: { rel: string; reason: string }[];
+  failed: number;
+  sessionDead: boolean;
+}
+
+async function planAndDelete(ctx: RunContext, stale: CatalogEntry[], cancelled: () => boolean, log: (m: string) => void): Promise<DeletionOutcome> {
+  const out: DeletionOutcome = { deleted: 0, wouldDelete: [], wouldDeleteCount: 0, kept: [], failed: 0, sessionDead: false };
+  const { spec, drive } = ctx;
+  const staleSet = new Map(stale.map((e) => [e.rel, e]));
+  const dropRows = (rel: string) => {
+    if (!ctx.write) return;
+    const gone = stale.filter((s) => s.rel === rel || s.rel.startsWith(rel + '/')).map((s) => s.rel);
+    catalog.remove(spec.setId, gone);
   };
+  const batch: { uid: string; rel: string }[] = [];
+  const flush = async () => {
+    if (batch.length === 0) return;
+    const items = batch.splice(0);
+    const res = await drive.trash(items.map((b) => b.uid));
+    for (const r of res) {
+      const item = items.find((b) => b.uid === r.uid);
+      if (!item) continue;
+      if (r.ok) {
+        out.deleted++;
+        dropRows(item.rel);
+      } else if (r.code === 'UNAUTHENTICATED') {
+        out.sessionDead = true;
+      } else {
+        out.failed++;
+        log(`  could not trash ${item.rel}: ${r.error ?? 'error'}`);
+      }
+    }
+  };
+
+  /** Does the remote folder contain anything that is not in our catalog? */
+  const hasForeign = async (dirUid: string, dirRel: string): Promise<boolean> => {
+    for (const child of (await ctx.childMap(dirUid, true)).values()) {
+      const rel = `${dirRel}/${child.name}`;
+      const kind = child.kind === 'folder' ? 'dir' : 'file';
+      const known = staleSet.get(rel) ?? (kind === 'dir' ? catalog.getDir(spec.setId, rel) : catalog.getFile(spec.setId, rel));
+      if (!known) return true;
+      if (child.kind === 'folder' && (await hasForeign(child.uid, rel))) return true;
+    }
+    return false;
+  };
+
+  const visit = async (e: CatalogEntry): Promise<void> => {
+    if (cancelled() || out.sessionDead) return;
+    if (e.rel === spec.subfolder) return; // never the set folder itself
+    const parentRel = path.posix.dirname(e.rel);
+    const parentUid = await ctx.dirUid(parentRel === '.' ? spec.subfolder : parentRel, false);
+    const name = path.posix.basename(e.rel);
+    if (!parentUid) {
+      dropRows(e.rel); // the parent is already gone on Drive
+      return;
+    }
+    const uid = e.nodeUid ?? (await ctx.childMap(parentUid)).get(name)?.uid ?? null;
+    const node = uid ? await drive.getNode(uid) : null;
+    if (!node || node.trashed) {
+      dropRows(e.rel); // already gone — nothing to do
+      return;
+    }
+    if (node.parentUid !== parentUid || node.name !== name || (node.kind === 'folder') !== (e.kind === 'dir')) {
+      out.kept.push({ rel: e.rel, reason: 'changed on Drive by someone else' });
+      log(`  kept ${e.rel}: it was moved, renamed or replaced on Drive`);
+      dropRows(e.rel); // no longer ours to manage
+      return;
+    }
+    if (e.kind === 'dir' && (await hasForeign(node.uid, e.rel))) {
+      out.kept.push({ rel: e.rel, reason: 'contains files this backup did not upload' });
+      log(`  kept folder ${e.rel}: it contains items this backup did not upload; trashing only ours`);
+      for (const child of stale) {
+        if (path.posix.dirname(child.rel) === e.rel) await visit(child);
+      }
+      if (ctx.write) catalog.upsertDir(spec.setId, e.rel, ctx.seenAt, node.uid); // the folder stays
+      return;
+    }
+    out.wouldDeleteCount++;
+    if (out.wouldDelete.length < 500) out.wouldDelete.push(e.rel);
+    if (!ctx.write) return;
+    batch.push({ uid: node.uid, rel: e.rel });
+    if (batch.length >= 50) await flush();
+  };
+
+  try {
+    for (const e of topMost(stale)) {
+      if (cancelled() || out.sessionDead) break;
+      await visit(e);
+    }
+    if (!cancelled() && !out.sessionDead) await flush();
+  } catch (err) {
+    if (driveErrorCode(err) === 'UNAUTHENTICATED') out.sessionDead = true;
+    else throw err;
+  }
+  return out;
+}
+
+/** Gates that must ALL pass before anything is deleted. Returns the reason to skip, or null. */
+async function deletionGate(
+  spec: RunSpec,
+  marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }>,
+  failedCount: number,
+  staleCount: number,
+  total: number,
+  pct: number | null,
+): Promise<string | null> {
+  const before = backupSets.get(spec.setId)?.sourceMarks ?? {};
+  for (const abs of spec.sourcePaths) {
+    const now = marksNow[abs];
+    if (!now?.exists) return `source "${relToLocalRoot(abs) || abs}" is missing on disk (mount offline?)`;
+    const prev: SourceMark | undefined = before[abs];
+    if (prev?.mounted && !now.mounted) return `source "${relToLocalRoot(abs) || abs}" is no longer a mounted share (NAS offline?)`;
+    if (!now.nonEmpty && (prev?.nonEmpty ?? true) && !spec.allowEmptySource) {
+      return `source "${relToLocalRoot(abs) || abs}" is empty — if you emptied it on purpose, confirm the deletion in the set's menu`;
+    }
+  }
+  if (failedCount > 0) return `${failedCount} file(s) failed to upload — "gone locally" can't be trusted until uploads succeed`;
+  if (pct !== null && total > 0 && staleCount / total > pct) {
+    return `${staleCount}/${total} entries (>${Math.round(pct * 100)}%) would be removed`;
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
+/* The run                                                              */
+/* ------------------------------------------------------------------ */
+
+export async function runSet(drive: DriveService, specIn: RunSpec, hooks: RunHooks = {}): Promise<DeltaResult> {
+  const spec = { ...specIn };
+  const log = hooks.log ?? (() => {});
+  const shouldCancel = hooks.shouldCancel ?? (() => false);
+  const mirrorCfg = getMirrorSafetyConfig();
+  const DELETE_SAFETY_PCT = mirrorCfg.enabled ? mirrorCfg.deleteSafetyPct : null;
+  const seenAt = Math.max(Date.now(), catalog.maxSeenAt(spec.setId) + 1);
+  const ctx = new RunContext(drive, spec, seenAt, true);
 
   let newCount = 0;
   let changedCount = 0;
   let unchangedCount = 0;
+  let adoptedCount = 0;
   let failedCount = 0;
-  // A bounded sample of skipped files (rel + human reason): one is named in the run
-  // summary, and the whole list is persisted for the UI's "Skipped files" panel.
-  const failedFiles: SkippedFile[] = [];
-  // Surface an unreadable file/folder as a failure instead of dropping it silently.
-  // In mirror mode this also trips the failedCount>0 deletion gate, so an
-  // unreadable-but-present file can never be mistaken for "gone" and trashed.
-  const noteUnreadable = (rel: string, reason: string) => {
-    failedCount += 1;
-    if (failedFiles.length < FAILED_SAMPLE_CAP) failedFiles.push({ rel, reason });
-    log(`  skipped: ${rel} — ${reason}`);
-  };
-  let deletedCount = 0;
   let doneFiles = 0;
   let doneBytes = 0;
   let cancelled = false;
-  // Set the moment a CLI op reports the Proton session is gone. We then stop
-  // scheduling work, skip the mirror deletion pass entirely, and end the run with a
-  // clear "reconnect" message instead of grinding every batch through 4 doomed
-  // retries (and never risking a delete pass against a half-dead session).
   let sessionDead = false;
-
+  const failedFiles: SkippedFile[] = [];
   const speed = makeSpeedMeter();
-  const report = (current: string) =>
-    onProgress({ doneFiles, totalFiles: 0, doneBytes, totalBytes: 0, current, bytesPerSec: speed(doneBytes) });
-  const cancelledResult = (): DeltaResult => ({
+  let lastReport = 0;
+  const report = (current: string, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastReport < 250) return;
+    lastReport = now;
+    hooks.onProgress?.({ doneFiles, totalFiles: 0, doneBytes, totalBytes: 0, current, bytesPerSec: speed(doneBytes) });
+  };
+  const noteFailed = (rel: string, reason: string) => {
+    failedCount++;
+    if (failedFiles.length < FAILED_SAMPLE_CAP) failedFiles.push({ rel, reason });
+    log(`  skipped: ${rel} — ${reason}`);
+  };
+  const result = (message: string, extra: Partial<DeltaResult> = {}): DeltaResult => ({
     ok: false,
-    cancelled: true,
+    cancelled,
     newCount,
     changedCount,
     unchangedCount,
+    adoptedCount,
     deletedCount: 0,
     failedCount,
     failedFiles,
-    message: `Cancelled - ${doneFiles} uploaded`,
+    uploadedBytes: doneBytes,
+    deletionSkipped: null,
+    message,
+    ...extra,
   });
 
-  // Fast initial seed: on the first run (empty catalog) with no excludes, let the
-  // CLI recurse the whole tree in ~one process per source (`upload … -f skip`)
-  // instead of tens of thousands of per-folder batch spawns, then record the
-  // catalog from a local walk. Structure is preserved via uploadSourceTrees.
-  // Excludes can't be honoured by the CLI recursion, so those sets fall through to
-  // the per-file path below.
-  if (excludes.length === 0 && catalog.count(setId) === 0) {
-    log('Initial upload (recursive)…');
-    report('initial upload');
-    // Verbose upload so we get a per-file [metric] upload line — gives live file
-    // count, bytes and speed even though the CLI does whole subtrees in one go.
-    let uploaded = 0;
-    let lastReport = 0;
-
-    // Catalog recording, done PER UNIT right after that unit's CLI process succeeds
-    // (not once after the whole tree). If the container is OOM-killed or restarted
-    // mid-seed, everything up to the last completed unit is already in the catalog,
-    // so the next run takes the bounded per-file path for the remainder instead of
-    // starting the whole recursive seed over — which is what turned one kill into a
-    // daily kill loop (an empty catalog re-triggers the seed every run).
-    const dirs = new Set<string>();
-    let seeded = 0;
-    let buf: WalkedFile[] = [];
-    const flushSeed = () => {
-      catalog.batch(() => {
-        for (const f of buf) {
-          const relDir = path.dirname(f.rel);
-          if (relDir !== '.') {
-            const parts = relDir.split('/');
-            for (let i = 1; i <= parts.length; i++) {
-              const sub = parts.slice(0, i).join('/');
-              if (!dirs.has(sub)) {
-                dirs.add(sub);
-                catalog.upsertDir(setId, sub, seenAt);
-              }
-            }
-          }
-          catalog.upsertFile(setId, f.rel, f.size, f.mtimeMs, null, seenAt);
-        }
-      });
-      seeded += buf.length;
-      doneFiles = Math.max(uploaded, seeded);
-      buf = [];
-    };
-    const recordUnit = async (roots: { abs: string; relBase: string }[]) => {
-      for (const r of roots) {
-        for await (const f of walkSourceStream(r.abs, r.relBase, { includeHidden, onSkip: noteUnreadable })) {
-          // On cancel, stop walking but keep what's buffered: every file here was
-          // uploaded by the unit that just succeeded, so recording it is correct.
-          if (shouldCancel()) break;
-          buf.push(f);
-          if (buf.length >= 1000) {
-            flushSeed();
-            report('recording');
-          }
-        }
-      }
-      if (buf.length) flushSeed();
-    };
-
-    const res = await uploadSourceTrees(
-      sources,
-      target,
-      'skip',
-      'merge',
-      (bytes) => {
-        uploaded += 1;
-        doneFiles = Math.max(uploaded, seeded);
-        doneBytes += bytes;
-        const now = Date.now();
-        if (now - lastReport >= 250) {
-          lastReport = now;
-          report('uploading');
-        }
-      },
-      shouldCancel,
-      skipThumbnails,
-      includeHidden,
-      recordUnit,
-    );
-    if (shouldCancel()) return cancelledResult();
-    if (res.code !== 0) {
-      const authDead = looksUnauthenticated(res.stderr + res.stdout);
-      return {
-        ok: false,
-        cancelled: false,
-        newCount: seeded,
-        changedCount: 0,
-        unchangedCount: 0,
-        deletedCount: 0,
-        failedCount: 1,
-        failedFiles,
-        message: authDead
-          ? SESSION_EXPIRED_MSG
-          : `Initial upload failed — ${describeUploadError(res.stderr || res.stdout)}`,
-      };
-    }
-    return {
-      ok: failedCount === 0,
-      cancelled: false,
-      newCount: seeded,
-      changedCount: 0,
-      unchangedCount: 0,
-      deletedCount: 0,
-      failedCount,
-      failedFiles,
-      message:
-        failedCount === 0
-          ? `${seeded} uploaded`
-          : `${seeded} uploaded, ${failedCount} skipped` +
-            (failedFiles[0] ? ` (e.g. “${path.basename(failedFiles[0].rel)}” — ${failedFiles[0].reason})` : ''),
-    };
+  // 1. Target and set folder.
+  log('Checking the Drive target…');
+  const target = await ctx.resolvePath(spec.targetPath);
+  if (!target || target.kind !== 'folder') {
+    const shown = spec.targetPath.replace(/^\/my-files/, '') || '/';
+    return result(`Target "Drive${shown}" no longer exists on Drive - backup did NOT run. Recreate the folder or change the target.`);
   }
+  ctx.targetUid = target.uid;
+  const bindErr = await bindSetFolder(ctx, log);
+  if (bindErr) return result(bindErr);
 
-  // Folders we've already ensured exist on Drive this run (dirs ≪ files).
-  const ensuredDirs = new Set<string>();
-  const ensureDir = async (relDir: string): Promise<void> => {
-    if (relDir === '' || relDir === '.') return;
-    const parts = relDir.split('/');
-    for (let i = 1; i <= parts.length; i++) {
-      const sub = parts.slice(0, i).join('/');
-      if (ensuredDirs.has(sub)) continue;
-      ensuredDirs.add(sub);
-      if (catalog.hasDir(setId, sub)) continue;
-      const name = parts[i - 1];
-      const parentRel = parts.slice(0, i - 1).join('/');
-      const parentDrive = parentRel ? `${target}/${parentRel}` : target;
-      const res = await createFolder(parentDrive, name);
-      // create-folder errors harmlessly if it already exists; record either way.
-      void res;
-      catalog.upsertDir(setId, sub, seenAt);
+  // 2. Sources (also the mount marks the mirror gate compares against next time).
+  const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
+  for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
+
+  // 3. Upload pool: bounded files in flight (live-tunable), shared speed limit.
+  let capAt = 0;
+  let cap = 2;
+  const maxInflight = () => {
+    if (Date.now() - capAt > 1000) {
+      cap = Math.max(1, Math.min(8, getUploadConfig().concurrency || 2));
+      capAt = Date.now();
     }
+    return cap;
   };
-
-  // Bounded-concurrency flush pool. Wait until we're below the (live) cap BEFORE
-  // starting a batch, so lowering the cap mid-run drains the in-flight set down
-  // gracefully instead of overshooting, and raising it starts more at once.
+  const throttle = makeThrottle(() => getUploadConfig().limitKBps);
   const inflight = new Set<Promise<void>>();
-  const schedule = async (task: () => Promise<void>): Promise<void> => {
+  const schedule = async (task: () => Promise<void>) => {
     while (inflight.size >= maxInflight()) await Promise.race(inflight);
     const p = task().finally(() => inflight.delete(p));
     inflight.add(p);
   };
 
-  // Upload one (sub)batch ONCE. With `retry`, applies the 4× transient-retry loop
-  // (exponential backoff); without it, a single attempt. Returns whether it
-  // succeeded, the last error, and whether the failure was an auth/expired-session
-  // one — a dead session won't recover by retrying, so one expired token can't turn
-  // into a multi-hour zombie run holding the global run mutex.
-  const uploadBatchOnce = async (
-    parentDrive: string,
-    absList: string[],
-    retry: boolean,
-  ): Promise<{ ok: boolean; err: string; auth: boolean }> => {
-    const maxAttempts = retry ? 4 : 1;
-    let lastErr = '';
-    for (let attempt = 1; attempt <= maxAttempts && !shouldCancel() && !sessionDead; attempt++) {
-      const res = await upload(absList, parentDrive, 'create-new-revision', 'merge', undefined, skipThumbnails);
-      if (res.code === 0) return { ok: true, err: '', auth: false };
-      lastErr = (res.stderr || res.stdout).trim().slice(0, 200);
-      if (looksUnauthenticated(res.stderr + res.stdout)) return { ok: false, err: lastErr, auth: true };
-      if (attempt < maxAttempts) {
-        const waitMs = RETRY_BASE_MS * 2 ** (attempt - 1);
-        log(`  batch failed (try ${attempt}/${maxAttempts}), retrying in ${waitMs / 1000}s: ${lastErr}`);
-        // Sleep in ≤500ms steps so a cancel is honoured promptly, but never longer
-        // than the wait itself (keeps the failure-path tests near-instant).
-        const step = Math.min(500, waitMs);
-        for (let w = 0; w < waitMs && !shouldCancel() && !sessionDead; w += step) await new Promise((r) => setTimeout(r, step));
+  const record = (rel: string, size: number, mtimeMs: number, sha1: string | null, uid: string | null) => {
+    catalog.upsertFile(spec.setId, rel, size, mtimeMs, sha1, seenAt, uid);
+  };
+
+  /** Same content on Drive as on disk? Reads the local file only when size (and, if asked, mtime) already match. */
+  const sameContent = async (remote: RemoteNode, abs: string, size: number, mtimeMs: number, requireMtime: boolean) => {
+    if (remote.kind !== 'file' || remote.size !== size || !remote.sha1) return false;
+    if (requireMtime && (remote.mtimeMs === null || Math.abs(remote.mtimeMs - mtimeMs) > 2000)) return false;
+    return (await sha1File(abs)) === remote.sha1;
+  };
+
+  /** Upload one file (new or changed), with reconciliation and retries. */
+  const processFile = async (f: { abs: string; rel: string; size: number; mtimeMs: number }, verdict: 'new' | 'changed', cat?: CatalogFile) => {
+    const relDir = path.posix.dirname(f.rel);
+    const name = path.posix.basename(f.rel);
+    const opts = {
+      mediaType: mediaTypeFor(name),
+      thumbnails: !spec.skipThumbnails,
+      signal: hooks.signal,
+      throttle,
+      onProgress: (() => {
+        let last = 0;
+        return (b: number) => {
+          doneBytes += b - last;
+          last = b;
+          report('/' + relDir);
+        };
+      })(),
+    };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        let parentUid = await ctx.dirUid(relDir, true);
+        if (!parentUid) throw new DriveError('NOT_FOUND', 'parent folder missing');
+        let nodeUid = cat?.nodeUid ?? null;
+        if (verdict === 'changed' && !nodeUid) nodeUid = (await ctx.childMap(parentUid)).get(name)?.uid ?? null;
+
+        if (verdict === 'changed' && nodeUid) {
+          const remote = await drive.getNode(nodeUid);
+          if (!remote || remote.trashed || remote.parentUid !== parentUid || remote.kind !== 'file') {
+            nodeUid = null; // gone or no longer ours where it was: upload as a new file
+          } else if (await sameContent(remote, f.abs, f.size, f.mtimeMs, true)) {
+            record(f.rel, f.size, f.mtimeMs, remote.sha1, remote.uid);
+            adoptedCount++;
+            changedCount--;
+            unchangedCount++;
+            return;
+          }
+        }
+
+        let res;
+        if (nodeUid) {
+          res = await drive.uploadRevision(nodeUid, f, opts);
+        } else {
+          try {
+            res = await drive.uploadNew(parentUid, name, f, opts);
+          } catch (e) {
+            if (!(e instanceof Error) || driveErrorCode(e) !== 'NAME_CONFLICT') throw e;
+            const c = e as DriveError;
+            if (c.existingIsDraft) {
+              res = await drive.uploadNew(parentUid, name, f, { ...opts, overrideDraft: true });
+            } else {
+              const ex = c.existingUid ? await drive.getNode(c.existingUid) : null;
+              if (!ex) throw e;
+              if (ex.kind !== 'file') throw new DriveError('NAME_CONFLICT', `a folder named "${name}" already exists on Drive`);
+              if (await sameContent(ex, f.abs, f.size, f.mtimeMs, false)) {
+                record(f.rel, f.size, f.mtimeMs, ex.sha1, ex.uid);
+                adoptedCount++;
+                if (verdict === 'new') newCount--;
+                else changedCount--;
+                unchangedCount++;
+                return;
+              }
+              if (spec.mode === 'add') {
+                // Add never updates. Record what Drive has (NOT the local stat), so a
+                // later switch to Backup still sees the difference and uploads it.
+                record(f.rel, ex.size ?? -1, ex.mtimeMs ?? 0, ex.sha1, ex.uid);
+                newCount--;
+                unchangedCount++;
+                return;
+              }
+              res = await drive.uploadRevision(ex.uid, f, opts);
+            }
+          }
+        }
+        record(f.rel, f.size, f.mtimeMs, res.sha1, res.nodeUid);
+        doneFiles++;
+        // Changed while we read it? The catalog holds the digest of what was really
+        // uploaded, so the next run sees the new mtime, hashes, and uploads again.
+        const after = await fsp.stat(f.abs).catch(() => null);
+        if (after && (after.size !== f.size || Math.abs(after.mtimeMs - f.mtimeMs) > 1)) {
+          log(`  note: ${f.rel} changed during upload; the next run uploads the newer version`);
+        }
+        return;
+      } catch (e) {
+        const code = driveErrorCode(e);
+        if (code === 'UNAUTHENTICATED') {
+          sessionDead = true;
+          return;
+        }
+        if (code === 'CANCELLED' || shouldCancel()) return;
+        if (code === 'NOT_FOUND' && attempt === 1) {
+          // A cached folder uid went stale (folder deleted on Drive): resolve again.
+          ctx.forgetDir(relDir);
+          continue;
+        }
+        const fsCode = code ? undefined : (e as NodeJS.ErrnoException)?.code; // DriveError has .code too
+        if (fsCode === 'ENOENT') return; // deleted locally since the walk — not a failure
+        if (code && TRANSIENT.has(code) && attempt < 4 && !fsCode) {
+          const wait = RETRY_BASE_MS * 4 ** (attempt - 1);
+          log(`  ${f.rel}: ${describeUploadError(e)} — retry ${attempt}/3 in ${Math.round(wait / 1000)}s`);
+          for (let w = 0; w < wait && !shouldCancel(); w += 250) await sleep(Math.min(250, wait));
+          continue;
+        }
+        noteFailed(f.rel, describeUploadError(e));
+        return;
       }
     }
-    return { ok: false, err: lastErr, auth: false };
   };
 
-  const recordUploaded = (files: { f: WalkedFile; sha1: string | null }[]) => {
-    catalog.batch(() => {
-      for (const { f, sha1 } of files) catalog.upsertFile(setId, f.rel, f.size, f.mtimeMs, sha1, seenAt);
-    });
-    doneFiles += files.length;
-    doneBytes += files.reduce((s, x) => s + x.f.size, 0);
-  };
-
-  // Upload a batch and ISOLATE failures: if the whole batch fails (after its
-  // transient retries), split it in half and retry each half with a single attempt,
-  // recursing down to a single file. Good files still sync; only the truly-bad
-  // file(s) are counted as failed and logged BY PATH. This bounds the blast radius
-  // of one unuploadable file (issue #22: a name the CLI can't handle, a corrupt or
-  // over-limit file) to itself instead of its ≤199 batch-mates. Crucially it still
-  // increments failedCount for a real failure, so the mirror deletion pass's
-  // `failedCount > 0` safety gate keeps skipping deletion (never trash a present-
-  // but-failed file's Drive copy).
-  const flushChunk = async (
-    parentDrive: string,
-    files: { f: WalkedFile; sha1: string | null }[],
-    retry: boolean,
-  ): Promise<void> => {
-    if (shouldCancel() || sessionDead || files.length === 0) return;
-    const r = await uploadBatchOnce(
-      parentDrive,
-      files.map((x) => x.f.abs),
-      retry,
-    );
-    if (r.auth) {
-      sessionDead = true;
-      log('Proton session expired — stopping this run. Reconnect to resume.');
-      return;
-    }
-    if (r.ok) {
-      recordUploaded(files);
-      return;
-    }
-    if (shouldCancel() || sessionDead) return;
-    if (files.length === 1) {
-      failedCount += 1;
-      const reason = describeUploadError(r.err);
-      if (failedFiles.length < FAILED_SAMPLE_CAP) failedFiles.push({ rel: files[0].f.rel, reason });
-      log(`  upload failed (skipping this file): ${files[0].f.rel} — ${reason}`);
-      return;
-    }
-    // Bisect. Transients were already retried at the top level, so the sub-batches
-    // use a single attempt each — one poison file can't amplify into 4× per level.
-    const mid = Math.floor(files.length / 2);
-    await flushChunk(parentDrive, files.slice(0, mid), false);
-    await flushChunk(parentDrive, files.slice(mid), false);
-  };
-
-  // Upload one batch (single parent), isolating any bad file, then record it.
-  const flush = async (parentDrive: string, files: { f: WalkedFile; sha1: string | null }[]): Promise<void> => {
-    if (shouldCancel() || sessionDead || files.length === 0) return;
-    report(parentDrive.replace('/my-files', '') || '/');
-    await flushChunk(parentDrive, files, true);
-    report(parentDrive.replace('/my-files', '') || '/');
-  };
-
-  // Pending uploads grouped by Drive parent; a bucket is flushed when it fills
-  // (CHUNK). Buckets that never fill would otherwise sit here until the walk ends —
-  // for a tree of many small folders (photo libraries: one folder per day, a few
-  // files each) that is EVERY new file held in memory for the whole run. So the
-  // total across buckets is capped too: past PENDING_CAP the fullest bucket is
-  // flushed early. Slightly smaller batches in that shape, bounded memory always.
-  // (Env override exists for the test suite only, like PDB_UPLOAD_RETRY_BASE_MS.)
-  const PENDING_CAP = Number(process.env.PDB_PENDING_CAP) || 2000;
-  let pendingTotal = 0;
-  const pending = new Map<string, { f: WalkedFile; sha1: string | null }[]>();
-  const queue = (parentDrive: string, item: { f: WalkedFile; sha1: string | null }) => {
-    const arr = pending.get(parentDrive);
-    if (arr) arr.push(item);
-    else pending.set(parentDrive, [item]);
-    pendingTotal += 1;
-  };
-  const takeBucket = (parentDrive: string) => {
-    const bucket = pending.get(parentDrive)!;
-    pending.delete(parentDrive);
-    pendingTotal -= bucket.length;
-    return bucket;
-  };
-  const fullestPending = (): string => {
-    let bestKey = '';
-    let best = -1;
-    for (const [k, v] of pending) {
-      if (v.length > best) {
-        best = v.length;
-        bestKey = k;
-      }
-    }
-    return bestKey;
-  };
-
-  // Mirror mode marks every unchanged file as "seen this run" so the deletion pass
-  // can tell what vanished locally. Doing that as one UPDATE per file means one
-  // WAL commit per file — fatal for millions of unchanged files. We buffer the
-  // rels and flush them in one transaction every TOUCH_FLUSH. CRITICAL: the buffer
-  // MUST be drained before catalog.stale() runs, or still-buffered (unflushed)
-  // files would be misread as stale and wrongly trashed. flushTouches() below is
-  // called both at the threshold and right before the stale() computation.
-  const TOUCH_FLUSH = 2000;
+  // 4. Walk + diff. "Seen" marks for mirror are buffered and flushed in one transaction.
   const touchBuf: string[] = [];
-  // Ancestor dirs already marked seen this run — so each is touched at most once
-  // (O(#dirs), not O(#files)).
   const seenDirs = new Set<string>();
   const flushTouches = () => {
     if (touchBuf.length === 0) return;
-    catalog.touchMany(setId, touchBuf, seenAt);
-    touchBuf.length = 0;
+    catalog.touchMany(spec.setId, touchBuf.splice(0), seenAt);
   };
-  // Mark a kept file as seen, plus its ancestor directory chain. Dirs only get a
-  // fresh seen_at via ensureDir (i.e. for *uploaded* files), so without this a
-  // no-change mirror run would leave every dir row stale and the deletion pass
-  // would trash the whole subtree (down to the set folder). Touching the chain
-  // keeps a dir iff it still holds at least one surviving file.
-  const queueTouch = (rel: string) => {
+  const touch = (rel: string) => {
     touchBuf.push(rel);
-    let dir = path.dirname(rel);
+    let dir = path.posix.dirname(rel);
     while (dir && dir !== '.' && !seenDirs.has(dir)) {
       seenDirs.add(dir);
       touchBuf.push(dir);
-      dir = path.dirname(dir);
+      dir = path.posix.dirname(dir);
     }
-    if (touchBuf.length >= TOUCH_FLUSH) flushTouches();
+    if (touchBuf.length >= 2000) flushTouches();
+  };
+  const pendingDirs: string[] = [];
+  const drainDirs = async () => {
+    while (pendingDirs.length && !sessionDead) {
+      const rel = pendingDirs.shift()!;
+      try {
+        await ctx.dirUid(rel, true);
+      } catch (e) {
+        if (driveErrorCode(e) === 'UNAUTHENTICATED') sessionDead = true;
+        else noteFailed(rel, describeUploadError(e));
+      }
+    }
   };
 
   log('Comparing against catalog…');
-  for (const s of sources) {
-    for await (const file of walkSourceStream(s.abs, s.relBase, { includeHidden, onSkip: noteUnreadable })) {
+  report('scanning', true);
+  outer: for (const abs of spec.sourcePaths) {
+    const relBase = relBaseFor(spec.subfolder, abs);
+    for await (const file of walkSourceStream(abs, relBase, {
+      includeHidden: spec.includeHidden,
+      onSkip: noteFailed,
+      onDir: (rel) => {
+        if (ctx.isExcluded(rel) && rel !== relBase) return;
+        touch(rel);
+        if (!catalog.getDir(spec.setId, rel)) pendingDirs.push(rel); // created on Drive below (empty folders too)
+      },
+    })) {
       if (shouldCancel()) {
         cancelled = true;
-        break;
+        break outer;
       }
-      if (sessionDead) break; // an in-flight batch reported the session is gone
-      if (isExcluded(file.rel)) {
-        if (mode === 'mirror') queueTouch(file.rel); // keep, don't trash
+      if (sessionDead) break outer;
+      // Folders first (keeps empty folders mirrored).
+      await drainDirs();
+      if (ctx.isExcluded(file.rel)) {
+        touch(file.rel);
         continue;
       }
-
-      const cat = catalog.getFile(setId, file.rel);
-      const verdict = diffFile(file, cat);
-      let sha1: string | null = null;
-      let doUpload = verdict === 'new' || verdict === 'changed';
-
+      const cat = catalog.getFile(spec.setId, file.rel);
+      let verdict = diffFile(file, cat);
+      if (spec.mode === 'add' && cat) verdict = 'unchanged'; // add never updates
       if (verdict === 'hash') {
-        sha1 = await sha1File(file.abs).catch(() => null);
-        if (sha1 === null || !cat || sha1 !== cat.sha1) {
-          doUpload = true;
-        } else {
-          // Same content, only mtime drifted: refresh catalog so we skip hashing
-          // next time, count as unchanged, no upload.
-          unchangedCount++;
-          if (mode === 'mirror') queueTouch(file.rel);
-          else catalog.upsertFile(setId, file.rel, file.size, file.mtimeMs, sha1, seenAt);
-          continue;
+        // Same size, mtime drifted. Compare content: against our recorded digest, or
+        // (catalog rows from CLI-era releases have none) against Drive's.
+        let known = cat!.sha1;
+        let uid = cat!.nodeUid ?? null;
+        try {
+          if (!known) {
+            const parentUid = await ctx.dirUid(path.posix.dirname(file.rel), false);
+            uid ??= parentUid ? ((await ctx.childMap(parentUid)).get(path.posix.basename(file.rel))?.uid ?? null) : null;
+            const remote = uid ? await drive.getNode(uid) : null;
+            known = remote && !remote.trashed ? remote.sha1 : null;
+          }
+          const local = known ? await sha1File(file.abs) : null;
+          if (known && local === known) {
+            unchangedCount++;
+            record(file.rel, file.size, file.mtimeMs, local, uid); // refresh mtime: no hashing next time
+            continue;
+          }
+        } catch (e) {
+          if (driveErrorCode(e) === 'UNAUTHENTICATED') {
+            sessionDead = true;
+            break outer;
+          }
+          // Could not compare (unreadable/remote error): fall through and upload.
         }
+        verdict = 'changed';
       }
-
-      if (!doUpload) {
+      if (verdict === 'unchanged') {
         unchangedCount++;
-        if (mode === 'mirror') queueTouch(file.rel);
+        touch(file.rel);
         continue;
       }
-
       if (verdict === 'new') newCount++;
       else changedCount++;
-
-      const relDir = path.dirname(file.rel);
-      await ensureDir(relDir === '.' ? '' : relDir);
-      const parentDrive = relDir === '.' ? target : `${target}/${relDir}`;
-      queue(parentDrive, { f: file, sha1 });
-
-      if (pending.get(parentDrive)!.length >= CHUNK) {
-        const bucket = takeBucket(parentDrive);
-        await schedule(() => flush(parentDrive, bucket));
-      } else if (pendingTotal >= PENDING_CAP) {
-        const key = fullestPending();
-        const bucket = takeBucket(key);
-        await schedule(() => flush(key, bucket));
-      }
+      await schedule(() => processFile(file, verdict as 'new' | 'changed', cat));
     }
     if (cancelled || sessionDead) break;
-  }
-
-  // Flush any partially-filled buckets.
-  if (!cancelled && !sessionDead) {
-    for (const parentDrive of [...pending.keys()]) {
-      if (shouldCancel()) {
-        cancelled = true;
-        break;
-      }
-      if (sessionDead) break;
-      const bucket = takeBucket(parentDrive);
-      await schedule(() => flush(parentDrive, bucket));
-    }
+    await drainDirs();
   }
   await Promise.all(inflight);
   if (shouldCancel()) cancelled = true;
+  flushTouches(); // MUST precede stale(): an unflushed mark would look like a deletion
+  report('', true);
 
-  // Persist any buffered "seen" marks before deciding what's stale — otherwise an
-  // unflushed touch would make a present file look deleted. Safe on cancel too:
-  // the deletion pass below is gated on !cancelled, so a partial flush never trashes.
-  flushTouches();
+  if (sessionDead) return result(SESSION_EXPIRED_MSG);
 
-  // Session died mid-run: end now with a clear reconnect message, BEFORE the mirror
-  // deletion pass. Files already uploaded this run are recorded in the catalog
-  // (per-batch), so a reconnect + re-run just resumes the remainder. Crucially this
-  // skips stale-deletion entirely, so a half-dead session can never trash Drive.
-  if (sessionDead) {
-    return {
-      ok: false,
-      cancelled: false,
-      newCount,
-      changedCount,
-      unchangedCount,
-      deletedCount: 0,
-      failedCount,
-      failedFiles,
-      message: SESSION_EXPIRED_MSG,
-    };
-  }
-
-  // Mirror: trash catalog entries that no longer exist locally (scoped to the set
-  // folder). Three safety nets first — a vanished source mount, an upload failure,
-  // or a bug must never let a scan wipe Drive data the user still has:
-  //   (1) if any configured source path is missing on disk (e.g. an unmounted NAS
-  //       share), skip deletion entirely — "gone locally" can't be trusted.
-  //   (2) if ANY upload failed this run (a changed file that didn't make it to
-  //       Drive keeps its old catalog timestamp and would look "stale"), skip
-  //       deletion — we must not trash a present-but-failed file's Drive copy.
-  //   (3) if the configurable percentage gate is enabled and a run would remove
-  //       more than DELETE_SAFETY_PCT of the catalog, skip deletion and flag it.
+  // 5. Mirror deletions (never on cancel).
+  let deletedCount = 0;
   let deletionSkipped: string | null = null;
-  if (mode === 'mirror' && !cancelled) {
-    let sourcesIntact = true;
-    for (const s of sources) {
-      try {
-        await fsp.stat(s.abs);
-      } catch {
-        sourcesIntact = false;
-        break;
+  if (spec.mode === 'mirror' && !cancelled) {
+    const stale = catalog.stale(spec.setId, seenAt).filter((s) => s.rel === spec.subfolder || s.rel.startsWith(ctx.prefix));
+    if (stale.length) {
+      deletionSkipped = await deletionGate(spec, marksNow, failedCount, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+      if (deletionSkipped) {
+        log(`Safety: ${deletionSkipped} — deletion skipped.`);
+      } else {
+        const d = await planAndDelete(ctx, stale, shouldCancel, log);
+        deletedCount = d.deleted;
+        failedCount += d.failed;
+        if (d.sessionDead) return result(SESSION_EXPIRED_MSG, { deletedCount });
+        if (d.deleted) log(`Moved ${d.deleted} item(s) no longer present locally to the Drive trash`);
       }
-    }
-
-    const stale = catalog.stale(setId, seenAt).filter((s) => managedRoots.has(s.rel.split('/')[0]));
-    const totalEntries = catalog.count(setId);
-    const pctGone = totalEntries > 0 ? stale.length / totalEntries : 0;
-
-    if (!sourcesIntact) {
-      deletionSkipped = 'a source path is missing on disk (mount offline?)';
-    } else if (failedCount > 0) {
-      deletionSkipped = `${failedCount} file(s) failed to upload — "gone locally" can't be trusted until uploads succeed`;
-    } else if (DELETE_SAFETY_PCT !== null && pctGone > DELETE_SAFETY_PCT) {
-      deletionSkipped = `${stale.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
-    }
-
-    if (deletionSkipped) {
-      log(`Safety: ${deletionSkipped} — deletion skipped. Re-check the source, then re-run to apply deletions.`);
-    } else {
-      // Only trash top-most items; trashing a folder removes its children.
-      const tops = topMost(stale);
-      const removedRels: string[] = [];
-      for (const s of tops) {
-        if (shouldCancel() || sessionDead) break;
-        const res = await trashDrive(`${target}/${s.rel}`);
-        if (res.ok) {
-          deletedCount++;
-          removedRels.push(s.rel);
-        } else if (looksUnauthenticated((res.error || '') + (res.raw || ''))) {
-          // Session died mid-deletion — stop now (don't grind a doomed trash per
-          // entry) and end with the clear reconnect message below.
-          sessionDead = true;
-          log('Proton session expired — stopping this run. Reconnect to resume.');
-          break;
-        } else {
-          failedCount++;
-        }
-      }
-      // Drop trashed entries (and their descendants) from the catalog.
-      const removedSet = new Set(removedRels);
-      const gone = stale.filter((s) => hasAncestorIn(s.rel, removedSet, true)).map((s) => s.rel);
-      if (gone.length) catalog.remove(setId, gone);
-      if (tops.length) log(`Removed ${deletedCount} item(s) no longer present locally`);
     }
   }
 
-  // Session died during the deletion pass — end with the clear reconnect message
-  // (deletedCount reflects what was already trashed before it died) instead of the
-  // generic summary.
-  if (sessionDead) {
-    return {
-      ok: false,
-      cancelled: false,
-      newCount,
-      changedCount,
-      unchangedCount,
-      deletedCount,
-      failedCount,
-      failedFiles,
-      message: SESSION_EXPIRED_MSG,
-    };
+  // Remember how the sources looked, for the next run's mount check — but only after
+  // a run that saw them intact, so an offline share can never become the reference.
+  if (!cancelled && Object.values(marksNow).every((m) => m.exists && (m.nonEmpty || spec.allowEmptySource || !m.mounted))) {
+    const marks: Record<string, SourceMark> = {};
+    for (const [abs, m] of Object.entries(marksNow)) marks[abs] = { mounted: m.mounted, nonEmpty: m.nonEmpty };
+    backupSets.setSourceMarks(spec.setId, marks);
   }
 
   const parts = [`${doneFiles} uploaded`, `${unchangedCount} unchanged`];
-  if (mode === 'mirror' && !cancelled && !deletionSkipped) parts.push(`${deletedCount} removed`);
+  if (adoptedCount) parts.push(`${adoptedCount} already on Drive`);
+  if (spec.mode === 'mirror' && !cancelled && !deletionSkipped) parts.push(`${deletedCount} removed`);
   if (deletionSkipped) parts.push(`deletion skipped for safety (${deletionSkipped})`);
   if (failedCount) {
-    // Name one failed file + its reason so the summary is actionable, not just a count.
     const ex = failedFiles[0];
     parts.push(ex ? `${failedCount} failed (e.g. “${path.basename(ex.rel)}” — ${ex.reason})` : `${failedCount} failed`);
   }
@@ -898,149 +828,134 @@ export async function runCatalogDelta(
     newCount,
     changedCount,
     unchangedCount,
+    adoptedCount,
     deletedCount,
     failedCount,
     failedFiles,
+    uploadedBytes: doneBytes,
+    deletionSkipped,
     message: cancelled ? `Cancelled - ${parts.join(', ')}` : parts.join(', '),
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Dry run                                                              */
+/* ------------------------------------------------------------------ */
+
 export interface PreviewResult {
   ok: boolean;
-  mode: 'backup' | 'mirror';
+  mode: Mode;
   newCount: number;
   changedCount: number;
   unchangedCount: number;
-  wouldUploadCount: number; // new + changed
+  wouldUploadCount: number;
   wouldUploadBytes: number;
-  /** Top-most Drive-relative paths a mirror run would trash (capped for the UI). */
   wouldDelete: string[];
-  wouldDeleteCount: number; // full count (may exceed wouldDelete.length)
+  wouldDeleteCount: number;
   wouldDeleteTruncated: boolean;
-  /** If set, the live mirror run would SKIP deletion for this safety reason. */
   deletionWouldSkip: string | null;
   message: string;
 }
 
 /**
- * Read-only "what would this run do" preview — never contacts Drive, never writes
- * the catalog, never uploads or trashes. Mirrors the delta engine's own decisions:
- * it streams the same local walk and runs the same diffFile() verdicts to count
- * new/changed/unchanged + bytes, and for mirror mode it reproduces the deletion
- * pass by checking which catalog entries no longer exist on disk (bounded memory —
- * it stats each entry instead of marking seen_at) and applies the same safety gates
- * (missing source mount, configured percentage gate). Lets the user see exactly
- * what a backup/mirror would change — especially which Drive files a mirror would
- * delete — before running.
+ * What a run would do — the SAME scan, exclusions, verdicts and deletion planner
+ * as runSet, with every write replaced by counting. It reads from Drive only for
+ * the items a mirror run would delete (identity and foreign-content checks, same
+ * as the live run) and never writes the catalog: "seen" marks go to a TEMP table.
  */
-export async function previewDelta(
-  setId: string,
-  sourcePaths: string[],
-  subfolder: string,
-  mode: 'backup' | 'mirror',
-  excludes: string[] = [],
-  shouldCancel: () => boolean = () => false,
-  includeHidden = false,
-): Promise<PreviewResult> {
-  // Snapshot the same global value as a live run so the preview and execution
-  // agree even if the user changes Settings while this local walk is in progress.
-  const DELETE_SAFETY_PCT = configuredDeleteSafetyPct();
-  const sources = sourcePaths.map((abs) => ({ abs, relBase: relBaseFor(subfolder, abs) }));
-  const managedRoots = new Set([subfolder]);
-  const matchExclude = makeExcluder(excludes);
-  const prefix = `${subfolder}/`;
-  const isExcluded = (rel: string) => matchExclude(rel.startsWith(prefix) ? rel.slice(prefix.length) : rel);
+export async function previewSet(drive: DriveService, spec: RunSpec, shouldCancel: () => boolean = () => false): Promise<PreviewResult> {
+  const mirrorCfg = getMirrorSafetyConfig();
+  const DELETE_SAFETY_PCT = mirrorCfg.enabled ? mirrorCfg.deleteSafetyPct : null;
+  const ctx = new RunContext(drive, { ...spec }, 0, false);
+  const db = getDb();
+  db.exec('CREATE TEMP TABLE IF NOT EXISTS preview_seen (rel TEXT PRIMARY KEY) WITHOUT ROWID; DELETE FROM temp.preview_seen;');
+  const ins = db.prepare('INSERT OR IGNORE INTO temp.preview_seen (rel) VALUES (?)');
+  const seenDirs = new Set<string>();
+  const touch = (rel: string) => {
+    ins.run(rel);
+    let dir = path.posix.dirname(rel);
+    while (dir && dir !== '.' && !seenDirs.has(dir)) {
+      seenDirs.add(dir);
+      ins.run(dir);
+      dir = path.posix.dirname(dir);
+    }
+  };
 
   let newCount = 0;
   let changedCount = 0;
   let unchangedCount = 0;
   let wouldUploadBytes = 0;
-
-  // Same diff the real run does, but it only counts — no upload, no catalog write.
-  for (const s of sources) {
-    for await (const file of walkSourceStream(s.abs, s.relBase, { includeHidden })) {
-      if (shouldCancel()) break;
-      if (isExcluded(file.rel)) continue;
-      const cat = catalog.getFile(setId, file.rel);
-      const verdict = diffFile(file, cat);
-      if (verdict === 'unchanged') {
-        unchangedCount++;
-        continue;
-      }
-      if (verdict === 'hash') {
-        const sha1 = await sha1File(file.abs).catch(() => null);
-        if (sha1 !== null && cat && sha1 === cat.sha1) {
-          unchangedCount++; // content identical, only mtime drifted → no upload
-          continue;
+  db.exec('BEGIN');
+  try {
+    for (const abs of spec.sourcePaths) {
+      const relBase = relBaseFor(spec.subfolder, abs);
+      for await (const file of walkSourceStream(abs, relBase, {
+        includeHidden: spec.includeHidden,
+        onDir: (rel) => {
+          if (!ctx.isExcluded(rel) || rel === relBase) touch(rel);
+        },
+      })) {
+        if (shouldCancel()) break;
+        touch(file.rel);
+        if (ctx.isExcluded(file.rel)) continue;
+        const cat = catalog.getFile(spec.setId, file.rel);
+        let verdict = diffFile(file, cat);
+        if (spec.mode === 'add' && cat) verdict = 'unchanged';
+        if (verdict === 'hash') {
+          const local = cat!.sha1 ? await sha1File(file.abs).catch(() => null) : null;
+          verdict = local && local === cat!.sha1 ? 'unchanged' : 'changed';
         }
-        changedCount++;
-        wouldUploadBytes += file.size;
-        continue;
+        if (verdict === 'unchanged') unchangedCount++;
+        else {
+          if (verdict === 'new') newCount++;
+          else changedCount++;
+          wouldUploadBytes += file.size;
+        }
       }
-      if (verdict === 'new') newCount++;
-      else changedCount++;
-      wouldUploadBytes += file.size;
     }
+  } finally {
+    db.exec('COMMIT');
   }
 
   let wouldDelete: string[] = [];
   let wouldDeleteCount = 0;
-  let wouldDeleteTruncated = false;
   let deletionWouldSkip: string | null = null;
-
-  if (mode === 'mirror') {
-    // Map a catalog rel ("<subfolder>/<source-rel-to-LOCAL_ROOT>") back to its local
-    // path, so we can tell whether it still exists without re-listing Drive.
-    const localAbs = (rel: string): string => {
-      const sub = rel.startsWith(prefix) ? rel.slice(prefix.length) : rel === subfolder ? '' : rel;
-      return sub ? path.join(LOCAL_ROOT, sub) : LOCAL_ROOT;
-    };
-    const missing: { rel: string; kind: string }[] = [];
-    await catalog.eachEntryAsync(setId, async (e) => {
-      if (shouldCancel()) return;
-      if (!managedRoots.has(e.rel.split('/')[0])) return; // scope to this set's folder
-      try {
-        await fsp.stat(localAbs(e.rel));
-      } catch {
-        missing.push(e); // gone locally → a mirror run would trash its Drive copy
+  if (spec.mode === 'mirror') {
+    const stale = (
+      db
+        .prepare(
+          `SELECT c.rel, c.kind, c.node_uid FROM backup_catalog c
+           WHERE c.set_id = ? AND (c.rel = ? OR (c.rel > ? AND c.rel < ?))
+             AND NOT EXISTS (SELECT 1 FROM temp.preview_seen s WHERE s.rel = c.rel)
+           ORDER BY length(c.rel)`,
+        )
+        .all(spec.setId, spec.subfolder, spec.subfolder + '/', spec.subfolder + '0') as { rel: string; kind: 'file' | 'dir'; node_uid: string | null }[]
+    ).map((r) => ({ rel: r.rel, kind: r.kind, nodeUid: r.node_uid }));
+    if (stale.length) {
+      const marksNow: Record<string, { exists: boolean; mounted: boolean; nonEmpty: boolean }> = {};
+      for (const abs of spec.sourcePaths) marksNow[abs] = await sourceMark(abs);
+      deletionWouldSkip = await deletionGate(spec, marksNow, 0, stale.length, catalog.count(spec.setId), DELETE_SAFETY_PCT);
+      if (!deletionWouldSkip) {
+        const target = await ctx.resolvePath(spec.targetPath);
+        const set = backupSets.get(spec.setId);
+        ctx.targetUid = target?.uid ?? '';
+        ctx.setFolderUid = set?.folderUid ?? (target ? ((await ctx.childMap(target.uid)).get(spec.subfolder)?.uid ?? '') : '');
+        if (ctx.setFolderUid) {
+          const plan = await planAndDelete(ctx, stale, shouldCancel, () => {});
+          wouldDelete = plan.wouldDelete;
+          wouldDeleteCount = plan.wouldDeleteCount;
+        }
       }
-    });
-    // Only the top-most items are trashed (a folder removes its children).
-    const tops = topMost(missing);
-    wouldDeleteCount = tops.length;
-    const CAP = 500;
-    wouldDelete = tops.slice(0, CAP).map((s) => s.rel);
-    wouldDeleteTruncated = tops.length > CAP;
-
-    // Same safety gates the live run applies before deleting (the "an upload failed"
-    // gate can't apply to a read-only preview, so it's omitted here).
-    let sourcesIntact = true;
-    for (const s of sources) {
-      try {
-        await fsp.stat(s.abs);
-      } catch {
-        sourcesIntact = false;
-        break;
-      }
-    }
-    const totalEntries = catalog.count(setId);
-    const pctGone = totalEntries > 0 ? missing.length / totalEntries : 0;
-    if (!sourcesIntact) {
-      deletionWouldSkip = 'a source path is missing on disk (mount offline?)';
-    } else if (DELETE_SAFETY_PCT !== null && pctGone > DELETE_SAFETY_PCT) {
-      deletionWouldSkip = `${missing.length}/${totalEntries} entries (>${Math.round(DELETE_SAFETY_PCT * 100)}%) would be removed`;
     }
   }
+  db.exec('DELETE FROM temp.preview_seen');
 
   const wouldUploadCount = newCount + changedCount;
   const parts = [`${wouldUploadCount} to upload`, `${unchangedCount} unchanged`];
-  if (mode === 'mirror') {
-    if (deletionWouldSkip) parts.push(`deletion skipped for safety (${deletionWouldSkip})`);
-    else parts.push(`${wouldDeleteCount} to remove`);
-  }
+  if (spec.mode === 'mirror') parts.push(deletionWouldSkip ? `deletion skipped for safety (${deletionWouldSkip})` : `${wouldDeleteCount} to remove`);
   return {
     ok: true,
-    mode,
+    mode: spec.mode,
     newCount,
     changedCount,
     unchangedCount,
@@ -1048,79 +963,139 @@ export async function previewDelta(
     wouldUploadBytes,
     wouldDelete,
     wouldDeleteCount,
-    wouldDeleteTruncated,
+    wouldDeleteTruncated: wouldDeleteCount > wouldDelete.length,
     deletionWouldSkip,
     message: parts.join(' · '),
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Verify                                                               */
+/* ------------------------------------------------------------------ */
+
 export interface VerifyResult {
   ok: boolean;
-  checked: number; // catalog file entries examined
-  repaired: number; // entries dropped (missing/changed on Drive) → re-uploaded next run
+  checked: number;
+  /** Catalog entries dropped (missing or different on Drive) → re-uploaded next run. */
+  repaired: number;
+  /** Content verify only: files whose local SHA-1 differs from Drive's. */
+  contentMismatches: number;
+  /** Items on Drive inside the set's folder that this backup did not upload. */
+  foreign: number;
   message: string;
 }
 
 /**
- * Reconcile the catalog against Drive truth (opt-in; this is the expensive full
- * per-folder `list` scan the catalog design otherwise avoids). Lists the set's
- * Drive subtree, then drops any catalog FILE entry that is missing on Drive or
- * whose size no longer matches — e.g. a file deleted or changed externally on
- * Drive — so the next backup re-uploads it.
- *
- * Safety: it never trashes anything on Drive (worst case it schedules a
- * re-upload), and it ABORTS without touching the catalog if a Drive listing fails
- * for any reason other than "folder not found", so a transient network/auth blip
- * can't wipe the catalog.
+ * Reconcile the catalog with Drive (opt-in; this is the full remote scan the
+ * catalog otherwise avoids). Walks the set's Drive folder one folder at a time —
+ * memory is bounded by one folder listing, not by the set size — and:
+ *  - drops catalog entries Drive does not have (or has with another size), so the
+ *    next run re-uploads them; never deletes anything on Drive;
+ *  - fills in Drive node ids for catalog rows written by CLI-era releases;
+ *  - with `content`, also reads every local file and compares its SHA-1 with the
+ *    digest Drive stores for the revision. This is the full content check that
+ *    detects changes the fast delta cannot see (same size AND same mtime).
+ * Any listing error other than Drive's explicit "not found" aborts without
+ * touching the catalog.
  */
-export async function verifyCatalog(
-  setId: string,
-  targetPath: string,
-  subfolder: string,
-  log: (msg: string) => void = () => {},
-  shouldCancel: () => boolean = () => false,
+export async function verifySet(
+  drive: DriveService,
+  spec: RunSpec,
+  opts: { content?: boolean; log?: (m: string) => void; shouldCancel?: () => boolean } = {},
 ): Promise<VerifyResult> {
-  const target = normalizeProtonPath(targetPath);
+  const log = opts.log ?? (() => {});
+  const cancelled = opts.shouldCancel ?? (() => false);
+  const ctx = new RunContext(drive, { ...spec }, Date.now(), true);
+  const empty = (message: string, ok = false): VerifyResult => ({ ok, checked: 0, repaired: 0, contentMismatches: 0, foreign: 0, message });
 
-  // Map of present Drive files: rel (catalog-style "<subfolder>/…") → size (-1 = unknown).
-  const present = new Map<string, number>();
-  let aborted: string | null = null;
-
-  async function recur(drivePath: string, relPrefix: string): Promise<void> {
-    if (aborted || shouldCancel()) return;
-    const res = await listDrive(drivePath);
-    if (!res.ok) {
-      // Folder genuinely gone → treat as empty. Any other failure → don't risk it.
-      if (/not found|no such|not exist|does not exist|cannot be found/i.test(res.error)) return;
-      aborted = res.error;
-      return;
-    }
-    for (const e of res.data) {
-      if (aborted || shouldCancel()) return;
-      const rel = `${relPrefix}/${e.name}`;
-      if (e.type === 'folder') await recur(`${drivePath}/${e.name}`, rel);
-      else present.set(rel, e.size ?? -1);
-    }
+  const target = await ctx.resolvePath(spec.targetPath);
+  if (!target) return empty('Verify aborted: the target folder does not exist on Drive.');
+  const set = backupSets.get(spec.setId);
+  let folder: RemoteNode | null = set?.folderUid ? await drive.getNode(set.folderUid) : null;
+  if (folder && (folder.trashed || folder.parentUid !== target.uid)) folder = null;
+  folder ??= (await ctx.childMap(target.uid, true)).get(spec.subfolder) ?? null;
+  if (!folder || folder.kind !== 'folder') {
+    // The set's folder is gone: the whole catalog is void. Reset it so the next
+    // run creates the folder and uploads everything again (explicit user action).
+    const n = catalog.count(spec.setId);
+    catalog.clear(spec.setId);
+    backupSets.setFolderUid(spec.setId, null);
+    return { ok: true, checked: n, repaired: n, contentMismatches: 0, foreign: 0, message: `The set's Drive folder is missing — ${n} entries reset; the next run uploads everything again.` };
   }
+  backupSets.setFolderUid(spec.setId, folder.uid);
+  catalog.upsertDir(spec.setId, spec.subfolder, catalog.maxSeenAt(spec.setId), folder.uid);
 
-  log('Scanning Drive…');
-  await recur(`${target}/${subfolder}`, subfolder);
-  if (shouldCancel()) return { ok: false, checked: 0, repaired: 0, message: 'Cancelled' };
-  if (aborted) {
-    return { ok: false, checked: 0, repaired: 0, message: `Verify aborted (Drive listing failed): ${aborted}` };
-  }
-
-  // Drop catalog file entries Drive no longer backs (missing, or size changed).
-  const invalid: string[] = [];
   let checked = 0;
-  catalog.eachFile(setId, (f) => {
-    checked++;
-    const size = present.get(f.rel);
-    if (size === undefined || (size >= 0 && size !== f.size)) invalid.push(f.rel);
-  });
-  if (invalid.length) catalog.remove(setId, invalid);
+  let repaired = 0;
+  let contentMismatches = 0;
+  let foreign = 0;
+  const drop: string[] = [];
+  const flushDrop = () => {
+    if (drop.length) catalog.remove(spec.setId, drop.splice(0));
+  };
 
-  const message = `${checked} checked · ${invalid.length} to re-upload on next run`;
+  // Depth-first over catalog dirs that exist on Drive.
+  const stack: { rel: string; uid: string }[] = [{ rel: spec.subfolder, uid: folder.uid }];
+  log('Scanning Drive…');
+  while (stack.length && !cancelled()) {
+    const { rel, uid } = stack.pop()!;
+    const remote = await ctx.childMap(uid, true);
+    const seen = new Set<string>();
+    for (const row of catalog.children(spec.setId, rel)) {
+      if (cancelled()) break;
+      const name = path.posix.basename(row.rel);
+      seen.add(name);
+      const r = remote.get(name);
+      if (row.kind === 'dir') {
+        if (r && r.kind === 'folder') {
+          if (row.nodeUid !== r.uid) catalog.setNodeUid(spec.setId, row.rel, r.uid);
+          stack.push({ rel: row.rel, uid: r.uid });
+        } else {
+          // Folder gone on Drive: everything below it must be uploaded again.
+          drop.push(row.rel);
+          for (const d of catalog.children(spec.setId, row.rel)) drop.push(d.rel);
+          repaired++;
+        }
+        continue;
+      }
+      checked++;
+      if (!r || r.kind !== 'file' || (r.size !== null && r.size !== row.size)) {
+        drop.push(row.rel);
+        repaired++;
+        continue;
+      }
+      if (row.nodeUid !== r.uid) catalog.setNodeUid(spec.setId, row.rel, r.uid);
+      if (opts.content) {
+        const abs = localAbsFor(spec, row.rel);
+        const local = abs ? await sha1File(abs).catch(() => null) : null;
+        if (local && r.sha1 && local !== r.sha1) {
+          contentMismatches++;
+          drop.push(row.rel);
+          repaired++;
+          log(`  content differs: ${row.rel}`);
+        }
+      }
+      if (drop.length >= 1000) flushDrop();
+    }
+    for (const name of remote.keys()) if (!seen.has(name)) foreign++;
+    if (cancelled()) break;
+  }
+  if (cancelled()) return empty('Cancelled');
+  flushDrop();
+  const message =
+    `${checked} checked · ${repaired} to re-upload on next run` +
+    (opts.content ? ` · ${contentMismatches} content mismatch(es)` : '') +
+    (foreign ? ` · ${foreign} item(s) on Drive not uploaded by this set` : '');
   log(message);
-  return { ok: true, checked, repaired: invalid.length, message };
+  return { ok: true, checked, repaired, contentMismatches, foreign, message };
+}
+
+/** Local path of a catalog rel, if it lies inside one of the set's sources. */
+function localAbsFor(spec: RunSpec, rel: string): string | null {
+  for (const abs of spec.sourcePaths) {
+    const base = relBaseFor(spec.subfolder, abs);
+    if (rel === base) return abs;
+    if (rel.startsWith(base + '/')) return path.join(abs, rel.slice(base.length + 1));
+  }
+  return null;
 }

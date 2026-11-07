@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "incremental": false,
+    "plugins": [],
+    "paths": {
+      "openpgp/lightweight": [
+        "./node_modules/openpgp"
+      ]
+    }
+  },
+  "include": [
+    "src/server/proton/runtime.ts",
+    "src/server/proton/vendor/**/*.ts",
+    "src/types/**/*.d.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

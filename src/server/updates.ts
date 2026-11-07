@@ -1,55 +1,10 @@
-import { getCliVersion } from './cli';
-
 /**
- * On-demand update checks (run when the Settings panel is opened):
- *  - CLI: probe Proton's download server for a newer version than the running one.
- *  - Container: compare the built git sha (APP_VERSION) to GitHub's main HEAD.
+ * On-demand container update check (run when the Settings panel is opened):
+ * newest published "<appVersion>-<revision>" image tag vs. the running one.
+ * The Proton SDK is part of the image, so there is no separate SDK download.
  */
 
-const DL = 'https://proton.me/download/drive/cli';
 const REPO = process.env.GITHUB_REPO || 'traktuner/docker-proton-drive-backup';
-
-async function versionExists(v: string): Promise<boolean> {
-  try {
-    const r = await fetch(`${DL}/${v}/linux-x64/proton-drive`, {
-      method: 'HEAD',
-      signal: AbortSignal.timeout(8000),
-    });
-    return r.status === 200;
-  } catch {
-    return false;
-  }
-}
-
-export interface CliUpdate {
-  current: string;
-  latest: string;
-  updateAvailable: boolean;
-}
-
-export async function checkCliUpdate(): Promise<CliUpdate> {
-  const current = await getCliVersion();
-  let best = current;
-  const m = current.match(/^(\d+)\.(\d+)\.(\d+)/);
-  if (m) {
-    let [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3])];
-    // higher patches on the current minor
-    for (let p = pat + 1; p <= pat + 30; p++) {
-      if (await versionExists(`${maj}.${min}.${p}`)) best = `${maj}.${min}.${p}`;
-      else break;
-    }
-    // higher minors (and their highest patch)
-    for (let mi = min + 1; mi <= min + 10; mi++) {
-      if (!(await versionExists(`${maj}.${mi}.0`))) break;
-      best = `${maj}.${mi}.0`;
-      for (let p = 1; p <= 30; p++) {
-        if (await versionExists(`${maj}.${mi}.${p}`)) best = `${maj}.${mi}.${p}`;
-        else break;
-      }
-    }
-  }
-  return { current, latest: best, updateAvailable: best !== current };
-}
 
 export interface ContainerUpdate {
   current: string;

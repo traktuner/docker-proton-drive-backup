@@ -387,7 +387,7 @@ describe('importConfig upsert by name', () => {
     expect(res.errors).toEqual([]);
     expect(res.updated).toBe(1);
     expect(backupSets.get(set.id)!.sourcePaths).toEqual([resolveLocal('/old'), resolveLocal('/new')]);
-    expect(catalog.getFile(set.id, 'SafeImport/old/keep.txt')).toEqual({ size: 4, mtimeMs: 1, sha1: 'sha' });
+    expect(catalog.getFile(set.id, 'SafeImport/old/keep.txt')).toMatchObject({ size: 4, mtimeMs: 1, sha1: 'sha' });
   });
 
   it('rejects a missing imported source addition without changing the set', () => {

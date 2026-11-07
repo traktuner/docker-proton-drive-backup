@@ -1,6 +1,6 @@
 import { backupSets } from '@/server/db';
-import { verifyCatalog } from '@/server/engine';
-import { uploadsBusy } from '@/server/cli';
+import { verifySet } from '@/server/engine';
+import { drive, normalizeProtonPath, uploadsBusy, writeGate } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,16 +15,13 @@ const g = globalThis as unknown as { __pdVerifying?: boolean };
  * Drive (never trashes). Synchronous — for huge sets this is a full Drive scan, so
  * it may take a while; the client shows a spinner.
  */
-export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   if (uploadsBusy()) {
     return Response.json({ error: 'A backup is running - verify after it finishes.' }, { status: 409 });
   }
   const set = backupSets.get(id);
   if (!set) return Response.json({ error: 'not found' }, { status: 404 });
-  if (set.mode === 'add') {
-    return Response.json({ error: 'Verify applies to backup/mirror sets only.' }, { status: 400 });
-  }
   if (g.__pdVerifying) {
     return Response.json({ error: 'A verify is already running - wait for it to finish.' }, { status: 409 });
   }
@@ -32,7 +29,22 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
   // concurrent requests can't pile up multiple full-Drive scans.
   g.__pdVerifying = true;
   try {
-    const res = await verifyCatalog(id, set.targetPath, set.targetSubfolder);
+    // Verify only edits OUR catalog, but it must still be the bound account's Drive.
+    const blocked = await writeGate();
+    if (blocked) return Response.json({ error: blocked }, { status: 409 });
+    // `?content=1` additionally compares every local file's SHA-1 with Drive's.
+    const content = new URL(req.url).searchParams.get('content') === '1';
+    const res = await verifySet(
+      await drive(),
+      {
+        setId: id,
+        sourcePaths: set.sourcePaths,
+        targetPath: normalizeProtonPath(set.targetPath),
+        subfolder: set.targetSubfolder,
+        mode: set.mode,
+      },
+      { content },
+    );
     return Response.json(res, { status: res.ok ? 200 : 502 });
   } finally {
     g.__pdVerifying = false;

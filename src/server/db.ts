@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { nanoid } from 'nanoid';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -36,6 +36,14 @@ export interface BackupSet {
   includeHidden: boolean;
   /** Auto-run on local file changes (debounced) instead of only on schedule. */
   watch: boolean;
+  /**
+   * Drive node uid of `<targetPath>/<targetSubfolder>` as last confirmed by a run.
+   * A different node at the same path (folder deleted and re-created, or a rename
+   * elsewhere) is detected instead of silently writing into the wrong folder.
+   */
+  folderUid: string | null;
+  /** Mount marks per source root from the last completed run (mirror safety). */
+  sourceMarks: Record<string, SourceMark>;
   lastRunAt: number | null;
   lastStatus: 'never' | 'running' | 'success' | 'error' | 'cancelled' | 'paused';
   lastMessage: string | null;
@@ -58,30 +66,72 @@ interface Row {
   skip_thumbnails: number | null;
   include_hidden: number | null;
   watch: number | null;
+  folder_uid: string | null;
+  source_marks: string | null;
   last_run_at: number | null;
   last_status: BackupSet['lastStatus'];
   last_message: string | null;
   created_at: number;
 }
 
-let _db: Database.Database | null = null;
+let _db: DatabaseSync | null = null;
 
-export function getDb(): Database.Database {
+/**
+ * Schema version written to `PRAGMA user_version` after a successful migration.
+ *
+ *  0  every CLI-era release (tables created ad hoc, columns added in place)
+ *  1  SDK release: Drive node ids in the catalog, per-set Drive bindings and the
+ *     app_meta key/value table. Purely ADDITIVE, so a CLI-era image can still open
+ *     the same file after a rollback (it ignores columns and tables it does not
+ *     know, and every one of its statements names its columns explicitly).
+ */
+export const SCHEMA_VERSION = 1;
+
+/** Path of the one-time pre-migration snapshot next to the DB. */
+export function preMigrationBackupPath(): string {
+  return `${DB_PATH}.pre-sdk.bak`;
+}
+
+export function getDb(): DatabaseSync {
   if (_db) return _db;
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const db = new Database(DB_PATH);
+  const db = new DatabaseSync(DB_PATH, { timeout: 5000 });
   // WAL + NORMAL is the recommended high-throughput, crash-safe combo: no fsync
   // per commit (the dominant cost when writing the catalog for millions of files),
   // and still no corruption — at most the last transaction is lost on an OS/power
-  // crash, which the next backup run self-heals (the catalog only records what we
-  // uploaded). The other pragmas keep temp data and the page cache in memory and
-  // let SQLite mmap the DB, all of which speed up the per-file point lookups.
-  db.pragma('journal_mode = WAL');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('temp_store = MEMORY');
-  db.pragma('cache_size = -65536'); // ~64 MB page cache (negative = KiB)
-  db.pragma('mmap_size = 268435456'); // 256 MB
-  db.pragma('wal_autocheckpoint = 2000');
+  // crash, which the next run self-heals: the catalog only records what Drive has
+  // confirmed, and a missing row is re-checked against Drive before any upload.
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA cache_size = -16384;   -- 16 MiB page cache (was 64 MiB; the OS page cache does the rest)
+    PRAGMA mmap_size = 268435456; -- 256 MiB, file-backed (reclaimable, not heap)
+    PRAGMA wal_autocheckpoint = 2000;
+    PRAGMA foreign_keys = OFF;
+  `);
+  createBaseSchema(db);
+  migrate(db);
+  _db = db;
+  return db;
+}
+
+/** Close the connection (tests and graceful shutdown). */
+export function closeDb(): void {
+  if (_db) {
+    try {
+      _db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } catch {
+      /* best-effort */
+    }
+    _db.close();
+    _db = null;
+    stmtCache.clear();
+  }
+}
+
+/** The CLI-era schema, created idempotently exactly as every 0.x release did. */
+function createBaseSchema(db: DatabaseSync) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS backup_sets (
       id TEXT PRIMARY KEY,
@@ -100,31 +150,167 @@ export function getDb(): Database.Database {
       last_message TEXT,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS backup_catalog (
+      set_id   TEXT    NOT NULL,
+      rel      TEXT    NOT NULL,
+      kind     TEXT    NOT NULL,          -- 'file' | 'dir'
+      size     INTEGER,
+      mtime_ms INTEGER,
+      sha1     TEXT,
+      seen_at  INTEGER NOT NULL,
+      PRIMARY KEY (set_id, rel)
+    );
+    CREATE INDEX IF NOT EXISTS idx_catalog_seen ON backup_catalog (set_id, seen_at);
+    CREATE TABLE IF NOT EXISTS backup_runs (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      set_id      TEXT    NOT NULL,
+      started_at  INTEGER NOT NULL,
+      finished_at INTEGER NOT NULL,
+      status      TEXT    NOT NULL,        -- success | error | cancelled
+      message     TEXT,
+      files       INTEGER NOT NULL DEFAULT 0,
+      bytes       INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_runs_set ON backup_runs (set_id, started_at DESC);
   `);
-  ensureColumns(db);
-  _db = db;
-  return db;
+  const add = (table: string, name: string, ddl: string) => {
+    const cols = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name));
+    if (!cols.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  };
+  add('backup_sets', 'mode', "mode TEXT NOT NULL DEFAULT 'add'");
+  add('backup_sets', 'schedule', "schedule TEXT NOT NULL DEFAULT 'off'");
+  add('backup_sets', 'schedule_hour', 'schedule_hour INTEGER NOT NULL DEFAULT 3');
+  add('backup_sets', 'schedule_minute', 'schedule_minute INTEGER NOT NULL DEFAULT 0');
+  add('backup_sets', 'schedule_dow', 'schedule_dow INTEGER NOT NULL DEFAULT 1');
+  add('backup_sets', 'excludes', 'excludes TEXT');
+  add('backup_sets', 'ping_url', 'ping_url TEXT');
+  add('backup_sets', 'target_subfolder', 'target_subfolder TEXT');
+  add('backup_sets', 'skip_thumbnails', 'skip_thumbnails INTEGER NOT NULL DEFAULT 0');
+  add('backup_sets', 'include_hidden', 'include_hidden INTEGER NOT NULL DEFAULT 0');
+  add('backup_sets', 'watch', 'watch INTEGER NOT NULL DEFAULT 0');
+  add('backup_runs', 'skipped', 'skipped TEXT');
 }
 
-/** Add any columns missing from an older DB (simple forward migration). */
-function ensureColumns(db: Database.Database) {
-  const cols = new Set(
-    (db.prepare('PRAGMA table_info(backup_sets)').all() as { name: string }[]).map((c) => c.name),
-  );
-  const add = (name: string, ddl: string) => {
-    if (!cols.has(name)) db.exec(`ALTER TABLE backup_sets ADD COLUMN ${ddl}`);
-  };
-  add('mode', "mode TEXT NOT NULL DEFAULT 'add'");
-  add('schedule', "schedule TEXT NOT NULL DEFAULT 'off'");
-  add('schedule_hour', 'schedule_hour INTEGER NOT NULL DEFAULT 3');
-  add('schedule_minute', 'schedule_minute INTEGER NOT NULL DEFAULT 0');
-  add('schedule_dow', 'schedule_dow INTEGER NOT NULL DEFAULT 1');
-  add('excludes', 'excludes TEXT');
-  add('ping_url', 'ping_url TEXT');
-  add('target_subfolder', 'target_subfolder TEXT');
-  add('skip_thumbnails', 'skip_thumbnails INTEGER NOT NULL DEFAULT 0');
-  add('include_hidden', 'include_hidden INTEGER NOT NULL DEFAULT 0');
-  add('watch', 'watch INTEGER NOT NULL DEFAULT 0');
+/**
+ * Forward-only, additive, idempotent migration to SCHEMA_VERSION.
+ *
+ * Crash safety: every step runs in ONE transaction together with the
+ * user_version bump, so a kill mid-migration rolls back to the old version and
+ * the next start simply repeats it. Before the first migration of a DB that
+ * already holds data, a consistent snapshot (`VACUUM INTO`, which includes
+ * committed WAL content) is written next to the DB — once, via a temp name +
+ * rename, so an interrupted snapshot is never mistaken for a complete one.
+ */
+function migrate(db: DatabaseSync) {
+  const v = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+  if (v >= SCHEMA_VERSION) return;
+  const hasData = (db.prepare('SELECT COUNT(*) AS n FROM backup_sets').get() as { n: number }).n > 0;
+  if (v === 0 && hasData && DB_PATH !== ':memory:') snapshotOnce(db);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const cols = (t: string) =>
+      new Set((db.prepare(`PRAGMA table_info(${t})`).all() as { name: string }[]).map((c) => c.name));
+    const cat = cols('backup_catalog');
+    if (!cat.has('node_uid')) db.exec('ALTER TABLE backup_catalog ADD COLUMN node_uid TEXT');
+    const sets = cols('backup_sets');
+    if (!sets.has('folder_uid')) db.exec('ALTER TABLE backup_sets ADD COLUMN folder_uid TEXT');
+    if (!sets.has('source_marks')) db.exec('ALTER TABLE backup_sets ADD COLUMN source_marks TEXT');
+    db.exec(`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    // Remember that this DB came from a CLI-era release (decides session takeover).
+    if (v === 0 && hasData) db.prepare('INSERT OR IGNORE INTO app_meta (key, value) VALUES (?, ?)').run('upgrade.fromCli', String(Date.now()));
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+  console.log(`[db] schema migrated ${v} -> ${SCHEMA_VERSION}`);
+}
+
+function snapshotOnce(db: DatabaseSync) {
+  const dest = preMigrationBackupPath();
+  if (fs.existsSync(dest)) return;
+  const tmp = `${dest}.tmp`;
+  fs.rmSync(tmp, { force: true });
+  try {
+    db.prepare('VACUUM INTO ?').run(tmp);
+    fs.renameSync(tmp, dest);
+    console.log(`[db] pre-migration snapshot written to ${dest}`);
+  } catch (e) {
+    // A full disk must not brick the upgrade: the migration itself is additive
+    // and the old image can read the migrated file. Report and continue.
+    fs.rmSync(tmp, { force: true });
+    console.warn('[db] could not write the pre-migration snapshot:', e instanceof Error ? e.message : e);
+  }
+}
+
+/** Compiled statements, cached for the connection lifetime (node:sqlite has no cache). */
+const stmtCache = new Map<string, ReturnType<DatabaseSync['prepare']>>();
+export function stmt(sql: string) {
+  let s = stmtCache.get(sql);
+  if (!s) {
+    s = getDb().prepare(sql);
+    stmtCache.set(sql, s);
+  }
+  return s;
+}
+
+let txDepth = 0;
+/** Run fn in one transaction (nestable via savepoints). */
+export function tx<T>(fn: () => T): T {
+  const db = getDb();
+  const sp = `sp${txDepth}`;
+  db.exec(txDepth === 0 ? 'BEGIN' : `SAVEPOINT ${sp}`);
+  txDepth++;
+  try {
+    const out = fn();
+    txDepth--;
+    db.exec(txDepth === 0 ? 'COMMIT' : `RELEASE ${sp}`);
+    return out;
+  } catch (e) {
+    txDepth--;
+    db.exec(txDepth === 0 ? 'ROLLBACK' : `ROLLBACK TO ${sp}; RELEASE ${sp}`);
+    throw e;
+  }
+}
+
+/** Small persistent key/value store (account binding, migration markers). */
+export const meta = {
+  get(key: string): string | null {
+    const r = stmt('SELECT value FROM app_meta WHERE key = ?').get(key) as { value: string } | undefined;
+    return r?.value ?? null;
+  },
+  set(key: string, value: string): void {
+    stmt('INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(
+      key,
+      value,
+    );
+  },
+  delete(key: string): void {
+    stmt('DELETE FROM app_meta WHERE key = ?').run(key);
+  },
+};
+
+/**
+ * What a source root looked like at the end of the last completed run: whether it
+ * was its own mount (st_dev differs from its parent's) and whether it held any
+ * entries. Lets Mirror tell an offline NAS share (the mountpoint is still there
+ * but is now a plain, empty directory of the parent filesystem) from a folder the
+ * user really emptied.
+ */
+export interface SourceMark {
+  mounted: boolean;
+  nonEmpty: boolean;
+}
+
+function parseMarks(raw: string | null): Record<string, SourceMark> {
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === 'object' ? v : {};
+  } catch {
+    return {};
+  }
 }
 
 function rowToSet(r: Row): BackupSet {
@@ -144,6 +330,8 @@ function rowToSet(r: Row): BackupSet {
     skipThumbnails: !!r.skip_thumbnails,
     includeHidden: !!r.include_hidden,
     watch: !!r.watch,
+    folderUid: r.folder_uid ?? null,
+    sourceMarks: parseMarks(r.source_marks),
     lastRunAt: r.last_run_at,
     lastStatus: r.last_status,
     lastMessage: r.last_message,
@@ -171,7 +359,7 @@ export interface CreateBackupSet {
 export const backupSets = {
   all(): BackupSet[] {
     return (
-      getDb().prepare('SELECT * FROM backup_sets ORDER BY created_at DESC').all() as Row[]
+      getDb().prepare('SELECT * FROM backup_sets ORDER BY created_at DESC').all() as unknown as Row[]
     ).map(rowToSet);
   },
 
@@ -307,13 +495,35 @@ export const backupSets = {
   renameSubfolder(id: string, oldSub: string, newSub: string): void {
     const db = getDb();
     const likePattern = oldSub.replace(/[\\%_]/g, '\\$&') + '/%';
-    db.transaction(() => {
+    tx(() => {
       db.prepare(
         `UPDATE backup_catalog SET rel = ? || substr(rel, ?)
          WHERE set_id = ? AND (rel = ? OR rel LIKE ? ESCAPE '\\')`,
       ).run(newSub, oldSub.length + 1, id, oldSub, likePattern);
       db.prepare('UPDATE backup_sets SET target_subfolder = ? WHERE id = ?').run(newSub, id);
-    })();
+    });
+  },
+
+  /** Remember the Drive node of the set's own top-level folder (see engine bindings). */
+  setFolderUid(id: string, uid: string | null): void {
+    stmt('UPDATE backup_sets SET folder_uid = ? WHERE id = ?').run(uid, id);
+  },
+
+  /** Per-source mount marks from the last completed run (see engine sourceMarks). */
+  setSourceMarks(id: string, marks: Record<string, SourceMark>): void {
+    stmt('UPDATE backup_sets SET source_marks = ? WHERE id = ?').run(JSON.stringify(marks), id);
+  },
+
+  /**
+   * Switching Proton accounts: every Drive node id and every catalog row belongs to
+   * the old account, so forget them all. The next run of each set creates its
+   * folder in the new account and uploads everything (explicit user action only).
+   */
+  resetAllBindings(): void {
+    tx(() => {
+      getDb().exec('DELETE FROM backup_catalog');
+      getDb().exec('UPDATE backup_sets SET folder_uid = NULL, source_marks = NULL');
+    });
   },
 
   delete(id: string): void {

@@ -1,15 +1,12 @@
-import { loginManager, clearAuthCache } from '@/server/cli';
+import { loginStart } from '@/server/drive';
 
 export const dynamic = 'force-dynamic';
 
+/** Start the browser sign-in (Proton session fork). Returns the URL to open. */
 export async function POST() {
-  clearAuthCache();
-  const status = await loginManager.start();
+  const status = await loginStart();
   if (status.state === 'failed') {
     return Response.json({ error: status.error || 'Login failed' }, { status: 500 });
   }
-  return Response.json({
-    state: status.state,
-    signInUrl: status.signInUrl ?? null,
-  });
+  return Response.json({ state: status.state, signInUrl: status.signInUrl ?? null });
 }

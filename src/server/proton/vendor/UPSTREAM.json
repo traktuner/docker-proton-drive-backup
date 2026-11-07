@@ -1,0 +1,27 @@
+{
+  "sdkVersion": "0.23.0",
+  "tag": "js/v0.23.0",
+  "commit": "8a44654aece1609f0f7218be51c205103945abd8",
+  "repository": "https://github.com/ProtonDriveApps/sdk",
+  "crypto": "2.0.0",
+  "ky": "1.14.3",
+  "accountModule": {
+    "path": "incubating/account/js/src",
+    "files": {
+      "accountAddress.ts": "b0d68654692bc965ddc74835d8872d0a990a5265882d9f267ebd224d7aba6d8b",
+      "accountApi.ts": "481ac29fca27f29cf717775d16db7729327ccbe59059b478e64e1a542887dfff",
+      "addresses.ts": "daba26b23ea6e8ad35ddd5210f2b99cedb8fd37a5b98023abf81bef2c7c947b0",
+      "api-auth-types.ts": "681882242ee9b555e4b15f33687340acb4c319c97555e597d85ce449cc8318ac",
+      "api-core-types.ts": "970d86c316d72491b3fe0258f8f2274f7307718801b240314ac4e882fc52c990",
+      "apiClient.ts": "7583a3da647c0d84599ef76bb59b4238b7c5cb0d3bc604fc0862b5cdf4f72b4e",
+      "auth.ts": "11fdc5ec196b17e1d8c326796eefc33d1e83a230e03e1cdcfc8c43e7f391f477",
+      "authWeb.ts": "6a74bbdae3e36ec3e776fc993d0a2def125f6c23084f0cfc872c6e0d3a38e9b5",
+      "index.ts": "ce03fbd44f798d07d206578c4deefd43493d4ea996a7665bc4a651bd1420373f",
+      "logger.ts": "a06f03bdb2405a4393800624f7fef8b25892da84c7a8c4863f2eb51edeb28798",
+      "sessionCredentials.ts": "65dea44a0303fe1382806bcb97425d3801bbf505ed2940aa5a477ae940bd6690",
+      "sleep.ts": "c2bf2b82345d8b7d32e10c239fb9e4db4a1c25d99d29e98e8a5df25c1cd18dd7",
+      "srp.ts": "7b690e36393071728e829b48324f13fbff3f31063a0f8b1dfdc82d2d1d6bbd3a",
+      "telemetryPreference.ts": "360f9808e452c60c98d8262020fb8f9de1ca726f0822e9133c55d8cbc2e94bda"
+    }
+  }
+}

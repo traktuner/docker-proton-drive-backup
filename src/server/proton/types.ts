@@ -111,6 +111,10 @@ export interface DriveService {
   /** Move nodes to the Drive trash (restorable). */
   trash(uids: string[]): Promise<{ uid: string; ok: boolean; error?: string; code?: DriveErrorCode }[]>;
   rename(uid: string, newName: string): Promise<RemoteNode>;
+  /** Revisions of a file node, newest first (restore/diagnostics; not used by runs). */
+  revisions?(uid: string): Promise<{ uid: string; active: boolean; size: number | null; sha1: string | null; created: number }[]>;
+  /** Download one revision to a local file, verified by the SDK. Returns bytes written. */
+  download?(revisionUid: string, destPath: string): Promise<number>;
 }
 
 export interface AccountInfo {

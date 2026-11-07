@@ -594,6 +594,38 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
         return out;
       }),
     rename: (uid, newName) => guard(async () => toRemote(await sdk.renameNode(uid, newName))),
+    revisions: (uid) =>
+      guard(async () => {
+        const out: { uid: string; active: boolean; size: number | null; sha1: string | null; created: number }[] = [];
+        for await (const r of sdk.iterateRevisions(uid)) {
+          out.push({
+            uid: r.uid,
+            active: r.state === 'active',
+            size: r.claimedSize ?? null,
+            sha1: r.claimedDigests?.sha1 ?? null,
+            created: r.creationTime.getTime(),
+          });
+        }
+        return out.sort((a, b) => b.created - a.created);
+      }),
+    download: (revisionUid, destPath) =>
+      guard(async () => {
+        const downloader = await sdk.getFileRevisionDownloader(revisionUid);
+        const fh = await fs.promises.open(destPath, 'w', 0o600);
+        let written = 0;
+        try {
+          const sink = new WritableStream<Uint8Array>({
+            async write(chunk) {
+              await fh.write(chunk);
+              written += chunk.byteLength;
+            },
+          });
+          await downloader.downloadToStream(sink).completion();
+        } finally {
+          await fh.close();
+        }
+        return written;
+      }),
   };
 
   return {

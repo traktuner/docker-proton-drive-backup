@@ -63,12 +63,20 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="border-t border-white/[0.07] px-5 py-4">
+    <div className="border-t border-white/[0.07] px-5 py-4 first:border-t-0">
       <h3 className="mb-2 text-[0.8125rem] font-semibold uppercase tracking-wide text-[color:var(--muted)]">{title}</h3>
       {children}
     </div>
   );
 }
+
+const TABS = [
+  { id: 'backup', label: 'Backup', hint: 'Uploads, Mirror safety' },
+  { id: 'display', label: 'Display', hint: 'Text size' },
+  { id: 'account', label: 'Account', hint: 'Sign-in, storage' },
+  { id: 'system', label: 'System', hint: 'Updates, paths, about' },
+] as const;
+type TabId = (typeof TABS)[number]['id'];
 
 export default function Settings() {
   const [textSize, setTextSize] = useState<TextSize>(DEFAULT_TEXT_SIZE);
@@ -85,6 +93,7 @@ export default function Settings() {
       /* private mode: applies for this visit only */
     }
   };
+  const [tab, setTab] = useState<TabId>('backup');
   const [open, setOpen] = useState(false);
   const [closing, setClosing] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -230,7 +239,10 @@ export default function Settings() {
             onClick={requestClose}
           >
             <div
-              className={`proton-dialog ${closing ? 'proton-dialog--out' : ''} my-auto w-full max-w-lg overflow-hidden rounded-xl border border-[color:var(--border)] bg-[color:var(--panel)] text-[color:var(--text)]`}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="settings-title"
+              className={`proton-dialog ${closing ? 'proton-dialog--out' : ''} my-auto flex h-[min(42rem,calc(100dvh-2rem))] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-[color:var(--border)] bg-[color:var(--panel)] text-[color:var(--text)]`}
               style={{ boxShadow: 'var(--shadow-lifted)' }}
               onAnimationEnd={(e) => {
                 // Matches both the normal scale-out and the reduce-motion fade-out.
@@ -238,97 +250,62 @@ export default function Settings() {
               }}
               onClick={(e) => e.stopPropagation()}
             >
-              <div>
-            <div className="flex items-center justify-between px-5 py-4">
-              <h2 className="text-base font-semibold">Settings</h2>
-              <button
-                onClick={requestClose}
-                className="pbtn pbtn--ghost p-1.5 text-[color:var(--muted)] hover:text-[color:var(--text)]"
-              >
-                ✕
-              </button>
-            </div>
-
-            {/* Display (accessibility) */}
-            <Section title="Display">
-              <div className="space-y-1.5">
-                <span className="block text-sm">Text size</span>
-                <div role="radiogroup" aria-label="Text size" className="grid grid-cols-4 gap-1.5">
-                  {TEXT_SIZES.map((t) => (
+              <div className="flex items-center justify-between border-b border-white/[0.07] px-5 py-4">
+                <h2 id="settings-title" className="text-base font-semibold">Settings</h2>
+                <button
+                  onClick={requestClose}
+                  aria-label="Close settings"
+                  className="pbtn pbtn--ghost p-1.5 text-[color:var(--muted)] hover:text-[color:var(--text)]"
+                >
+                  ✕
+                </button>
+              </div>
+              {/* Tabs: a row on phones, a side list from tablet width up. The dialog keeps
+                  one height so switching tabs never makes it jump. */}
+              <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+                <div
+                  role="tablist"
+                  aria-label="Settings sections"
+                  aria-orientation="vertical"
+                  className="flex shrink-0 gap-1 overflow-x-auto border-b border-white/[0.07] px-3 py-2 md:w-48 md:flex-col md:overflow-visible md:border-b-0 md:border-r md:py-3"
+                  onKeyDown={(e) => {
+                    const i = TABS.findIndex((t) => t.id === tab);
+                    const step = e.key === 'ArrowDown' || e.key === 'ArrowRight' ? 1 : e.key === 'ArrowUp' || e.key === 'ArrowLeft' ? -1 : 0;
+                    if (!step) return;
+                    e.preventDefault();
+                    const next = TABS[(i + step + TABS.length) % TABS.length].id;
+                    setTab(next);
+                    document.getElementById(`settings-tab-${next}`)?.focus();
+                  }}
+                >
+                  {TABS.map((t) => (
                     <button
                       key={t.id}
-                      role="radio"
-                      aria-checked={textSize === t.id}
-                      onClick={() => chooseTextSize(t.id)}
-                      className={`rounded-lg border px-2 py-2 text-center text-[0.8125rem] font-medium transition ${
-                        textSize === t.id
-                          ? 'border-[color:var(--accent)] bg-[color:var(--accent)]/10 text-[color:var(--text)]'
-                          : 'border-[color:var(--border)] text-[color:var(--muted)] hover:bg-[color:var(--panel-2)]'
+                      id={`settings-tab-${t.id}`}
+                      role="tab"
+                      aria-selected={tab === t.id}
+                      aria-controls="settings-panel"
+                      tabIndex={tab === t.id ? 0 : -1}
+                      onClick={() => setTab(t.id)}
+                      className={`shrink-0 rounded-lg px-3 py-2 text-left text-sm font-medium transition ${
+                        tab === t.id
+                          ? 'bg-[color:var(--accent)]/15 text-[color:var(--text)]'
+                          : 'text-[color:var(--muted)] hover:bg-[color:var(--interaction-default-hover)] hover:text-[color:var(--text)]'
                       }`}
                     >
-                      <span aria-hidden className="block leading-none" style={{ fontSize: `${t.pct / 100}em` }}>
-                        Aa
-                      </span>
-                      <span className="mt-1 block">{t.label}</span>
+                      {t.label}
+                      <span className="hidden text-xs font-normal text-[color:var(--muted)] md:block">{t.hint}</span>
                     </button>
                   ))}
                 </div>
-                <p className="text-[0.8125rem] text-[color:var(--muted)]">Applies to this browser. Builds on your browser&apos;s own font size.</p>
-              </div>
-            </Section>
-
-            {/* Account */}
-            <Section title="Account">
-              <Row label="Signed in as">
-                {info?.account.email ?? <span className="text-[color:var(--muted)]">…</span>}
-              </Row>
-              <button onClick={logout} className="pbtn pbtn--danger mt-2 w-full px-4 py-2 text-sm">
-                Log out
-              </button>
-            </Section>
-
-            {/* Updates */}
-            <Section title="Updates">
-              <Row label="Proton Drive SDK">
-                <span className="font-mono" title={info ? `${info.sdk.tag} @ ${info.sdk.commit.slice(0, 12)} · crypto ${info.sdk.crypto}` : ''}>
-                  {info?.sdk.version ?? '…'}
-                </span>
-              </Row>
-              {updates?.sdk.notices.map((n) => (
-                <p key={n.message} className={`text-xs ${n.kind === 'required' ? 'text-red-300' : 'text-amber-300'}`}>
-                  {n.message} Update the container image.
-                </p>
-              ))}
-              <Row label="Container image">
-                {!updates ? (
-                  <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
-                ) : updates.container.updateAvailable ? (
-                  <span className="text-amber-300">
-                    update available - {updates.container.latest}
-                    {updates.container.releaseUrl && (
-                      <>
-                        {' · '}
-                        <a href={updates.container.releaseUrl} target="_blank" rel="noreferrer" className="underline">
-                          what&apos;s new
-                        </a>
-                      </>
-                    )}
-                  </span>
-                ) : updates.container.latest ? (
-                  <span className="text-emerald-300">{updates.container.current} · up to date</span>
-                ) : (
-                  <span className="text-[color:var(--muted)]">{updates.container.current}</span>
-                )}
-              </Row>
-              <button
-                onClick={checkUpdates}
-                disabled={checking}
-                className="pbtn pbtn--ghost mt-2 px-3 py-1.5 text-[0.8125rem] text-[color:var(--muted)] hover:text-[color:var(--text)]"
-              >
-                {checking ? 'Checking…' : 'Check again'}
-              </button>
-            </Section>
-
+                <div
+                  id="settings-panel"
+                  role="tabpanel"
+                  aria-labelledby={`settings-tab-${tab}`}
+                  className="settings-panel min-h-0 flex-1 overflow-y-auto overscroll-contain"
+                >
+                  {tab === 'backup' && (
+                    <>
             {/* Uploads */}
             {uploads && (
               <Section title="Uploads">
@@ -459,6 +436,52 @@ export default function Settings() {
               </Section>
             )}
 
+                    </>
+                  )}
+                  {tab === 'display' && (
+                    <>
+            {/* Display (accessibility) */}
+            <Section title="Display">
+              <div className="space-y-1.5">
+                <span className="block text-sm">Text size</span>
+                <div role="radiogroup" aria-label="Text size" className="grid grid-cols-4 gap-1.5">
+                  {TEXT_SIZES.map((t) => (
+                    <button
+                      key={t.id}
+                      role="radio"
+                      aria-checked={textSize === t.id}
+                      onClick={() => chooseTextSize(t.id)}
+                      className={`rounded-lg border px-2 py-2 text-center text-[0.8125rem] font-medium transition ${
+                        textSize === t.id
+                          ? 'border-[color:var(--accent)] bg-[color:var(--accent)]/10 text-[color:var(--text)]'
+                          : 'border-[color:var(--border)] text-[color:var(--muted)] hover:bg-[color:var(--panel-2)]'
+                      }`}
+                    >
+                      <span aria-hidden className="block leading-none" style={{ fontSize: `${t.pct / 100}em` }}>
+                        Aa
+                      </span>
+                      <span className="mt-1 block">{t.label}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[0.8125rem] text-[color:var(--muted)]">Applies to this browser. Builds on your browser&apos;s own font size.</p>
+              </div>
+            </Section>
+
+                    </>
+                  )}
+                  {tab === 'account' && (
+                    <>
+            {/* Account */}
+            <Section title="Account">
+              <Row label="Signed in as">
+                {info?.account.email ?? <span className="text-[color:var(--muted)]">…</span>}
+              </Row>
+              <button onClick={logout} className="pbtn pbtn--danger mt-2 w-full px-4 py-2 text-sm">
+                Log out
+              </button>
+            </Section>
+
             {/* Storage */}
             {info?.quota && (
               <Section title="Storage">
@@ -478,6 +501,52 @@ export default function Settings() {
                 ))}
               </Section>
             )}
+
+                    </>
+                  )}
+                  {tab === 'system' && (
+                    <>
+            {/* Updates */}
+            <Section title="Updates">
+              <Row label="Proton Drive SDK">
+                <span className="font-mono" title={info ? `${info.sdk.tag} @ ${info.sdk.commit.slice(0, 12)} · crypto ${info.sdk.crypto}` : ''}>
+                  {info?.sdk.version ?? '…'}
+                </span>
+              </Row>
+              {updates?.sdk.notices.map((n) => (
+                <p key={n.message} className={`text-xs ${n.kind === 'required' ? 'text-red-300' : 'text-amber-300'}`}>
+                  {n.message} Update the container image.
+                </p>
+              ))}
+              <Row label="Container image">
+                {!updates ? (
+                  <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
+                ) : updates.container.updateAvailable ? (
+                  <span className="text-amber-300">
+                    update available - {updates.container.latest}
+                    {updates.container.releaseUrl && (
+                      <>
+                        {' · '}
+                        <a href={updates.container.releaseUrl} target="_blank" rel="noreferrer" className="underline">
+                          what&apos;s new
+                        </a>
+                      </>
+                    )}
+                  </span>
+                ) : updates.container.latest ? (
+                  <span className="text-emerald-300">{updates.container.current} · up to date</span>
+                ) : (
+                  <span className="text-[color:var(--muted)]">{updates.container.current}</span>
+                )}
+              </Row>
+              <button
+                onClick={checkUpdates}
+                disabled={checking}
+                className="pbtn pbtn--ghost mt-2 px-3 py-1.5 text-[0.8125rem] text-[color:var(--muted)] hover:text-[color:var(--text)]"
+              >
+                {checking ? 'Checking…' : 'Check again'}
+              </button>
+            </Section>
 
             {/* Environment */}
             <Section title="Environment">
@@ -507,6 +576,9 @@ export default function Settings() {
                 </a>
               </div>
             </Section>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
           </div>,

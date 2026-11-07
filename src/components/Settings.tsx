@@ -194,6 +194,12 @@ export default function Settings() {
   }, [open, loadSettings, checkUpdates, requestClose]);
 
   const logout = async () => {
+    if (
+      !window.confirm(
+        'Log out of Proton Drive? A running backup stops (it resumes where it left off when you run it again), and scheduled backups wait until you sign in again.',
+      )
+    )
+      return;
     await fetch('/api/auth/logout', { method: 'POST' });
     window.location.href = '/onboarding';
   };

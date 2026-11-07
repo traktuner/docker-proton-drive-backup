@@ -22,6 +22,7 @@ let LruCache: new <T>(max: number) => {
   iterateEntitiesByTag(t: string): AsyncGenerator<{ key: string; ok: boolean }>;
   removeEntities(k: string[]): Promise<void>;
   size: number;
+  bytes: number;
 };
 
 beforeAll(async () => {
@@ -76,6 +77,7 @@ describe('LruCache (replaces the SDK MemoryCache: bounded, O(1))', () => {
     tagged.length = 0;
     for await (const r of c.iterateEntitiesByTag('parent-x')) if (r.ok) tagged.push(r.key);
     expect(tagged).toEqual(['d']);
+    expect(c.bytes).toBe(1); // only 'd' ('4') is left
   });
 
   it('stays fast and bounded with 200k entries', async () => {

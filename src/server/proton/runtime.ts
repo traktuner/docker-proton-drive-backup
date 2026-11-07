@@ -280,10 +280,16 @@ async function makeThumbnails(abs: string, mediaType: string): Promise<Thumbnail
 export class LruCache<T> {
   private map = new Map<string, { value: T; tags?: string[] }>();
   private byTag = new Map<string, Set<string>>();
+  /** Characters held in string values (the node cache stores JSON): diagnostics. */
+  private chars = 0;
   constructor(private readonly max: number) {}
+  private weigh(v: T) {
+    return typeof v === 'string' ? v.length : 0;
+  }
   async clear() {
     this.map.clear();
     this.byTag.clear();
+    this.chars = 0;
   }
   private untag(key: string, tags?: string[]) {
     for (const t of tags ?? []) {
@@ -297,8 +303,10 @@ export class LruCache<T> {
     if (old) {
       this.untag(key, old.tags);
       this.map.delete(key);
+      this.chars -= this.weigh(old.value);
     }
     this.map.set(key, { value, tags });
+    this.chars += this.weigh(value);
     for (const t of tags ?? []) {
       let set = this.byTag.get(t);
       if (!set) this.byTag.set(t, (set = new Set()));
@@ -312,6 +320,7 @@ export class LruCache<T> {
         if (drop-- <= 0) break;
         this.map.delete(k);
         this.untag(k, e.tags);
+        this.chars -= this.weigh(e.value);
       }
     }
   }
@@ -337,10 +346,15 @@ export class LruCache<T> {
       if (!e) continue;
       this.map.delete(key);
       this.untag(key, e.tags);
+      this.chars -= this.weigh(e.value);
     }
   }
   get size() {
     return this.map.size;
+  }
+  /** Approximate bytes of string values (one-byte JSON). */
+  get bytes() {
+    return this.chars;
   }
 }
 
@@ -780,7 +794,7 @@ export async function createRuntime(opts: RuntimeOptions): Promise<ProtonRuntime
       stopEvents();
       await entitiesCache.clear();
     },
-    cacheStats: () => ({ entities: entitiesCache.size, crypto: cryptoCache.size, events: subscription !== null }),
+    cacheStats: () => ({ entities: entitiesCache.size, entitiesBytes: entitiesCache.bytes, crypto: cryptoCache.size, events: subscription !== null }),
     onFolderChanged: (cb) => void folderChangedCbs.add(cb),
     onSessionLost: (cb) => void lostCbs.add(cb),
     notices: () => [...notices],

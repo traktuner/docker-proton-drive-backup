@@ -12,6 +12,7 @@ import {
 import { usePathname } from 'next/navigation';
 import { useToast } from './Toast';
 import SessionBanner from './SessionBanner';
+import AccountBanner from './AccountBanner';
 
 /**
  * Single source of truth for "is the Proton session alive?" on the client.
@@ -54,9 +55,9 @@ export function useAuth(): AuthApi {
   );
 }
 
-// Client-side mirror of the server's auth-error patterns (cli.ts AUTH_ERROR_PATTERNS),
-// plus the friendly messages this app produces, so a raw CLI error or our own
-// "session expired" text both count.
+// Phrases of the session-expired messages this app produces (server: drive.ts
+// cleanDriveError / engine.ts), plus legacy CLI-era phrases still found in old run
+// history, so any of them raises the reconnect banner.
 const AUTH_HINTS = [
   'no session',
   'please login',
@@ -135,7 +136,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return;
     }
     check(false);
-    const id = setInterval(() => check(true), 60_000);
+    // Hidden tabs don't poll; they re-check when they become visible again.
+    const id = setInterval(() => {
+      if (document.visibilityState === 'visible') check(true);
+    }, 60_000);
     const onFocus = () => check(true);
     const onVis = () => {
       if (document.visibilityState === 'visible') check(true);
@@ -207,6 +211,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return (
     <Ctx.Provider value={{ status, signInUrl, reconnect, reportAuthError }}>
       {!selfManaged && <SessionBanner />}
+      {!selfManaged && <AccountBanner />}
       {children}
     </Ctx.Provider>
   );

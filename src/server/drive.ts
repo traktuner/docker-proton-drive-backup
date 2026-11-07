@@ -51,7 +51,7 @@ type G = {
   __pdRuntime?: Promise<ProtonRuntime>;
   __pdRuntimeOverride?: ProtonRuntime;
   __pdNameIndex?: Map<string, { at: number; byName: Map<string, RemoteNode> }>;
-  __pdAuth?: { authed: boolean; at: number; account: AccountInfo | null };
+  __pdAuth?: { authed: boolean; at: number; account: AccountInfo | null; hadSession?: boolean };
   __pdBusy?: { v: number };
 };
 const g = globalThis as unknown as G;
@@ -298,7 +298,8 @@ export function cleanDriveError(e: unknown, code?: string | null): string {
 /* Session, login and account binding                                  */
 /* ------------------------------------------------------------------ */
 
-const AUTH_TTL = 15_000;
+const AUTH_TTL = 60_000;
+const FORCE_MIN_AGE = 20_000;
 
 function markSessionLost() {
   g.__pdAuth = { authed: false, at: Date.now(), account: null };
@@ -315,14 +316,16 @@ function markSessionLost() {
 export async function isAuthenticated(force = false): Promise<boolean> {
   const rt = await runtime();
   if (!rt.hasSession()) {
-    g.__pdAuth = { authed: false, at: Date.now(), account: null };
+    g.__pdAuth = { authed: false, at: Date.now(), account: null, hadSession: false };
     return false;
   }
-  const c = g.__pdAuth;
-  if (!force && c && Date.now() - c.at < AUTH_TTL) return c.authed;
+  const c = g.__pdAuth?.hadSession === rt.hasSession() ? g.__pdAuth : undefined; // a login just finished → recheck
+  // Forced checks (every open tab re-verifies once a minute) are coalesced: at most
+  // one Proton request per FORCE_MIN_AGE no matter how many tabs poll.
+  if (c && Date.now() - c.at < (force ? FORCE_MIN_AGE : AUTH_TTL)) return c.authed;
   try {
     const acc = await rt.account(force);
-    g.__pdAuth = { authed: !!acc, at: Date.now(), account: acc };
+    g.__pdAuth = { authed: !!acc, at: Date.now(), account: acc, hadSession: true };
     if (acc) noteAccount(acc);
     return !!acc;
   } catch {

@@ -7,7 +7,8 @@ import { formatBytes } from '@/lib/format';
 interface Info {
   app: string;
   imageTag: string;
-  cli: string;
+  build: string;
+  sdk: { version: string; tag: string; commit: string; crypto: string; appVersionHeader: string };
   tz: string;
   localRoot: string;
   dataDir: string;
@@ -21,7 +22,7 @@ interface UploadsCfg {
   concurrency: number;
   /** Upload speed cap in KB/s; 0 = off. */
   limitKBps: number;
-  /** Whether the container can actually enforce a limit (has NET_ADMIN). */
+  /** Always true since the SDK release (the app limits its own reads). */
   canShape: boolean;
   /** Why it can't, when it can't — shown in the UI. */
   shapeReason: string;
@@ -33,7 +34,7 @@ interface MirrorSafetyCfg {
   deleteSafetyPct: number;
 }
 interface Updates {
-  cli: { current: string; latest: string; updateAvailable: boolean };
+  sdk: { current: string; notices: { kind: string; message: string }[] };
   container: { current: string; latest: string | null; updateAvailable: boolean };
 }
 
@@ -243,17 +244,16 @@ export default function Settings() {
 
             {/* Updates */}
             <Section title="Updates">
-              <Row label="Proton Drive CLI">
-                {!updates ? (
-                  <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
-                ) : updates.cli.updateAvailable ? (
-                  <span className="text-amber-300">
-                    {updates.cli.current} → {updates.cli.latest} available
-                  </span>
-                ) : (
-                  <span className="text-emerald-300">{updates.cli.current} · up to date</span>
-                )}
+              <Row label="Proton Drive SDK">
+                <span className="font-mono" title={info ? `${info.sdk.tag} @ ${info.sdk.commit.slice(0, 12)} · crypto ${info.sdk.crypto}` : ''}>
+                  {info?.sdk.version ?? '…'}
+                </span>
               </Row>
+              {updates?.sdk.notices.map((n) => (
+                <p key={n.message} className={`text-[11px] ${n.kind === 'required' ? 'text-red-300' : 'text-amber-300'}`}>
+                  {n.message} Update the container image.
+                </p>
+              ))}
               <Row label="Container image">
                 {!updates ? (
                   <span className="text-[color:var(--muted)]">{checking ? 'checking…' : '-'}</span>
@@ -293,9 +293,8 @@ export default function Settings() {
                     className="prange mt-2 w-full"
                   />
                   <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
-                    How many files upload at the same time, each its own CLI process (~4 streams each).
-                    Higher is faster but heavier on the connection and likelier to hit Proton rate limits.
-                    Takes effect during a running backup, as in-flight uploads finish.
+                    How many files upload at the same time. All share one connection pool and Proton&apos;s
+                    rate limits; small files profit most from more. Takes effect during a running backup.
                   </p>
                 </div>
 
@@ -329,9 +328,9 @@ export default function Settings() {
                   </div>
                   {uploads.canShape ? (
                     <p className="mt-1 text-[11px] leading-relaxed text-[color:var(--muted)]">
-                      Caps outbound bandwidth in the kernel (tc/TBF). Approximate, shared across all parallel
-                      uploads, and applied to the whole container&apos;s traffic while a backup runs. Takes
-                      effect on the next run.
+                      Caps how fast backups read files for upload, shared by all parallel uploads. Only
+                      backup traffic is limited, never the web UI. Changes apply within a second, also
+                      during a running backup.
                     </p>
                   ) : (
                     <p className="mt-1 text-[11px] leading-relaxed text-amber-400/80">
@@ -443,12 +442,12 @@ export default function Settings() {
                   GitHub repo
                 </a>
                 <a
-                  href="https://proton.me/support/drive-cli"
+                  href="https://github.com/ProtonDriveApps/sdk"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-[color:var(--accent-2)] hover:underline"
                 >
-                  Proton Drive CLI docs
+                  Proton Drive SDK
                 </a>
               </div>
             </Section>

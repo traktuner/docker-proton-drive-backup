@@ -23,7 +23,9 @@ export default function StorageBar() {
         .then((d) => setQ(d.quota))
         .catch(() => {});
     load();
-    const t = setInterval(load, 60_000);
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 60_000);
     return () => clearInterval(t);
     // Reload immediately when the session is (re)authenticated so the bar — which
     // hides itself on a dead session — comes back without waiting for the interval.

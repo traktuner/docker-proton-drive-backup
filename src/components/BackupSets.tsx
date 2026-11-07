@@ -226,7 +226,9 @@ export default function BackupSets({
 
   useEffect(() => {
     if (!sets.some((s) => s.lastStatus === 'running')) return;
-    const t = setInterval(load, 1500);
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, 1500);
     return () => clearInterval(t);
   }, [sets]);
 
@@ -249,18 +251,16 @@ export default function BackupSets({
     await fetch(`/api/backup-sets/${id}/pause`, { method: 'POST' });
     load();
   };
-  const verify = async (id: string) => {
+  const verify = async (id: string, content = false) => {
     const name = sets.find((s) => s.id === id)?.name;
     setVerifying((prev) => new Set(prev).add(id));
-    toast(`Verifying${name ? ` “${name}”` : ''} against Drive…`, 'info');
+    toast(`Verifying${content ? ' content of' : ''}${name ? ` “${name}”` : ''} against Drive…`, 'info');
     try {
-      const res = await fetch(`/api/backup-sets/${id}/verify`, { method: 'POST' });
+      const res = await fetch(`/api/backup-sets/${id}/verify${content ? '?content=1' : ''}`, { method: 'POST' });
       const d = await res.json();
       if (!res.ok) throw new Error(d.error || 'Verify failed');
       toast(
-        d.repaired > 0
-          ? `Verify: ${d.repaired} item(s) will re-upload next run (${d.checked} checked)`
-          : `Verify: all ${d.checked} item(s) match Drive`,
+        d.repaired > 0 ? `Verify: ${d.message}` : `Verify: all ${d.checked} item(s) match Drive${d.foreign ? ` (${d.foreign} other item(s) on Drive)` : ''}`,
         d.repaired > 0 ? 'info' : 'success',
       );
     } catch (e) {
@@ -800,14 +800,24 @@ export default function BackupSets({
                           {previewing.has(s.id) ? 'Previewing…' : 'Preview'}
                         </button>
                       )}
-                      {s.mode !== 'add' && (
+                      <button
+                        onClick={(e) => verify(s.id, e.shiftKey)}
+                        disabled={s.lastStatus === 'running' || verifying.has(s.id)}
+                        className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
+                        title="Reconcile the catalog against Drive — re-upload anything deleted or changed there. Shift-click: also compare every file's content (SHA-1) with Drive (reads all files)."
+                      >
+                        {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
+                      </button>
+                      {s.mode === 'mirror' && s.lastStatus === 'error' && /is empty — if you emptied it on purpose/.test(s.lastMessage ?? '') && (
                         <button
-                          onClick={() => verify(s.id)}
-                          disabled={s.lastStatus === 'running' || verifying.has(s.id)}
-                          className="pbtn pbtn--ghost px-2.5 py-1.5 text-xs"
-                          title="Reconcile the catalog against Drive — re-upload anything deleted or changed there"
+                          onClick={() => {
+                            if (window.confirm('The source folder is empty. Move every file of this set on Drive to the Drive trash? (Only do this if you emptied the folder on purpose — not if a NAS share is offline.)'))
+                              void fetch(`/api/backup-sets/${s.id}/run?allowEmptySource=1`, { method: 'POST' }).then(load);
+                          }}
+                          className="pbtn pbtn--danger px-2.5 py-1.5 text-xs"
+                          title="Confirm that the empty source was emptied on purpose and apply the deletions once"
                         >
-                          {verifying.has(s.id) ? 'Verifying…' : 'Verify'}
+                          Apply deletions
                         </button>
                       )}
                       <button

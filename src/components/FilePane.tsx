@@ -175,7 +175,7 @@ export default function FilePane({
     setFolderError(null);
     try {
       await onNewFolder(path, folderName);
-      // Optimistic: show the folder immediately (avoids the CLI cache lag).
+      // Optimistic: show the folder immediately.
       setEntries((prev) =>
         prev.some((e) => e.name === folderName && e.type === 'folder')
           ? prev
@@ -293,7 +293,7 @@ export default function FilePane({
         {error &&
           (authStatus !== 'authenticated' && looksLikeAuthError(error) ? (
             // Defer to the global session banner — show a calm reconnect prompt here
-            // instead of the raw "no session" CLI text.
+            // instead of a raw error text.
             <div className="m-3 rounded-md border border-[color:var(--border)] bg-[color:var(--panel-2)] p-3 text-sm text-[color:var(--muted)]">
               Disconnected from Proton Drive.{' '}
               <button onClick={reconnect} className="underline hover:no-underline" style={{ color: 'var(--accent-2)' }}>

@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { load, save, op, child, add, resolve } from './state.mjs';
+import { load, save, op, child, add, resolve, withLock } from './state.mjs';
 
 const args = process.argv.slice(2).filter((a) => a !== '-j' && a !== '--json');
 const SESSION = path.join(process.env.PROTON_DRIVE_CACHE_DIR || '/data/proton', 'auth-session.json');
@@ -48,7 +48,7 @@ if (args[0] === 'auth' && args[1] === 'login') {
   if (!s) fail('You need to login first');
   // A rotated token written by the SDK release must be accepted (rollback).
   if (!/^at-\d+$/.test(s.session.accessToken)) fail('not authenticated');
-  run();
+  withLock(run);
 }
 
 function entry(n) {

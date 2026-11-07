@@ -11,6 +11,28 @@ export const DIR = process.env.FAKE_DRIVE_DIR || '/fake-drive';
 const FILE = path.join(DIR, 'state.json');
 const OPS = path.join(DIR, 'ops.log');
 
+// The CLI-era app runs several CLI processes at once (parallel uploads), so every
+// read-modify-write of the shared state is serialised with a lock directory.
+const LOCK = path.join(DIR, 'state.lock');
+const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+export function withLock(fn) {
+  for (let i = 0; ; i++) {
+    try {
+      fs.mkdirSync(LOCK);
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      if (i > 3000) fs.rmSync(LOCK, { recursive: true, force: true }); // stale (killed holder)
+      nap(5);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    fs.rmSync(LOCK, { recursive: true, force: true });
+  }
+}
+
 export function load() {
   try {
     return JSON.parse(fs.readFileSync(FILE, 'utf8'));

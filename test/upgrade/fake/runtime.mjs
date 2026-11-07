@@ -7,7 +7,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { load, save, op, child, add } from './state.mjs';
+import { load as rawLoad, save, op, child, add, withLock } from './state.mjs';
+const load = () => withLock(rawLoad);
 
 class DriveError extends Error {
   constructor(code, message, extra = {}) {
@@ -51,7 +52,10 @@ export async function createRuntime(opts) {
   const need = () => {
     if (!readSession()) throw new DriveError('UNAUTHENTICATED', 'Proton login required');
   };
-  const putRevision = async (n, f, o) => {
+  // Every mutation is one synchronous read-modify-write under the state lock, so
+  // concurrent uploads of this process (and nothing else) can never lose updates.
+  const mutate = (fn) => withLock(() => { const st = rawLoad(); const out = fn(st); save(st); return out; });
+  const putRevision = (n, f, o) => {
     const buf = fs.readFileSync(f.abs);
     o.onProgress?.(buf.length);
     const sha1 = createHash('sha1').update(buf).digest('hex');
@@ -78,57 +82,54 @@ export async function createRuntime(opts) {
     },
     async createFolder(parentUid, name) {
       need();
-      const st = load();
-      const ex = child(st, parentUid, name);
-      if (ex) {
-        if (ex.kind === 'folder') return view(ex);
-        throw new DriveError('NAME_CONFLICT', 'exists', { existingUid: ex.uid });
-      }
-      const n = add(st, parentUid, name, 'folder');
-      save(st);
-      op('sdk', 'createFolder', { name });
-      return view(n);
+      return mutate((st) => {
+        const ex = child(st, parentUid, name);
+        if (ex) {
+          if (ex.kind === 'folder') return view(ex);
+          throw new DriveError('NAME_CONFLICT', 'exists', { existingUid: ex.uid });
+        }
+        const n = add(st, parentUid, name, 'folder');
+        op('sdk', 'createFolder', { name });
+        return view(n);
+      });
     },
     async uploadNew(parentUid, name, f, o) {
       need();
-      const st = load();
-      const ex = child(st, parentUid, name);
-      if (ex) throw new DriveError('NAME_CONFLICT', 'exists', { existingUid: ex.uid });
-      const n = add(st, parentUid, name, 'file');
-      const r = await putRevision(n, f, o);
-      save(st);
-      op('sdk', 'uploadNew', { uid: n.uid, name });
-      return r;
+      return mutate((st) => {
+        const ex = child(st, parentUid, name);
+        if (ex) throw new DriveError('NAME_CONFLICT', 'exists', { existingUid: ex.uid });
+        const n = add(st, parentUid, name, 'file');
+        op('sdk', 'uploadNew', { uid: n.uid, name });
+        return putRevision(n, f, o);
+      });
     },
     async uploadRevision(uid, f, o) {
       need();
-      const st = load();
-      const n = st.nodes[uid];
-      if (!n || n.trashed) throw new DriveError('NOT_FOUND', 'not found');
-      const r = await putRevision(n, f, o);
-      save(st);
-      op('sdk', 'uploadRevision', { uid, name: n.name });
-      return r;
+      return mutate((st) => {
+        const n = st.nodes[uid];
+        if (!n || n.trashed) throw new DriveError('NOT_FOUND', 'not found');
+        op('sdk', 'uploadRevision', { uid, name: n.name });
+        return putRevision(n, f, o);
+      });
     },
     async trash(uids) {
       need();
-      const st = load();
-      const out = uids.map((uid) => {
-        const n = st.nodes[uid];
-        if (!n) return { uid, ok: false, error: 'not found', code: 'NOT_FOUND' };
-        n.trashed = true;
-        op('sdk', 'trash', { uid, name: n.name });
-        return { uid, ok: true };
-      });
-      save(st);
-      return out;
+      return mutate((st) =>
+        uids.map((uid) => {
+          const n = st.nodes[uid];
+          if (!n) return { uid, ok: false, error: 'not found', code: 'NOT_FOUND' };
+          n.trashed = true;
+          op('sdk', 'trash', { uid, name: n.name });
+          return { uid, ok: true };
+        }),
+      );
     },
     async rename(uid, name) {
       need();
-      const st = load();
-      st.nodes[uid].name = name;
-      save(st);
-      return view(st.nodes[uid]);
+      return mutate((st) => {
+        st.nodes[uid].name = name;
+        return view(st.nodes[uid]);
+      });
     },
   };
 

@@ -425,7 +425,7 @@ export default function BackupSets({
                     placeholder="Drive subfolder"
                     className="w-full pfield px-2 py-1 text-sm"
                   />
-                  <p className="truncate text-xs text-[color:var(--muted)]">
+                  <p className="clip text-xs text-[color:var(--muted)]">
                     Files go to{' '}
                     <span className="text-[color:var(--accent-2)]">
                       {targetLabel(draft.targetPath ?? s.targetPath)}/{sanitizePreview(draft.targetSubfolder ?? '')}/…
@@ -608,13 +608,16 @@ export default function BackupSets({
               <>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
                 <div className="min-w-0">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <span className="truncate font-medium">{s.name}</span>
-                    <span className="shrink-0 rounded px-1.5 py-0.5 text-xs" style={statusStyle(s.lastStatus)}>
+                  <div className="flex min-w-0 items-start gap-2">
+                    <span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]" title={s.name}>{s.name}</span>
+                    <span className="mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-xs" style={statusStyle(s.lastStatus)}>
                       {s.lastStatus}
                     </span>
                   </div>
-                  <p className="mt-1 truncate text-[0.8125rem] text-[color:var(--muted)]">
+                  <p
+                    className="clip mt-1 text-[0.8125rem] text-[color:var(--muted)]"
+                    title={`${s.sourcePaths.join('\n')}\n→ ${targetLabel(s.targetPath)}/${s.targetSubfolder}`}
+                  >
                     {s.sourcePaths.length} source{s.sourcePaths.length > 1 ? 's' : ''} →{' '}
                     <span className="text-[color:var(--accent-2)]">
                       {targetLabel(s.targetPath)}/{s.targetSubfolder}
@@ -672,7 +675,7 @@ export default function BackupSets({
                           <div className="pd-indeterminate" />
                         )}
                       </div>
-                      <p className="tnum mt-1 truncate text-xs text-[color:var(--muted)]">
+                      <p className="clip tnum mt-1 text-xs text-[color:var(--muted)]" title={s.progress.current}>
                         {s.progress.totalBytes
                           ? `${s.progress.doneFiles}/${s.progress.totalFiles} files · ${formatBytes(s.progress.doneBytes)}/${formatBytes(s.progress.totalBytes)}`
                           : `${s.progress.doneFiles.toLocaleString()} uploaded · ${formatBytes(s.progress.doneBytes)}`}
@@ -683,7 +686,7 @@ export default function BackupSets({
                     </div>
                   ) : (
                     s.lastMessage && (
-                      <p className="mt-1 truncate text-[0.8125rem] text-[color:var(--muted)]" title={s.lastMessage}>
+                      <p className="clip mt-1 text-[0.8125rem] text-[color:var(--muted)]" title={s.lastMessage}>
                         {s.lastMessage}
                       </p>
                     )
@@ -907,7 +910,7 @@ export default function BackupSets({
                             </p>
                             <ul className="mt-1 max-h-32 space-y-0.5 overflow-auto pr-1 font-mono text-xs text-[color:var(--muted)]">
                               {p.wouldDelete.map((r) => (
-                                <li key={r} className="truncate" title={r}>
+                                <li key={r} className="clip" title={r}>
                                   {r}
                                 </li>
                               ))}

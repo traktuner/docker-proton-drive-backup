@@ -350,7 +350,7 @@ export default function FilePane({
                     className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
                   >
                     {entry.type === 'folder' ? <FolderIcon /> : <FileIcon />}
-                    <span className="truncate">{entry.name}</span>
+                    <span className="clip" title={entry.name}>{entry.name}</span>
                   </button>
 
                   {isPending ? (

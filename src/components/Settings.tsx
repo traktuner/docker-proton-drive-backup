@@ -54,7 +54,9 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   return (
     <div className="flex items-center justify-between gap-3 py-1 text-sm">
       <span className="text-[color:var(--muted)]">{label}</span>
-      <span className="min-w-0 truncate text-right">{children}</span>
+      <span className="clip text-right" title={typeof children === 'string' ? children : undefined}>
+        {children}
+      </span>
     </div>
   );
 }

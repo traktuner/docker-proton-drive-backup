@@ -590,7 +590,7 @@ export default function FilesPage() {
                 className="w-full pfield px-3 py-2 text-base sm:text-sm"
               />
               {(name.trim() || subfolder.trim()) && (
-                <p className="truncate text-xs text-[color:var(--muted)]">
+                <p className="clip text-xs text-[color:var(--muted)]" title={`${targetLabel}/${previewFolder}/…`}>
                   Saved to{' '}
                   <span className="text-[color:var(--accent-2)]">
                     {targetLabel}/{previewFolder}/…

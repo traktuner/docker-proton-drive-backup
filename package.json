@@ -17,8 +17,8 @@
     "sdk:check": "node scripts/sdk-check.mjs"
   },
   "dependencies": {
-    "@protontech/crypto": "2.0.0",
-    "@protontech/drive-sdk": "0.23.0",
+    "@protontech/crypto": "2.2.0",
+    "@protontech/drive-sdk": "0.24.0",
     "geist": "^1.7.2",
     "ky": "1.14.3",
     "nanoid": "^6.0.0",

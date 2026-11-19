@@ -1,9 +1,9 @@
 {
-  "sdkVersion": "0.23.0",
-  "tag": "js/v0.23.0",
-  "commit": "8a44654aece1609f0f7218be51c205103945abd8",
+  "sdkVersion": "0.24.0",
+  "tag": "js/v0.24.0",
+  "commit": "39933bb1ab7e4d08321c2ce43317c09ee5bac7d4",
   "repository": "https://github.com/ProtonDriveApps/sdk",
-  "crypto": "2.0.0",
+  "crypto": "2.2.0",
   "ky": "1.14.3",
   "accountModule": {
     "path": "incubating/account/js/src",
